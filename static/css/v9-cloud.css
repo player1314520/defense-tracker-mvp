@@ -1,0 +1,74 @@
+.v9-cloud-panel[hidden] { display: none !important; }
+.v9-cloud-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 10020;
+  display: grid;
+  place-items: center;
+  background: rgba(4, 4, 3, .78);
+  backdrop-filter: blur(8px);
+}
+.v9-cloud-card {
+  width: min(560px, calc(100vw - 28px));
+  border: 1px solid var(--v9-line-strong);
+  background: #13110e;
+  box-shadow: 0 30px 90px rgba(0, 0, 0, .55);
+}
+.v9-cloud-card header,
+.v9-cloud-card section {
+  padding: 22px 24px;
+  border-bottom: 1px solid var(--v9-line);
+}
+.v9-cloud-card header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+}
+.v9-cloud-card h2 { margin: 5px 0 0; font-size: 24px; font-weight: 500; }
+.v9-cloud-card label { display: grid; gap: 8px; color: var(--v9-muted); font-size: 12px; }
+.v9-cloud-card input,
+.v9-cloud-card select {
+  min-height: 42px;
+  border: 1px solid var(--v9-line-strong);
+  background: #0d0c0a;
+  color: var(--v9-ink);
+  padding: 0 12px;
+}
+.v9-cloud-card form { display: grid; gap: 13px; }
+.v9-cloud-status { margin: 0; color: var(--v9-green); font: 11px var(--mono); }
+.v9-cloud-status[data-bad="1"] { color: var(--v9-red); }
+.v9-cloud-device-line { margin: 14px 0 0; color: var(--v9-muted); }
+.v9-cloud-actions { display: flex; gap: 10px; margin: 14px 0; }
+#v9CloudInviteForm { grid-template-columns: 1fr 130px auto; margin: 16px 0; }
+.v9-recovery-card section { display: grid; gap: 16px; }
+.v9-recovery-card p { margin: 0; color: var(--v9-muted); line-height: 1.75; }
+.v9-recovery-code {
+  display: block;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--v9-line-strong);
+  background: #0d0c0a;
+  color: var(--v9-ink);
+  padding: 14px;
+  font: 12px/1.7 var(--mono);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.v9-recovery-confirmation {
+  display: flex !important;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+.v9-recovery-confirmation input { min-height: auto; }
+.v9-cloud-close {
+  border: 0;
+  background: transparent;
+  color: var(--v9-muted);
+  cursor: pointer;
+  font-size: 24px;
+}
+@media (max-width: 620px) {
+  .v9-cloud-card { width: calc(100vw - 16px); }
+  .v9-cloud-card header, .v9-cloud-card section { padding: 18px; }
+  #v9CloudInviteForm { grid-template-columns: 1fr; }
+}

@@ -1,0 +1,59 @@
+# Compiled / build artifacts
+dist/
+build/
+.venv-build/
+*.spec
+__pycache__/
+*.py[cod]
+*.egg-info/
+node_modules/
+
+# Secrets & runtime
+.access_token
+.ai_config.json
+.ai_config.key
+.email_config.json
+.email_config.key
+.feishu_config.json
+.supabase_config.json
+.supabase_v9_config.json
+.v9_local_master.key
+*.key
+.env
+.env.*
+
+# IDE & tools
+.claude/
+.codex/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Project-specific generated files
+ssl/
+data/
+*.ico
+*.log
+
+# 素材库 & 归档（非源码：写作样本、要讯成品、旧鸿蒙原型）
+素材库/
+归档/
+*.docx
+
+# 审阅/工具产物 & 本地压缩包（非源码，仅根目录）
+/*.png
+/*.zip
+.playwright-mcp/
+.superpowers/
+.agents/
+每日自动要讯/
+
+# 设计稿工作参考（Claude Design 导出，可复现，不入库）
+*.dc.html

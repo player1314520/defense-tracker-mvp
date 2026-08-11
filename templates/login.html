@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 — 追踪系统</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0d1117;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #c9d1d9;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 2.5rem 2rem;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    }
+    .logo {
+      text-align: center;
+      margin-bottom: 1.6rem;
+    }
+    .logo span {
+      font-size: 2.2rem;
+    }
+    h1 {
+      text-align: center;
+      font-size: 1.2rem;
+      font-weight: 600;
+      color: #e6edf3;
+      margin-bottom: 0.3rem;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: 0.78rem;
+      color: #8b949e;
+      margin-bottom: 1.8rem;
+    }
+    label {
+      display: block;
+      font-size: 0.82rem;
+      color: #8b949e;
+      margin-bottom: 0.4rem;
+    }
+    input[type="password"] {
+      width: 100%;
+      padding: 0.6rem 0.8rem;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #e6edf3;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color .2s;
+      margin-bottom: 1rem;
+    }
+    input[type="password"]:focus {
+      border-color: #388bfd;
+    }
+    button[type="submit"] {
+      width: 100%;
+      padding: 0.65rem;
+      background: #238636;
+      border: 1px solid #2ea043;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .2s;
+    }
+    button[type="submit"]:hover {
+      background: #2ea043;
+    }
+    .error {
+      background: rgba(248, 81, 73, 0.1);
+      border: 1px solid rgba(248, 81, 73, 0.4);
+      border-radius: 6px;
+      padding: 0.6rem 0.8rem;
+      font-size: 0.85rem;
+      color: #f85149;
+      margin-bottom: 1rem;
+      text-align: center;
+    }
+    .hint {
+      margin-top: 1rem;
+      font-size: 0.75rem;
+      color: #484f58;
+      text-align: center;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo"><span>🔒</span></div>
+    <h1>军事追踪系统</h1>
+    <p class="subtitle">请输入访问令牌以继续</p>
+
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="/login" autocomplete="off">
+      <label for="token">访问令牌</label>
+      <input type="password" id="token" name="token" placeholder="粘贴访问令牌..." autofocus>
+      <button type="submit">进入系统</button>
+    </form>
+
+    <p class="hint">令牌由管理员生成，每次服务重启后更新<br>查看控制台输出获取当前令牌</p>
+  </div>
+</body>
+</html>

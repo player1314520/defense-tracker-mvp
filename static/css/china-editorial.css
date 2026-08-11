@@ -1,0 +1,155 @@
+/* ═══════════════════════════════════════════════════════════
+   中国专区 · 编辑室版面（第3步之二，设计稿 dc.html:216-277）
+   作用域 #tab-content-china；零 !important；DOM/china.js 未动。
+   本文件替代 china-compact.css（1447 行/212 个 !important，已删）。
+   ═══════════════════════════════════════════════════════════ */
+#tab-content-china { background: var(--bg); color: var(--ink1); font-family: var(--sans); }
+#tab-content-china .china-workbench { max-width: 1300px; margin: 0 auto; padding: 26px 30px 50px; }
+
+/* ── 版头：mono overline + 衬线 28px + 右侧大数字（dc:218-228）── */
+#tab-content-china .china-command-panel {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 20px; flex-wrap: wrap;
+  border: none; border-bottom: 1px solid var(--line2); border-radius: 0;
+  background: none; padding: 0 0 17px; margin-bottom: 24px; box-shadow: none;
+}
+#tab-content-china .china-zone-title {
+  display: flex; align-items: center; gap: 12px;
+  font-family: var(--serif); font-size: 28px; font-weight: 500; color: var(--ink1); margin: 0;
+}
+#tab-content-china .china-zone-title::before {
+  content: 'CHINA DESK · ONE-SCREEN OVERVIEW'; display: block; position: absolute;
+  transform: translateY(-26px);
+  font-family: var(--mono); font-size: 10px; letter-spacing: 2px;
+  color: var(--ink3); font-weight: 400;
+}
+#tab-content-china .china-zone-title { position: relative; padding-top: 22px; }
+#tab-content-china .china-dragon { display: none; }   /* 编辑室不要 emoji 图腾 */
+#tab-content-china .china-zone-stats { display: flex; gap: 32px; }
+#tab-content-china .china-stat { text-align: right; background: none; border: none; padding: 0; }
+#tab-content-china .china-stat-num {
+  font-family: var(--serif); font-size: 27px; line-height: 1; color: var(--ink1); display: block;
+}
+#tab-content-china .china-stat:nth-child(2) .china-stat-num { color: var(--accent); }
+#tab-content-china .china-stat > span:not(.china-stat-num), #tab-content-china .china-stat small {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 1px;
+  color: var(--ink3); text-transform: uppercase; margin-top: 6px; display: inline-block;
+}
+
+/* ── 专题矩阵：边框卡（dc:230-235）── */
+#tab-content-china .china-topic-matrix, #tab-content-china .china-pulse-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 30px;
+}
+#tab-content-china .china-pulse-card, #tab-content-china .china-topic-chip {
+  border: 1px solid var(--line); border-radius: 0; background: none;
+  padding: 16px 17px; box-shadow: none; transition: background .15s;
+}
+#tab-content-china .china-pulse-card:hover, #tab-content-china .china-topic-chip:hover {
+  background: rgba(236,230,218,.024); transform: none;
+}
+#tab-content-china .china-topic-top {
+  display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 13px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: 1.5px;
+  color: var(--ink3); text-transform: uppercase;
+}
+#tab-content-china .china-pulse-card b, #tab-content-china .china-topic-chip b,
+#tab-content-china .china-pulse-card strong, #tab-content-china .china-topic-chip strong {
+  font-family: var(--serif); font-size: 23px; color: var(--ink1); font-weight: 500;
+}
+
+/* ── 面板通用骨架 ── */
+#tab-content-china .china-panel {
+  background: none; border: none; border-radius: 0; box-shadow: none; padding: 0;
+}
+#tab-content-china .china-panel-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding-bottom: 12px; border-bottom: 1px solid var(--line2); margin-bottom: 4px;
+}
+#tab-content-china .china-panel-head h3, #tab-content-china .china-panel-head h2 {
+  font-family: var(--serif); font-size: 18px; font-weight: 500; color: var(--ink1); margin: 0;
+}
+#tab-content-china .china-panel-head span {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 1.5px;
+  color: var(--ink3); text-transform: uppercase;
+}
+
+/* 主两栏（dc:237） */
+#tab-content-china .china-compact-list { display: grid; grid-template-columns: 1fr 328px; gap: 40px; align-items: start; }
+#tab-content-china .china-compact-list-wide { grid-template-columns: 1fr; }
+#tab-content-china .china-main-column { min-width: 0; }
+#tab-content-china .china-side-column { min-width: 0; }
+
+/* ── 智库对华分析条目（dc:243-260 行式）── */
+#tab-content-china .china-intel-title a, #tab-content-china .china-intel-title {
+  font-family: var(--serif); font-size: 18px; font-weight: 500; line-height: 1.35;
+  color: var(--ink1); text-decoration: none; transition: color .15s;
+}
+#tab-content-china .china-intel-title a:hover { color: var(--accent); }
+#tab-content-china .china-intel-meta {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .6px;
+  color: var(--ink3); text-transform: uppercase; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+#tab-content-china .china-intel-body { font-size: 13px; line-height: 1.6; color: var(--ink2); max-width: 66ch; margin: 8px 0 11px; }
+#tab-content-china .china-intel-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .6px;
+  color: var(--ink3); text-transform: uppercase;
+}
+#tab-content-china .china-intel-score { font-family: var(--serif); font-size: 16px; color: var(--ochre); }
+#tab-content-china .china-mini-tags { display: inline-flex; gap: 0; flex-wrap: wrap; }
+#tab-content-china .china-mini-tag {
+  background: none; border: none; padding: 0; border-radius: 0;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .6px; text-transform: uppercase;
+  color: var(--ochre);
+}
+#tab-content-china .china-mini-tag + .china-mini-tag::before { content: '·'; color: var(--ink4); margin: 0 7px; }
+#tab-content-china .china-row-actions { display: flex; gap: 16px; }
+#tab-content-china .china-row-actions button {
+  background: none; border: none; border-radius: 0; padding: 0;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .6px;
+  color: var(--ink3); text-transform: uppercase; cursor: pointer; transition: color .15s;
+}
+#tab-content-china .china-row-actions button:hover { color: var(--ink1); }
+#tab-content-china .china-elite-chip, #tab-content-china .china-source-chip {
+  background: none; border: none; padding: 0; border-radius: 0;
+  font-family: var(--mono); font-size: 10px; color: var(--ochre); letter-spacing: .6px;
+}
+#tab-content-china .china-more-note {
+  font-family: var(--serif); font-style: italic; font-size: 13px; color: var(--ink3);
+  padding: 14px 0; border-top: 1px solid var(--line); margin-top: 4px;
+}
+
+/* 条目行分隔（动态渲染的直接子块） */
+#tab-content-china .china-main-column > div,
+#tab-content-china .china-main-column article { border-top: 1px solid var(--line); padding: 18px 0 17px; }
+#tab-content-china .china-main-column > div:first-child { border-top: none; }
+
+/* ── 资源快链（dc:268-273 行式链接）── */
+#tab-content-china .china-reports-grid, #tab-content-china .china-tt-grid { display: flex; flex-direction: column; }
+#tab-content-china .china-report-card, #tab-content-china .china-tt-link {
+  display: block; padding: 13px 0; border-top: 1px solid var(--line);
+  background: none; border-radius: 0; box-shadow: none;
+  text-decoration: none; cursor: pointer; transition: background .15s;
+}
+#tab-content-china .china-report-card:hover, #tab-content-china .china-tt-link:hover {
+  background: rgba(236,230,218,.024); transform: none;
+}
+#tab-content-china .report-icon { display: none; }    /* 编辑室：文字即身份，不要 emoji */
+#tab-content-china .report-title {
+  font-family: var(--serif); font-size: 14.5px; color: var(--ink1);
+}
+#tab-content-china .report-url {
+  font-family: var(--mono); font-size: 10px; color: var(--ink3); white-space: nowrap;
+}
+#tab-content-china .report-url::after { content: ' ↗'; }
+#tab-content-china .report-desc { font-size: 11.5px; color: var(--ink3); margin-top: 4px; }
+
+/* 空态/加载 */
+#tab-content-china .loading-state { color: var(--ink3); font-family: var(--serif); font-style: italic; }
+
+/* 窄屏 */
+@media (max-width: 900px) {
+  #tab-content-china .china-topic-matrix, #tab-content-china .china-pulse-grid { grid-template-columns: repeat(2, 1fr); }
+  #tab-content-china .china-compact-list { grid-template-columns: 1fr; }
+}

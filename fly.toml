@@ -1,0 +1,43 @@
+# Fly.io 部署配置（V9 密文同步与任务元数据协调器）
+# 应用名后续用 fly apps create 时确定
+app = "defense-tracker-v9"
+primary_region = "hkg"   # 香港，对国内 + 飞书 API 延迟均最低
+
+[build]
+  dockerfile = "deploy/Dockerfile.cloud"
+
+[env]
+  PORT = "8080"
+  V9_CLOUD_DB_PATH = "/data/v9-cloud.sqlite3"
+  V9_PRODUCTION_MODE = "true"
+
+# 持久化卷：会话数据跨部署保留
+[mounts]
+  source = "fangwu_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"        # 飞书 webhook 不可冷启动，必须常驻
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 50
+    soft_limit = 25
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/ready"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256                   # 免费档配额内
+  processes = ["app"]

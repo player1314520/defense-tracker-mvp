@@ -1,0 +1,5 @@
+[functions.invite-member]
+verify_jwt = false
+
+[functions.access-applications]
+verify_jwt = false

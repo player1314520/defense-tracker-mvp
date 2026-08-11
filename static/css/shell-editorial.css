@@ -1,0 +1,146 @@
+/* ═══════════════════════════════════════════════════════════
+   壳层编辑室化（第2步 P0-B）：报头 masthead + 导航 nav + 全局底色
+   按设计稿 dc.html:36-81。壳层出现在每一屏——做完这一件事，
+   即使其余 Tab 内容未迁移，观感也从"两个世界硬接缝"变成
+   "统一报头下的渐进翻新"。
+   !important 为过渡期定点压制（旧霓虹壳 base/terminal-v9/
+   neon-restore/compact 仍在层叠中）；第3步删旧主题后可摘除。
+   ═══════════════════════════════════════════════════════════ */
+@keyframes edSweepShell { 0% { transform: translateX(-160%); } 100% { transform: translateX(460%); } }
+@keyframes edPulseShell { 0%,100% { opacity: .85; } 50% { opacity: .35; } }
+
+/* 全局底色：newsprint（未迁移 Tab 的深色面板暂坐其上，逐步翻新） */
+html, body {
+  background: var(--bg) !important;
+  color: var(--ink1) !important;
+  font-family: var(--sans) !important;
+}
+
+/* 顶部细红线 + 流光 */
+.ed-toprule {
+  height: 2px; background: var(--accent);
+  position: relative; overflow: hidden;
+}
+.ed-toprule-sweep {
+  position: absolute; top: 0; bottom: 0; left: 0; width: 22%;
+  background: linear-gradient(90deg, transparent, rgba(255,228,214,.85), transparent);
+  animation: edSweepShell 5.5s linear infinite;
+}
+
+/* ═══ 报头 masthead ═══ */
+.topbar {
+  display: flex !important; align-items: center !important;
+  justify-content: space-between !important;
+  padding: 14px 28px !important;
+  background: var(--bg) !important;
+  border-bottom: 1px solid var(--line2) !important;
+  box-shadow: none !important;
+  position: static !important;   /* 旧壳 sticky 取消：报纸报头随页滚动 */
+}
+.topbar-left { display: flex !important; align-items: center !important; gap: 15px !important; }
+.ed-mark {
+  width: 38px; height: 38px; border: 1px solid var(--line2);
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.ed-mark span { font-family: var(--serif); font-size: 22px; color: var(--ink1); line-height: 1; }
+.ed-title-wrap { display: flex; flex-direction: column; }
+.topbar .logo {
+  font-family: var(--serif) !important; font-size: 20px !important; font-weight: 500 !important;
+  color: var(--ink1) !important; letter-spacing: .5px !important; line-height: 1.1 !important;
+  text-shadow: none !important; display: block !important;
+}
+.topbar .tagline {
+  font-family: var(--mono) !important; font-size: 9px !important; letter-spacing: 3px !important;
+  color: var(--ink3) !important; text-transform: uppercase !important; margin-top: 3px !important;
+  display: block !important;
+}
+.topbar-right { display: flex !important; align-items: center !important; gap: 16px !important; }
+.topbar .clock {
+  font-family: var(--mono) !important; font-size: 12px !important;
+  color: var(--ink2) !important; letter-spacing: .3px !important;
+  background: none !important; border: none !important; padding: 0 !important;
+}
+.ed-vline { width: 1px; height: 26px; background: var(--line2); }
+.status-pill {
+  display: flex !important; align-items: center !important; gap: 8px !important;
+  background: none !important; border: none !important; padding: 0 !important;
+  font-family: var(--mono) !important; font-size: 11px !important;
+  color: var(--ink2) !important; letter-spacing: .5px !important; box-shadow: none !important;
+}
+.status-pill .dot {
+  width: 6px !important; height: 6px !important; border-radius: 50% !important;
+  background: var(--ochre) !important; animation: edPulseShell 2.6s infinite !important;
+  box-shadow: none !important;
+}
+.status-pill.error .dot { background: var(--accent) !important; animation: none !important; }
+.lang-btn, .refresh-btn {
+  background: none !important; border: none !important; border-radius: 0 !important;
+  font-family: var(--mono) !important; font-size: 11px !important; letter-spacing: 1px !important;
+  color: var(--ink3) !important; cursor: pointer !important; padding: 2px 4px !important;
+  transition: color .18s !important; box-shadow: none !important; text-shadow: none !important;
+}
+.lang-btn:hover, .refresh-btn:hover { color: var(--ink1) !important; background: none !important; }
+
+/* ═══ 导航 nav ═══ */
+.tab-nav {
+  display: flex !important; align-items: center !important;
+  justify-content: space-between !important; flex-wrap: wrap !important;
+  padding: 0 28px !important; min-height: 48px !important;
+  background: var(--bg) !important;
+  border-bottom: 1px solid var(--line) !important;
+  box-shadow: none !important; gap: 0 !important;
+  position: static !important;
+}
+.tab-nav .tab-btn {
+  position: relative !important; height: 48px !important;
+  display: inline-flex !important; align-items: center !important;
+  background: none !important; border: none !important; border-radius: 0 !important;
+  padding: 0 !important; margin-right: 26px !important;
+  font-family: var(--sans) !important; font-size: 14px !important;
+  color: var(--ink3) !important; cursor: pointer !important;
+  transition: color .18s !important; box-shadow: none !important; text-shadow: none !important;
+  border-bottom: none !important;
+}
+.tab-nav .tab-btn:hover { color: var(--ink1) !important; background: none !important; }
+.tab-nav .tab-btn.active { color: var(--ink1) !important; font-weight: 500 !important; background: none !important; }
+.tab-nav .tab-btn.active::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  background: var(--accent);
+}
+/* 各 Tab 专属彩色壳（china-tab/ai-tab 等旧强调色）一律压平 */
+.tab-nav .tab-btn.china-tab, .tab-nav .tab-btn.ai-tab,
+.tab-nav .tab-btn.agent-tab, .tab-nav .tab-btn.brief-tab,
+.tab-nav .tab-btn.track-tab { color: var(--ink3) !important; }
+.tab-nav .tab-btn.china-tab.active, .tab-nav .tab-btn.ai-tab.active,
+.tab-nav .tab-btn.agent-tab.active, .tab-nav .tab-btn.brief-tab.active,
+.tab-nav .tab-btn.track-tab.active { color: var(--ink1) !important; }
+
+/* 右侧统计条：mono 小字 + 斜杠分隔（设计稿 dc:72-80） */
+.tab-stats { display: flex !important; align-items: center !important; gap: 0 !important; margin-left: auto !important; }
+.stat-chip {
+  display: inline-flex !important; align-items: baseline !important; gap: 5px !important;
+  background: none !important; border: none !important; border-radius: 0 !important;
+  padding: 0 !important; font-family: var(--mono) !important; font-size: 11px !important;
+  color: var(--ink3) !important; letter-spacing: .3px !important; box-shadow: none !important;
+}
+.stat-chip + .stat-chip::before {
+  content: '/'; color: var(--line-deco); margin: 0 10px;
+}
+.stat-chip strong {
+  color: var(--ink1) !important; font-weight: 500 !important; font-size: 12px !important;
+}
+.stat-chip.bookmark-chip strong { color: var(--ochre) !important; }
+
+/* 页脚随壳换装 */
+.footer {
+  background: var(--bg) !important; border-top: 1px solid var(--line) !important;
+  color: var(--ink4) !important; font-family: var(--mono) !important;
+  font-size: 10px !important; letter-spacing: .5px !important;
+}
+
+/* 窄屏（沿用旧断点 480px） */
+@media (max-width: 480px) {
+  .topbar { padding: 10px 14px !important; }
+  .tab-nav { padding: 0 14px !important; overflow-x: auto !important; }
+  .tab-stats { display: none !important; }  /* 手机上让位给 Tab 本身 */
+}

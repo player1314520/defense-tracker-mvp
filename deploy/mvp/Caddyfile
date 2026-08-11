@@ -1,0 +1,90 @@
+{
+    email {$ACME_EMAIL}
+    admin off
+    auto_https disable_redirects
+    servers {
+        protocols h1 h2
+    }
+}
+
+(security_headers) {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        -Server
+    }
+}
+
+http://{$PORTAL_DOMAIN}, http://{$API_DOMAIN} {
+    redir https://{host}{uri} permanent
+}
+
+https://{$PORTAL_DOMAIN} {
+    import security_headers
+    encode zstd gzip
+    request_body {
+        # Flask's production Portal limit is 256 KiB.  The Portal serves
+        # static assets and tiny application/login payloads only.
+        max_size 256KB
+    }
+
+    @portal_public {
+        path / /health /ready /favicon.ico /portal /portal/*
+    }
+
+    handle @portal_public {
+        reverse_proxy {$PORTAL_UPSTREAM} {
+            health_uri /health
+            health_interval 15s
+            health_timeout 3s
+            header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
+            header_up -X-Real-IP
+            header_up -X-Forwarded-For
+            header_up -CF-Connecting-IP
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+
+    handle {
+        respond 404
+    }
+}
+
+https://{$API_DOMAIN} {
+    import security_headers
+    encode zstd gzip
+    request_body {
+        # V9 accepts at most a 24 MiB encoded sync event.  32 MiB is the
+        # transport ceiling, leaving framing overhead without weakening the
+        # database's 16 MiB ciphertext constraint.
+        max_size 32MB
+    }
+
+    @public_api {
+        path /auth/v1/* /rest/v1/* /graphql/v1/* /realtime/v1/* /storage/v1/* /functions/v1/access-applications /functions/v1/access-applications/* /functions/v1/invite-member /functions/v1/invite-member/*
+    }
+
+    handle @public_api {
+        reverse_proxy {$SUPABASE_UPSTREAM} {
+            health_uri /auth/v1/health
+            health_interval 15s
+            health_timeout 3s
+            header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
+            header_up -X-Real-IP
+            header_up -X-Forwarded-For
+            header_up -CF-Connecting-IP
+            header_up -X-V9-Client-IP
+            header_up X-V9-Client-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+
+    handle {
+        respond 404
+    }
+}

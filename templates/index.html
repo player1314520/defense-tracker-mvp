@@ -1,0 +1,1219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Defense Command Hub · 防务数据追踪系统 V9</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='18' fill='%230b0f14'/><text x='50' y='60' text-anchor='middle' font-size='42' fill='%23d9e2ec' font-family='Arial'>DI</text></svg>">
+  <!-- Marked.js (Markdown渲染，用于AI输出，已本地化避免 jsdelivr GFW 单点) -->
+  <script nonce="{{ g.csp_nonce }}" src="/static/js/marked.min.js"></script>
+  <!-- DOMPurify (净化AI Markdown渲染后的HTML) -->
+  <script nonce="{{ g.csp_nonce }}" src="/static/js/purify.min.js"></script>
+  <!-- style.css 按区块拆为多文件，<link> 严格按原层叠顺序加载（v5→v7→v8→v9→霓虹修复→紧凑）。旧霓虹层随逐 Tab 编辑室迁移逐个删除。 -->
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/tabs.css">
+  <link rel="stylesheet" href="/static/css/features.css">
+  <link rel="stylesheet" href="/static/css/ai.css">
+  <link rel="stylesheet" href="/static/css/agent.css">
+  <link rel="stylesheet" href="/static/css/brief-editorial.css">
+  <link rel="stylesheet" href="/static/css/mobile-feishu.css">
+  <link rel="stylesheet" href="/static/css/china-editorial.css">
+  <link rel="stylesheet" href="/static/css/tracking.css">
+  <!-- tokens.css 在旧主题之后加载：压过 neon-restore/terminal-v9 的同名 :root 变量
+       （--mono 撞名）；旧主题全部删除后（第3步收尾）可移回首位 -->
+  <link rel="stylesheet" href="/static/css/tokens.css">
+  <link rel="stylesheet" href="/static/css/news-editorial.css">
+  <!-- shell-editorial 末位加载：编辑室报头/导航压过旧霓虹壳层 -->
+  <link rel="stylesheet" href="/static/css/shell-editorial.css">
+  <!-- workbench 三屏编辑室协调，末位加载 -->
+  <link rel="stylesheet" href="/static/css/workbench-editorial.css">
+  <link rel="stylesheet" href="/static/css/states-editorial.css">
+  <link rel="stylesheet" href="/static/css/command-hub-v9.css">
+  <link rel="stylesheet" href="/static/css/v9-cloud.css">
+</head>
+<body>
+
+<!-- ─── V9 指挥中枢壳层 ──────────────────────────────────── -->
+<div class="v9-classification" aria-label="系统分级">
+  <span>非 密</span><span>·</span><span>演 示 数 据</span><span>／／</span>
+  <span>UNCLASSIFIED · DEMO</span><span>角色 · 分析员</span>
+</div>
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="ed-mark"><span>追</span></div>
+    <div class="ed-title-wrap">
+      <span class="logo"><span data-cn="防务数据追踪系统" data-en="Defense Command Hub">防务数据追踪系统</span></span>
+      <span class="tagline">DEFENSE COMMAND HUB · V9 · 闭环</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <button class="v9-action" id="v9SavedBtn" type="button" title="查看追踪收藏"><span class="v9-action-icon">★</span> 收藏 <strong id="statBookmarks">0</strong></button>
+    <button class="v9-action" id="v9QueueBtn" type="button" title="进入告警分诊"><span class="v9-action-icon accent">＋</span> 队列 <strong id="trkTabBadge">0</strong></button>
+    <button class="v9-action" id="v9SearchBtn" type="button" title="搜索情报"><span class="v9-kbd">⌘K</span> 检索</button>
+    <button class="v9-action v9-icon-action" id="v9HelpBtn" type="button" title="打开使用引导">?</button>
+    <button class="v9-action" id="v9TourBtn" type="button">引导</button>
+    <button class="v9-action" id="v9CloudBtn" type="button">账户</button>
+    <div class="ed-vline"></div>
+    <div class="v9-clock-wrap">
+      <span id="clock" class="clock"></span>
+      <span class="v9-date" id="v9Date"></span>
+    </div>
+    <div class="status-pill" id="statusPill" aria-live="polite"><span class="dot"></span><span id="statusText">连接中…</span></div>
+    <button class="lang-btn" id="langBtn" onclick="toggleLang()" title="Switch Language">
+      <span id="langLabel">EN</span>
+    </button>
+    <button class="refresh-btn" onclick="fetchAll()" title="重新抓取全部信源">刷新</button>
+  </div>
+</header>
+
+<div class="v9-wire" aria-label="实时情报滚动条">
+  <span class="v9-wire-label"><i></i> WIRE · 电讯</span>
+  <div class="v9-wire-track" id="v9WireTrack">
+    <span>正在载入真实高优先级情报…</span>
+  </div>
+  <div class="v9-runtime-stats">
+    <span>3D <strong id="statArticles">—</strong></span>
+    <span>FEEDS <strong id="statActive">—</strong></span>
+    <span>SITES <strong id="statSites">—</strong></span>
+    <span>UPDATED <strong id="statUpdate">—</strong></span>
+  </div>
+</div>
+
+<main class="v9-workspace">
+  <aside class="v9-rail">
+    <nav class="tab-nav" role="tablist" aria-label="防务工作流">
+      <div class="v9-nav-group">
+        <span class="v9-nav-label">态 势</span>
+        <button class="tab-btn active" onclick="showTab('overview')" id="tab-overview" role="tab"><em>00</em><span>态势总览</span></button>
+      </div>
+      <div class="v9-nav-group">
+        <span class="v9-nav-label">情 报 流</span>
+        <button class="tab-btn" onclick="showTab('news')" id="tab-news" role="tab"><em>01</em><span>实时新闻</span><i class="v9-alert-dot"></i></button>
+        <button class="tab-btn" onclick="showTab('ai')" id="tab-ai" role="tab"><em>02</em><span>证据库</span></button>
+      </div>
+      <div class="v9-nav-group">
+        <span class="v9-nav-label">情 报 网</span>
+        <button class="tab-btn" onclick="showTab('thinktanks')" id="tab-thinktanks" role="tab"><em>03</em><span>实体图谱</span></button>
+        <button class="tab-btn" onclick="showTab('china')" id="tab-china" role="tab"><em>04</em><span>地理态势</span></button>
+        <button class="tab-btn" onclick="showTab('tracking')" id="tab-tracking" role="tab"><em>05</em><span>告警分诊</span><b id="v9AlertNavBadge">0</b></button>
+        <button class="tab-btn" onclick="showTab('agent')" id="tab-agent" role="tab"><em>06</em><span>案件工作区</span></button>
+      </div>
+      <div class="v9-nav-group">
+        <span class="v9-nav-label">智 能 体</span>
+        <button class="tab-btn" onclick="showTab('squad')" id="tab-squad" role="tab"><em>07</em><span>智能体编队</span></button>
+        <button class="tab-btn" onclick="showTab('scenario')" id="tab-scenario" role="tab"><em>08</em><span>情景推演</span></button>
+      </div>
+      <div class="v9-nav-group">
+        <span class="v9-nav-label">写 作 台</span>
+        <button class="tab-btn" onclick="showTab('brief')" id="tab-brief" role="tab"><em>09</em><span>写作室</span></button>
+        <button class="tab-btn" onclick="showTab('delivery')" id="tab-delivery" role="tab"><em>10</em><span>版面计划</span></button>
+      </div>
+    </nav>
+  </aside>
+  <section class="v9-stage">
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB 0: 态势总览
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-overview" class="tab-content active">
+  <section class="v9-overview">
+    <header class="v9-page-head">
+      <div>
+        <span class="v9-kicker">SITUATION OVERVIEW · PAST 72 HOURS</span>
+        <h1>态势总览</h1>
+        <p>把分散信源压缩为可研判、可派发、可交付的一张态势面。</p>
+      </div>
+      <div class="v9-page-actions">
+        <button class="v9-primary" type="button" data-v9-target="squad">派发智能体任务 →</button>
+        <button class="v9-secondary" type="button" data-v9-target="delivery">版面计划</button>
+      </div>
+    </header>
+    <div class="v9-risk-grid" id="v9RiskGrid" aria-label="区域态势指数" aria-live="polite">
+      <div class="v9-panel-loading">正在根据真实信源计算态势信号…</div>
+    </div>
+    <div class="v9-activity">
+      <button type="button" data-v9-target="tracking"><i class="cyan"></i><span id="v9OverviewAlertText">告警队列暂无待处理项</span><strong>进入分诊 →</strong></button>
+      <button type="button" data-v9-target="news"><i class="gold"></i><span id="v9OverviewNewsText">等待实时新闻更新</span><strong>查看新闻 →</strong></button>
+      <button type="button" data-v9-target="agent"><i class="red"></i><span id="v9OverviewCaseText">尚无由告警转入的案件</span><strong>打开案件 →</strong></button>
+    </div>
+  </section>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB 1: 实时新闻
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-news" class="tab-content" hidden>
+  <div class="main-grid">
+    <section class="panel news-panel">
+      <div class="panel-header">
+        <h2><span data-cn="实时防务新闻（近3天）" data-en="Live Defense News (Last 3 Days)">实时防务新闻（近3天）</span></h2>
+        <div class="search-bar-wrap">
+        <span class="search-icon">⌕</span>
+          <input type="text" id="newsSearch" class="news-search-input"
+                 placeholder="搜索标题/来源… Search news…"
+                 oninput="handleSearch(this.value)">
+          <button class="search-clear-btn" id="searchClearBtn" onclick="clearSearch()" style="display:none">✕</button>
+        </div>
+        <!-- 地区过滤 -->
+        <div class="filter-bar" id="filterBar">
+          <button class="filter-btn active" data-filter="all"      onclick="setFilter('all',this)"      >全部</button>
+          <button class="filter-btn tier1"   data-filter="tier1"   onclick="setFilter('tier1',this)"    >顶尖</button>
+          <button class="filter-btn china-f" data-filter="🇨🇳 中国" onclick="setFilter('🇨🇳 中国',this)" >🇨🇳 中国</button>
+          <button class="filter-btn usa-f"   data-filter="🇺🇸 美国" onclick="setFilter('🇺🇸 美国',this)" >🇺🇸 美国</button>
+          <button class="filter-btn japan-f" data-filter="🇯🇵 日本" onclick="setFilter('🇯🇵 日本',this)" >🇯🇵 日本</button>
+          <button class="filter-btn taiwan-f"data-filter="🇹🇼 台湾" onclick="setFilter('🇹🇼 台湾',this)" >🇹🇼 台湾</button>
+          <button class="filter-btn"         data-filter="🌏 亚太" onclick="setFilter('🌏 亚太',this)"  >🌏 亚太</button>
+          <button class="filter-btn"         data-filter="🚢 海军" onclick="setFilter('🚢 海军',this)"  >🚢 海军</button>
+          <button class="filter-btn"         data-filter="✈️ 空天" onclick="setFilter('✈️ 空天',this)"  >✈️ 空天</button>
+          <button class="filter-btn"         data-filter="🇺🇦 乌克兰" onclick="setFilter('🇺🇦 乌克兰',this)">🇺🇦 乌</button>
+        </div>
+        <!-- 排序 + 标签过滤 + 快捷键提示 -->
+        <div class="ctrl-row">
+          <div class="sort-group">
+            <span class="ctrl-label">排序：</span>
+            <button class="sort-btn active" id="sortPriority" onclick="setSort('priority',this)">写作优先</button>
+            <button class="sort-btn"        id="sortNewest"   onclick="setSort('date',this)">最新</button>
+            <button class="sort-btn"        id="sortValue"    onclick="setSort('value',this)">最高价值</button>
+            <button class="sort-btn"        id="sortUnread"   onclick="setSort('unread',this)">未读优先</button>
+          </div>
+          <div class="star-filter-group">
+            <span class="ctrl-label">星级≥</span>
+            <button class="star-filter-btn" onclick="setMinStars(3,this)">3★</button>
+            <button class="star-filter-btn" onclick="setMinStars(5,this)">5★</button>
+            <button class="star-filter-btn" onclick="setMinStars(7,this)">7★</button>
+            <button class="star-filter-btn" onclick="setMinStars(8,this)">8★</button>
+          </div>
+          <div class="unread-badge" id="unreadBadge" style="display:none">
+            <span id="unreadCount">0</span> 条未读
+            <button onclick="markAllRead()">全部已读</button>
+          </div>
+          <div class="shortcut-hint"><kbd>/</kbd> 搜索 <kbd>1-6</kbd> 切换标签 <kbd>Esc</kbd> 清空</div>
+        </div>
+        <!-- 关键词预警 -->
+        <div class="alert-bar" id="alertBar">
+          <span class="alert-label">预警词：</span>
+          <div class="alert-tags" id="alertTagsDisplay"></div>
+          <input type="text" id="alertInput" class="alert-input" placeholder="输入关键词回车添加…" onkeydown="handleAlertKey(event)">
+          <button class="v9-rule-open" id="v9RuleOpen" type="button">规则编辑器</button>
+          <button class="alert-toggle-btn" onclick="toggleAlertBar()" id="alertToggleBtn" title="展开/折叠预警">▲</button>
+        </div>
+        <section class="v9-rule-editor" id="v9RuleEditor" hidden aria-labelledby="v9RuleTitle">
+          <header>
+            <div><span>ALERT RULES · 客户端加密</span><h2 id="v9RuleTitle">预警规则与 24 小时触发节奏</h2></div>
+            <button type="button" id="v9RuleClose" aria-label="关闭规则编辑器">×</button>
+          </header>
+          <div class="v9-rule-rhythm" id="v9RuleRhythm" aria-label="过去 24 小时规则命中次数"></div>
+          <div class="v9-rule-summary" id="v9RuleSummary">尚未加载规则</div>
+          <form class="v9-rule-form" id="v9RuleForm">
+            <input type="hidden" id="v9RuleId">
+            <input type="hidden" id="v9RuleVersion">
+            <label>规则名称<input id="v9RuleName" required maxlength="80" placeholder="例如：台海高优先级"></label>
+            <label>关键词（逗号分隔）<input id="v9RuleKeywords" required placeholder="taiwan, 台海, 演训"></label>
+            <label>最低星级<input id="v9RuleStars" type="number" min="0" max="10" value="6"></label>
+            <label>严重度<select id="v9RuleSeverity"><option value="medium">中</option><option value="high">高</option><option value="critical">紧急</option><option value="low">低</option></select></label>
+            <label>限定来源（可选）<input id="v9RuleSources" placeholder="Reuters, USNI News"></label>
+            <label class="v9-rule-check"><input id="v9RuleEnabled" type="checkbox" checked> 启用规则</label>
+            <div class="v9-rule-form-actions"><button type="button" id="v9RuleReset">新建</button><button type="submit">加密保存</button></div>
+          </form>
+          <div class="v9-rule-list" id="v9RuleList"></div>
+        </section>
+      </div>
+      <div class="news-list" id="newsList">
+        <div class="loading-state"><div class="spinner"></div><p>正在抓取防务情报…<br><small>Fetching defense intelligence…</small></p></div>
+      </div>
+    </section>
+    <aside class="news-aside">
+      <section class="panel">
+        <div class="panel-header"><h2><span data-cn="新闻源状态" data-en="Feed Status">新闻源状态</span></h2></div>
+        <div id="feedStatus" class="feed-status-list"></div>
+      </section>
+      <section class="panel" style="margin-top:12px">
+        <div class="panel-header"><h2><span data-cn="价值标签统计" data-en="Value Tag Stats">价值标签统计</span></h2></div>
+        <div id="valueStats" class="value-stats-panel"></div>
+      </section>
+      <section class="panel" style="margin-top:12px">
+        <div class="panel-header"><h2><span data-cn="写作优先级" data-en="Writing Priority">写作优先级</span></h2></div>
+        <div id="priorityStats" class="priority-stats-panel"></div>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB 3: 中国专区
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-china" class="tab-content" hidden>
+  <section class="v9-p3-panel v9-geo-workspace" aria-labelledby="v9GeoTitle">
+    <header class="v9-page-head">
+      <div><span class="v9-kicker">OFFLINE GEO INTELLIGENCE · 120 HOURS</span><h1 id="v9GeoTitle">地理态势</h1><p>本地离线矢量底图；位置、认知状态与证据链只在本机解密。</p></div>
+      <div class="v9-page-actions"><button class="v9-primary" id="v9GeoNew" type="button">标注事件</button></div>
+    </header>
+    <div class="v9-time-control"><label>回放窗口 <strong id="v9GeoHoursLabel">120h</strong><input id="v9GeoHours" type="range" min="1" max="120" value="120"></label><button id="v9GeoPlay" type="button">▶ 播放</button></div>
+    <div class="v9-geo-grid">
+      <div class="v9-offline-map" id="v9OfflineMap"><img src="/static/img/v9-world-map.svg" alt="离线世界底图"><div id="v9GeoMarkers"></div><span>LOCAL VECTOR MAP · NO THIRD-PARTY REQUEST</span></div>
+      <aside><div class="v9-layer-switch"><label><input type="checkbox" value="event" checked> 事件</label><label><input type="checkbox" value="entity" checked> 实体</label><label><input type="checkbox" value="alert" checked> 告警</label><label><input type="checkbox" value="case" checked> 案件</label></div><div id="v9GeoList" class="v9-p3-list"><div class="v9-panel-loading">尚无地理事件</div></div></aside>
+    </div>
+    <form id="v9GeoForm" class="v9-p3-form" hidden>
+      <input id="v9GeoEventTitle" required placeholder="事件标题">
+      <input id="v9GeoLat" required type="number" min="-90" max="90" step="any" placeholder="纬度">
+      <input id="v9GeoLon" required type="number" min="-180" max="180" step="any" placeholder="经度">
+      <select id="v9GeoStatus"><option value="fact">已验证事实</option><option value="source_claim">来源声明</option><option value="inference">分析推断</option><option value="scenario_assumption">情景假设</option></select>
+      <input id="v9GeoEvidence" class="v9-evidence-drop" required placeholder="证据 ID（可从证据库拖入）">
+      <input id="v9GeoEntities" placeholder="关联实体 ID（可选，逗号分隔）">
+      <input id="v9GeoAlert" placeholder="关联告警 ID（可选）">
+      <input id="v9GeoCase" placeholder="关联案件 ID（可选）">
+      <button type="submit">加密保存事件</button>
+    </form>
+  </section>
+  <div class="china-workbench">
+    <section class="china-command-panel">
+      <div class="china-zone-title">
+        <span class="china-dragon">CN</span>
+        <div>
+          <h1 data-cn="中国防务情报专区" data-en="China Defense Intelligence Zone">中国防务情报专区</h1>
+          <p data-cn="一屏总览：美欧智库、PLA动态、台海局势、核力量、印太竞争"
+             data-en="One-screen overview: think tanks, PLA movements, Taiwan Strait, nuclear forces, Indo-Pacific competition">
+            一屏总览：美欧智库、PLA动态、台海局势、核力量、印太竞争
+          </p>
+        </div>
+      </div>
+      <div class="china-zone-stats" id="chinaStats"></div>
+      <div class="china-pulse-grid" id="chinaPulseGrid"></div>
+    </section>
+
+    <section class="china-panel china-topic-panel">
+      <div class="china-panel-head">
+        <h2>态势专题矩阵</h2>
+        <span>按最近3天相关信源自动聚类</span>
+      </div>
+      <div id="chinaTopicMatrix" class="china-topic-matrix"></div>
+    </section>
+
+    <main class="china-main-column">
+      <section class="china-panel">
+        <div class="china-panel-head">
+          <h2>美欧顶尖智库对华分析</h2>
+          <span id="chinaEliteMeta">高价值优先</span>
+        </div>
+        <div class="china-compact-list" id="chinaEliteList">
+          <div class="loading-state"><div class="spinner"></div><p>加载中…</p></div>
+        </div>
+      </section>
+
+      <section class="china-panel">
+        <div class="china-panel-head">
+          <h2>中国相关情报流</h2>
+          <span id="chinaNewsMeta">近3天精选</span>
+        </div>
+        <div class="china-compact-list china-compact-list-wide" id="chinaNewsList">
+          <div class="loading-state"><div class="spinner"></div><p>加载中…</p></div>
+        </div>
+      </section>
+    </main>
+
+    <aside class="china-side-column">
+      <section class="china-panel china-resource-panel">
+        <div class="china-panel-head">
+          <h2>报告资源快链</h2>
+          <span>官方 / 智库 / 数据</span>
+        </div>
+        <div class="china-reports-grid">
+          <a class="china-report-card" href="http://www.mod.gov.cn/" target="_blank" rel="noopener">
+            <div class="report-icon">OF</div>
+            <div class="report-title">中国国防部官网</div>
+            <div class="report-desc">官方白皮书、政策声明、新闻发布会</div>
+            <div class="report-url">mod.gov.cn</div>
+          </a>
+          <a class="china-report-card" href="https://www.rand.org/topics/china.html" target="_blank" rel="noopener">
+            <div class="report-icon">RA</div>
+            <div class="report-title">RAND China Research</div>
+            <div class="report-desc">军事现代化深度报告</div>
+            <div class="report-url">rand.org/topics/china</div>
+          </a>
+          <a class="china-report-card" href="https://chinapower.csis.org/" target="_blank" rel="noopener">
+            <div class="report-icon">CP</div>
+            <div class="report-title">CSIS China Power</div>
+            <div class="report-desc">综合国力数据与交互分析</div>
+            <div class="report-url">chinapower.csis.org</div>
+          </a>
+          <a class="china-report-card" href="https://www.iiss.org/research-areas/china/" target="_blank" rel="noopener">
+            <div class="report-icon">II</div>
+            <div class="report-title">IISS China Research</div>
+            <div class="report-desc">军事平衡与PLA战力评估</div>
+            <div class="report-url">iiss.org/china</div>
+          </a>
+          <a class="china-report-card" href="https://fas.org/initiative/status-world-nuclear-forces/" target="_blank" rel="noopener">
+            <div class="report-icon">NF</div>
+            <div class="report-title">FAS 核力量评估</div>
+            <div class="report-desc">核弹头数量与发展趋势</div>
+            <div class="report-url">fas.org/nuclear-forces</div>
+          </a>
+          <a class="china-report-card" href="https://www.dia.mil/Military-Power-Publications/" target="_blank" rel="noopener">
+            <div class="report-icon">DI</div>
+            <div class="report-title">DIA 军力报告</div>
+            <div class="report-desc">《中国军事力量》年度报告</div>
+            <div class="report-url">dia.mil/Military-Power</div>
+          </a>
+        </div>
+      </section>
+
+      <section class="china-panel">
+        <div class="china-panel-head">
+          <h2>智库/研究入口</h2>
+          <span>优先站内检索</span>
+        </div>
+        <div id="chinaThinktankGrid" class="china-tt-grid"></div>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB 4: 智库目录
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-thinktanks" class="tab-content" hidden>
+  <section class="v9-p3-panel v9-graph-workspace" aria-labelledby="v9GraphTitle">
+    <header class="v9-page-head">
+      <div><span class="v9-kicker">ENTITY GRAPH · EVIDENCE FIRST</span><h1 id="v9GraphTitle">实体图谱</h1><p>每条边明确区分事实、来源声明和分析推断；点击节点回溯证据。</p></div>
+      <div class="v9-page-actions"><button class="v9-secondary" id="v9GraphEntityNew" type="button">新增实体</button><button class="v9-primary" id="v9GraphRelationNew" type="button">新增关系</button></div>
+    </header>
+    <div class="v9-time-control"><label>时间回放 <strong id="v9GraphHoursLabel">120h</strong><input id="v9GraphHours" type="range" min="1" max="120" value="120"></label><button id="v9GraphPlay" type="button">▶ 播放</button><span class="v9-graph-legend"><i class="fact"></i>事实 <i class="claim"></i>来源声明 <i class="inference"></i>分析推断</span></div>
+    <div class="v9-graph-grid"><svg id="v9GraphCanvas" viewBox="0 0 900 520" role="img" aria-label="实体关系图"></svg><aside id="v9GraphLedger" class="v9-p3-list"><div class="v9-panel-loading">尚无实体与关系</div></aside></div>
+    <form id="v9EntityForm" class="v9-p3-form" hidden>
+      <input id="v9EntityName" required placeholder="实体名称">
+      <select id="v9EntityKind"><option value="organization">组织</option><option value="platform">平台</option><option value="person">人物</option><option value="location">地点</option></select>
+      <select id="v9EntityStatus"><option value="fact">已验证事实</option><option value="source_claim">来源声明</option><option value="inference">分析推断</option><option value="scenario_assumption">情景假设</option></select>
+      <input id="v9EntityEvidence" class="v9-evidence-drop" required placeholder="证据 ID（可从证据库拖入）">
+      <button type="submit">加密保存实体</button>
+    </form>
+    <form id="v9RelationForm" class="v9-p3-form" hidden>
+      <select id="v9RelationFrom" required></select><input id="v9RelationPredicate" required placeholder="关系，例如：部署于"><select id="v9RelationTo" required></select>
+      <select id="v9RelationStatus"><option value="fact">已验证事实</option><option value="source_claim">来源声明</option><option value="inference">分析推断</option><option value="scenario_assumption">情景假设</option></select>
+      <input id="v9RelationEvidence" class="v9-evidence-drop" required placeholder="证据 ID">
+      <button type="submit">加密保存关系</button>
+    </form>
+  </section>
+  <div class="wb-stepper">
+    <button class="wb-step" onclick="showTab('ai')"><span class="wb-step-num">Ⅰ</span><span data-cn="资料搜集 · 证据池" data-en="Source Capture">资料搜集 · 证据池</span></button>
+    <span class="wb-step-arrow">→</span>
+    <button class="wb-step" onclick="showTab('agent')"><span class="wb-step-num">Ⅱ</span><span data-cn="报告写作 · 交付" data-en="Report Writing">报告写作 · 交付</span></button>
+    <button class="wb-step-aux active" onclick="showTab('thinktanks')" data-cn="信源目录" data-en="Directory">信源目录</button>
+  </div>
+  <div class="thinktank-search-bar">
+    <input type="text" id="ttSearch" class="tt-search-input"
+           placeholder="搜索网站 / Search sites…" oninput="filterThinktanks(this.value)">
+    <span class="tt-search-icon">🔍</span>
+  </div>
+  <div id="thinktankContent" class="thinktank-grid">
+    <div class="loading-state"><div class="spinner"></div><p>加载智库目录…</p></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB 7: AI 智能分析
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-ai" class="tab-content" hidden>
+  <section class="v9-evidence-shelf" aria-labelledby="v9EvidenceTitle">
+    <header>
+      <div>
+        <span class="v9-kicker">ENCRYPTED EVIDENCE VAULT · CLIENT ONLY</span>
+        <h1 id="v9EvidenceTitle">证据库</h1>
+        <p>原文与来源链仅在已解锁本机解密；云端同步只接收密文。</p>
+      </div>
+      <label class="v9-evidence-search">
+        <span>内存检索</span>
+        <input id="v9EvidenceSearch" type="search" placeholder="搜索标题、来源、摘要…">
+      </label>
+    </header>
+    <div id="v9EvidenceList" class="v9-evidence-list">
+      <div class="v9-panel-loading">正在打开本地加密证据库…</div>
+    </div>
+  </section>
+  <div class="wb-stepper">
+    <button class="wb-step active" onclick="showTab('ai')"><span class="wb-step-num">Ⅰ</span><span data-cn="资料搜集 · 证据池" data-en="Source Capture">资料搜集 · 证据池</span></button>
+    <span class="wb-step-arrow">→</span>
+    <button class="wb-step" onclick="showTab('agent')"><span class="wb-step-num">Ⅱ</span><span data-cn="报告写作 · 交付" data-en="Report Writing">报告写作 · 交付</span></button>
+    <button class="wb-step-aux" onclick="showTab('thinktanks')" data-cn="信源目录" data-en="Directory">信源目录</button>
+  </div>
+  <div class="ai-zone">
+    <!-- AI 配置栏 -->
+    <div class="ai-config-bar" id="aiConfigBar">
+      <div class="ai-config-left">
+        <span class="ai-logo">AI</span>
+        <div>
+          <h2 data-cn="防务报告源抓取 Agent" data-en="Defense Source Retrieval Agent">防务报告源抓取 Agent</h2>
+          <p class="ai-config-sub" id="aiStatusText">检查AI配置中…</p>
+        </div>
+      </div>
+      <div class="ai-config-right">
+        <button class="ai-config-btn" onclick="toggleAiSettings()" id="aiSettingsBtn">⚙️ 配置AI</button>
+      </div>
+    </div>
+
+    <!-- AI 设置面板（默认隐藏） -->
+    <div class="ai-settings-panel" id="aiSettingsPanel" style="display:none">
+      <!-- 提供商预设快速选择 -->
+      <div class="ai-provider-presets">
+        <label class="ai-preset-label">🏆 顶级LLM服务商（点击快速切换）</label>
+        <div class="ai-preset-grid" id="aiPresetGrid"></div>
+      </div>
+      <div class="ai-settings-grid">
+        <div class="ai-field">
+          <label>官方 API 端点（固定）</label>
+          <input type="text" id="aiBaseUrl" value="https://api.deepseek.com" readonly aria-readonly="true">
+          <small id="aiBaseUrlHint">仅允许 DeepSeek、智谱 GLM、Moonshot Kimi 官方 HTTPS 端点</small>
+        </div>
+        <div class="ai-field">
+          <label>API Key</label>
+          <input type="password" id="aiApiKey" placeholder="sk-xxxxxxxx">
+          <small id="aiKeyHint">密钥仅保存在本机环境变量/内存中</small>
+        </div>
+        <div class="ai-field">
+          <label>模型（Model）</label>
+          <select id="aiModel"></select>
+          <small id="aiModelHint">不同服务商的模型清单会自动更新</small>
+        </div>
+        <div class="ai-field ai-field-actions">
+          <button class="ai-save-btn" onclick="saveAiConfig()">保存配置</button>
+          <button class="ai-test-btn" onclick="testAiConnection()">🔌 测试连接</button>
+          <a class="ai-get-key-link" id="aiGetKeyLink" href="#" target="_blank" rel="noopener">🔑 获取API Key</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="consult-stage">
+      <aside class="consult-panel consult-project-rail">
+        <div class="consult-project-head">
+          <div>
+            <h3>资料项目库</h3>
+            <span>本地 SQLite 保存，重开后可继续</span>
+          </div>
+          <b id="consultProjectCount">0</b>
+        </div>
+        <div class="consult-project-actions">
+          <button class="consult-secondary compact" onclick="consultNewSessionDraft()">新建</button>
+          <button class="consult-secondary compact" onclick="consultLoadSessions()">刷新</button>
+        </div>
+        <div id="consultProjectList" class="consult-project-list">
+          <div class="consult-empty">正在读取资料项目…</div>
+        </div>
+      </aside>
+
+      <div class="consult-workbench">
+        <section class="consult-panel consult-mission">
+        <div class="consult-panel-head">
+          <h3>防务报告源抓取 Agent</h3>
+          <span id="consultSessionBadge" class="consult-badge">未创建任务</span>
+        </div>
+        <div id="consultCapabilityNotice" class="consult-capability">
+          <strong>Agent 实际功能</strong>
+          <span>客户输入一个需求，Agent 自动联网搜集相关智库报告、官方文件、PDF、论文和网页正文，形成可审阅、可导出的资料包。</span>
+        </div>
+        <div id="searchStatusPanel" class="consult-search-config">
+          <div class="consult-panel-head compact-head">
+            <h3>联网搜集状态</h3>
+            <span id="searchStatusText" class="consult-muted">读取中</span>
+          </div>
+          <div id="searchProviderStatus" class="consult-provider-status"></div>
+          <details class="consult-advanced-config">
+            <summary>高级搜索配置</summary>
+            <div class="consult-key-grid">
+              <input id="searchTavilyKey" type="password" autocomplete="off" placeholder="Tavily API Key（增强主搜索，可选）">
+              <input id="searchBraveKey" type="password" autocomplete="off" placeholder="Brave Search API Key（增强备用，可选）">
+              <input id="searchSerpKey" type="password" autocomplete="off" placeholder="SerpAPI Key（Google增强，可选）">
+            </div>
+            <div class="consult-button-row">
+              <button class="consult-secondary compact" onclick="saveSearchConfig()">保存增强配置</button>
+              <button class="consult-secondary compact" onclick="loadSearchStatus()">刷新状态</button>
+            </div>
+          </details>
+        </div>
+        <label class="consult-label">客户需求</label>
+        <textarea id="consultInstruction" class="consult-instruction"
+          placeholder="例如：搜集20份台海无人系统智库报告 / 帮我找有关六代机发展的公开报告和论文"></textarea>
+        <div class="consult-controls">
+          <label class="consult-mini-field">
+            <span>目标来源</span>
+            <input id="consultTargetCount" type="number" min="1" value="20">
+          </label>
+          <label class="consult-check">
+            <input id="consultSearchWeb" type="checkbox" checked>
+            <span>联网搜集</span>
+          </label>
+        </div>
+        <div class="consult-button-row">
+          <button class="consult-primary wide" onclick="consultRunSourceAgent()">一键搜集并归档至目标</button>
+          <button class="consult-secondary compact" onclick="consultSearchSources()">仅搜索候选</button>
+        </div>
+        <div class="consult-plan" id="consultPlan">
+          <div class="consult-empty">输入客户指令后，Agent 会生成报告源抓取计划、搜索式和证据目标。</div>
+        </div>
+        <div id="consultCaptureCockpit" class="consult-capture-cockpit"></div>
+        </section>
+
+        <section class="consult-panel consult-evidence">
+        <div class="consult-panel-head">
+          <h3>报告源池</h3>
+          <div class="consult-actions">
+            <span id="consultSearchMeta" class="consult-muted">尚未检索</span>
+            <button class="consult-secondary compact" onclick="consultContinueToTarget()">继续归档至目标</button>
+            <button class="consult-secondary compact" onclick="consultDeepRetryToTarget()">深度补抓</button>
+            <button class="consult-secondary compact" onclick="consultSelectAllEvidence()">全选</button>
+            <button class="consult-secondary compact" onclick="consultArchiveSources()">归档选中来源</button>
+          </div>
+        </div>
+        <div id="consultEvidenceFilters" class="consult-filter-tabs"></div>
+        <div id="consultEvidenceList" class="consult-evidence-list">
+          <div class="consult-empty">检索后将在这里列出已抓取的具体报告/分析，以及仍需站内检索的智库目标。</div>
+        </div>
+        </section>
+
+        <section class="consult-panel consult-output">
+        <div class="consult-panel-head">
+          <h3>交付与复核</h3>
+          <div class="consult-actions">
+            <button class="consult-primary" onclick="consultExportSourcePack()">导出资料包</button>
+            <button class="consult-secondary" onclick="consultBuildSourcePack()">整理报告源包</button>
+            <button class="consult-secondary" onclick="consultOpenLocalArchive()">本地资料库</button>
+            <button class="consult-secondary" onclick="consultHandoffToReportAgent()">转入报告Agent</button>
+            <button class="consult-secondary" onclick="consultCopySourcePack()">复制</button>
+          </div>
+        </div>
+        <label class="consult-label">抓取 / 整理要求</label>
+        <textarea id="consultWritingReq" class="consult-review"
+          placeholder="例如：优先智库PDF、官方评估、政策分析；标注哪些只是站点入口，哪些是具体报告"></textarea>
+        <div class="consult-revise-row">
+          <input id="consultRevisionInput" class="consult-revise-input" type="text"
+                 placeholder="资料包备注：优先补抓RAND/CSIS/IISS，或按来源可信度重排">
+          <button class="consult-secondary" onclick="consultRevise()">修订</button>
+        </div>
+        <div id="consultOpsBoard" class="consult-ops-board"></div>
+        <div class="consult-workflow-strip">
+          <div id="consultGapAdvisor" class="consult-mini-module"></div>
+          <div id="consultHandoffChecklist" class="consult-mini-module"></div>
+        </div>
+        <div id="consultReadingQueue" class="consult-mini-module consult-reading-queue"></div>
+        <div id="consultAssetPreview" class="consult-asset-preview is-empty">
+          <div class="consult-asset-empty">
+            <strong>资料阅读窗</strong>
+            <span>在来源池点击“预览”，PDF 会在这里直接打开；DOCX/网页会以文档页方式显示已抽取正文。</span>
+          </div>
+        </div>
+        <div class="consult-preview-head">
+          <span>资料包正文预览</span>
+          <small>整理后用于 DOCX/PDF 导出，也可转入报告 Agent</small>
+        </div>
+        <div id="consultSourcePackBody" class="consult-report-body">
+          <div class="consult-empty">选择报告源后点击“整理报告源包”。资料包会区分已抓取具体报告/分析与待进入站内检索的智库目标。</div>
+        </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- AI 结果输出 -->
+    <div class="ai-result-panel" id="aiResultPanel" style="display:none">
+      <div class="ai-result-header">
+        <div class="ai-result-title">
+          <span id="aiResultIcon">AI</span>
+          <span id="aiResultLabel">AI 分析结果</span>
+          <span class="ai-model-badge" id="aiModelBadge"></span>
+        </div>
+        <div>
+          <button class="ai-copy-btn" onclick="aiCopyResult()" title="复制">复制</button>
+          <button class="ai-close-btn" onclick="aiCloseResult()">✕</button>
+        </div>
+      </div>
+      <div class="ai-result-body" id="aiResultBody">
+        <div class="ai-loading">
+          <div class="ai-spinner"></div>
+          <p>AI 正在分析中，请稍候…</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB 8: 报告 Agent 工作台
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-agent" class="tab-content" hidden>
+  <section class="v9-p3-panel v9-case-workspace" aria-labelledby="v9CaseTitle">
+    <header class="v9-page-head"><div><span class="v9-kicker">CASE WORKSPACE · VERSION CONTROLLED</span><h1 id="v9CaseTitle">案件工作区</h1><p>假设、证据、任务、矛盾材料和结论统一进入版本化案件。</p></div></header>
+    <div class="v9-case-grid"><aside id="v9CaseList" class="v9-p3-list"><div class="v9-panel-loading">尚无案件；可从告警一键转入。</div></aside><main id="v9CaseDetail"><div class="v9-panel-loading">选择一个案件查看证据时间线。</div></main></div>
+    <form id="v9CaseConclusionForm" class="v9-p3-form" hidden>
+      <textarea id="v9CaseConclusion" required placeholder="分析结论（必须引用证据）"></textarea>
+      <select id="v9CaseConclusionStatus"><option value="fact">已验证事实</option><option value="source_claim">来源声明</option><option value="inference" selected>分析推断</option><option value="scenario_assumption">情景假设</option></select>
+      <input id="v9CaseConclusionEvidence" class="v9-evidence-drop" required placeholder="引用证据 ID">
+      <input id="v9CaseHypothesis" placeholder="新增假设（可选）">
+      <input id="v9CaseTask" placeholder="新增任务（可选）">
+      <input id="v9CaseContradiction" class="v9-evidence-drop" placeholder="反证/矛盾证据 ID（可选）">
+      <input id="v9CaseConfidence" type="number" min="0" max="1" step=".05" value=".5">
+      <button type="submit">保存版本化结论</button>
+    </form>
+  </section>
+  <div class="wb-stepper">
+    <button class="wb-step" onclick="showTab('ai')"><span class="wb-step-num">Ⅰ</span><span data-cn="资料搜集 · 证据池" data-en="Source Capture">资料搜集 · 证据池</span></button>
+    <span class="wb-step-arrow">→</span>
+    <button class="wb-step active" onclick="showTab('agent')"><span class="wb-step-num">Ⅱ</span><span data-cn="报告写作 · 交付" data-en="Report Writing">报告写作 · 交付</span></button>
+    <button class="wb-step-aux" onclick="showTab('thinktanks')" data-cn="信源目录" data-en="Directory">信源目录</button>
+  </div>
+  <div class="agent-zone">
+    <div class="agent-header">
+      <div class="agent-header-left">
+        <span class="agent-logo">RW</span>
+        <div>
+          <h2>防务报告 Agent 工作台</h2>
+          <p class="agent-sub">客户一句话委托 · 智库/报告源检索 · 战略分析报告 · DOCX交付</p>
+        </div>
+      </div>
+      <div class="agent-header-right">
+        <span class="agent-stat">项目 <strong id="agentProjectCount">0</strong></span>
+        <span class="agent-stat">证据 <strong id="agentEvidenceCount">0</strong></span>
+        <button class="agent-secondary-btn" onclick="agentLoadProjects()">刷新</button>
+      </div>
+    </div>
+
+    <div class="agent-grid">
+      <aside class="agent-panel agent-sidebar">
+        <div class="agent-project-library-head">
+          <div>
+            <h3 class="agent-panel-title">报告项目库</h3>
+            <span>本地保存，选择项目即可恢复证据与草稿</span>
+          </div>
+          <strong id="agentProjectSidebarCount">0个</strong>
+        </div>
+        <div class="agent-project-actions">
+          <button class="agent-secondary-btn" onclick="agentNewProjectDraft()">新建</button>
+          <button class="agent-secondary-btn" onclick="agentLoadProjects()">刷新</button>
+        </div>
+        <div id="agentProjectList" class="agent-project-list">
+          <div class="agent-empty">暂无项目</div>
+        </div>
+
+        <h3 class="agent-panel-title agent-create-title">新建报告项目</h3>
+        <div class="agent-client-brief">
+          <div class="agent-brief-kicker">最简输入</div>
+          <textarea id="agentRequest" class="agent-request-area"
+                    placeholder="帮我做一个XXX报告，例如：帮我做一个台海军力平衡报告"></textarea>
+          <input id="agentTopic" class="agent-input" type="text" placeholder="可选聚焦：台海 / 六代机 / 印太 / 核力量">
+          <div class="agent-form-row">
+            <span class="agent-mode-chip">高价值防务战略分析报告</span>
+            <input id="agentTargetCount" class="agent-input agent-small-input" type="number" min="1" value="12" title="目标证据源数量">
+          </div>
+          <button class="agent-primary-btn wide" onclick="agentCreateProject()">创建战略报告项目</button>
+        </div>
+      </aside>
+
+      <section class="agent-panel agent-evidence-panel">
+        <div class="agent-panel-head">
+          <h3 class="agent-panel-title">智能体证据池</h3>
+          <div class="agent-actions">
+            <select id="agentMinLevel" class="agent-select compact">
+              <option value="A">S/A级</option>
+              <option value="S">仅S级</option>
+              <option value="B">B级以上</option>
+            </select>
+            <button class="agent-secondary-btn" onclick="agentCollectEvidence()">检索信息源</button>
+            <button class="agent-secondary-btn" onclick="agentAutonomousCollect()" title="Agent 自主联网检索并归档公开信源，补齐至目标数；未配 .search_config.json 时降级用公开网页抓取">🛰 自主扩池</button>
+          </div>
+        </div>
+        <div id="agentEvidenceMeta" class="agent-evidence-meta">
+          <span>目标 -</span><span>已收集 0</span>
+        </div>
+        <div id="agentHandoffChecklist" class="agent-handoff-checklist"></div>
+        <div id="agentEvidenceList" class="agent-evidence-list">
+          <div class="agent-empty">创建项目后，Agent会汇总RSS信息、智库、报告源与公开材料线索</div>
+        </div>
+      </section>
+
+      <main class="agent-panel agent-editor-panel">
+        <div class="agent-panel-head">
+          <h3 class="agent-panel-title">战略报告生产台</h3>
+          <div class="agent-actions">
+            <button class="agent-secondary-btn" onclick="agentGenerateOutline()">生成目录提纲</button>
+            <button class="agent-primary-btn" onclick="agentGenerateDraft()">生成完整报告</button>
+            <button class="agent-secondary-btn" onclick="agentExportDocx()">导出Word</button>
+          </div>
+        </div>
+        <div class="agent-writing-spec">写作规范：DefenseTracker SOD/SOP · 技术—能力—规则 · PARA · FACT-DATA-CITE</div>
+        <div id="agentDraftQuality" class="agent-draft-quality">字数校验：暂无完整报告</div>
+        <div id="agentReviewRadar" class="agent-review-radar"></div>
+        <label class="agent-editor-label">目录提纲大纲</label>
+        <textarea id="agentOutlineText" class="agent-outline-area" placeholder="先生成或手工编辑报告目录、提纲、分析框架"></textarea>
+        <label class="agent-editor-label">审稿意见</label>
+        <div class="agent-revise-row">
+          <input id="agentReviewInput" class="agent-input" type="text" placeholder="例如：增强战略判断、补充智库来源、压缩执行摘要、突出后续跟踪">
+          <button class="agent-secondary-btn" onclick="agentReviseDraft()">修订</button>
+        </div>
+        <label class="agent-editor-label">完整报告正文</label>
+        <textarea id="agentDraftText" class="agent-draft-area" placeholder="生成完整报告后可在这里继续编辑"></textarea>
+        <div class="agent-preview" id="agentPreview">
+          <div class="agent-empty">暂无完整报告</div>
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB 9: 要讯自动写作 (Brief Auto-Writing)
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-brief" class="tab-content" hidden>
+  <section class="v9-function-page v9-p5-writing" aria-labelledby="v9WritingTitle">
+    <header class="v9-page-head">
+      <div><span class="v9-kicker">WRITING ROOM · EVIDENCE PER PARAGRAPH</span><h1 id="v9WritingTitle">写作室</h1><p>报告与要讯统一为版本化项目；每段单独维护证据、来源状态和事实核查。</p></div>
+      <div class="v9-page-actions"><button class="v9-secondary" id="v9DocumentRefresh" type="button">刷新</button><button class="v9-primary" id="v9DocumentNew" type="button">新建稿件</button></div>
+    </header>
+    <div class="v9-writing-workbench">
+      <aside id="v9DocumentList" class="v9-p5-list"><div class="v9-panel-loading">尚无 V9 稿件</div></aside>
+      <main>
+        <form id="v9DocumentForm" class="v9-document-form" hidden>
+          <input id="v9DocumentId" type="hidden">
+          <input id="v9DocumentVersion" type="hidden">
+          <div class="v9-document-meta">
+            <label>标题<input id="v9DocumentTitle" maxlength="300" required placeholder="稿件标题"></label>
+            <label>类型<select id="v9DocumentKind"><option value="report">专题报告</option><option value="brief">要讯</option></select></label>
+            <label>阶段<select id="v9DocumentStage"><option value="outline">大纲</option><option value="draft">草稿</option><option value="review">复核</option><option value="ready">定稿</option></select></label>
+          </div>
+          <label class="v9-document-outline">大纲<textarea id="v9DocumentOutline" placeholder="结构、大纲和写作要求"></textarea></label>
+          <div class="v9-paragraph-head"><div><span>PARAGRAPH LEDGER</span><h2>段落与证据</h2></div><button id="v9ParagraphAdd" type="button">＋ 添加段落</button></div>
+          <div id="v9ParagraphList" class="v9-paragraph-list"></div>
+          <label class="v9-revision-note">修订说明<input id="v9RevisionNote" placeholder="本次修改的原因和范围"></label>
+          <div id="v9DocumentValidation" class="v9-document-validation" role="status">保存后显示校验结果</div>
+          <footer class="v9-document-actions">
+            <button class="v9-primary" type="submit">保存密文修订</button>
+            <button id="v9DocumentLayout" type="button">送入版面</button>
+            <button type="button" data-document-export="docx">导出 DOCX</button>
+            <button type="button" data-document-export="pdf">导出 PDF</button>
+          </footer>
+        </form>
+        <div id="v9DocumentEmpty" class="v9-p5-empty"><strong>建立第一份可签发稿件</strong><p>从证据库复制或拖入证据 ID，每段完成事实核查后才能进入待签发。</p></div>
+      </main>
+    </div>
+  </section>
+  <div class="brief-zone" hidden aria-hidden="true">
+    <!-- 顶部控制栏 -->
+    <div class="brief-header">
+      <div class="brief-header-left">
+        <span class="brief-logo">ED</span>
+        <div>
+          <h2 data-cn="PLA军语要讯自动撰写" data-en="PLA-Style Brief Auto-Writing">PLA军语要讯自动撰写</h2>
+          <p class="brief-sub" id="briefStatusText">基于《写作要点》选题 · 符合《命令》规范 · 一键批量生成5-10篇要讯</p>
+        </div>
+      </div>
+      <div class="brief-header-right">
+        <span class="brief-stat">候选篇数 <strong id="briefCandCount">—</strong></span>
+        <span class="brief-stat">已生成 <strong id="briefDoneCount">0</strong></span>
+        <button class="brief-refresh-btn" onclick="briefLoadCandidates()" title="刷新候选列表">刷新候选</button>
+      </div>
+    </div>
+
+    <!-- 快速操作区 -->
+    <div class="brief-quickbar">
+      <div class="brief-action-group">
+        <label class="brief-count-label">批量生成</label>
+        <select id="briefBatchCount" class="brief-count-select">
+          <option value="5">5 篇</option>
+          <option value="6">6 篇</option>
+          <option value="7">7 篇</option>
+          <option value="8" selected>8 篇（推荐）</option>
+          <option value="9">9 篇</option>
+          <option value="10">10 篇</option>
+        </select>
+        <button class="brief-batch-btn" id="briefBatchBtn" onclick="briefBatchGenerate()">
+          一键生成今日要讯
+        </button>
+      </div>
+      <div class="brief-action-group">
+        <button class="brief-auto-btn" id="briefAutoBtn" onclick="briefToggleAuto()">
+          自动刷新: <span id="briefAutoState">关</span>
+        </button>
+        <button class="brief-export-btn" onclick="briefDownloadAllDocx()" title="批量下载Word（每篇一个docx文件）">
+          分篇下载
+        </button>
+        <button class="brief-export-btn" onclick="briefDownloadCompiledDocx()" title="汇编导出为单一docx（每篇分页）">
+          汇编Word
+        </button>
+        <button class="brief-export-btn" onclick="briefExportAll()" title="导出全部要讯为TXT汇编">
+          汇编TXT
+        </button>
+        <button class="brief-clear-btn" onclick="briefClearResults()" title="清空已生成">
+          清空
+        </button>
+      </div>
+    </div>
+
+    <!-- 进度条（批量生成时显示） -->
+    <div class="brief-progress-bar" id="briefProgressBar" style="display:none">
+      <div class="brief-progress-fill" id="briefProgressFill"></div>
+      <span class="brief-progress-text" id="briefProgressText">准备中…</span>
+    </div>
+
+    <!-- 今日产出：落盘 DOCX 列表（手动+22:00自动包） -->
+    <div class="brief-today">
+      <div class="brief-today-head">
+        <span class="brief-section-title" style="margin:0">今日产出</span>
+        <span class="brief-stat">共 <strong id="briefTodayCount">—</strong> 份</span>
+        <button class="brief-refresh-btn" onclick="briefLoadTodayFiles()" title="刷新列表">刷新</button>
+      </div>
+      <div id="briefTodayList"></div>
+    </div>
+
+    <!-- ═══ 导入素材生成要讯 ═══════════════════════════════════ -->
+    <div class="import-panel" id="importPanel">
+      <div class="import-panel-header" onclick="toggleImportPanel()">
+        <h3 class="import-panel-title">导入素材生成要讯</h3>
+        <span class="import-panel-hint">支持导入网址链接 / 上传文件（.txt .docx .pdf） / 粘贴文本</span>
+        <span class="import-toggle" id="importToggle">▼</span>
+      </div>
+      <div class="import-panel-body" id="importPanelBody">
+        <!-- 三种导入方式切换 -->
+        <div class="import-tabs">
+          <button class="import-tab active" onclick="switchImportTab('url')" id="importTabUrl">网址导入</button>
+          <button class="import-tab" onclick="switchImportTab('file')" id="importTabFile">文件导入</button>
+          <button class="import-tab" onclick="switchImportTab('text')" id="importTabText">文本导入</button>
+        </div>
+        <!-- URL导入 -->
+        <div class="import-content" id="importContentUrl">
+          <div class="import-url-row">
+            <input type="text" id="importUrlInput" class="import-url-input" placeholder="粘贴新闻网址或文章链接，如 https://www.defense.gov/News/..." autocomplete="off" />
+            <button class="import-go-btn" id="importUrlBtn" onclick="importFromUrl()">生成要讯</button>
+          </div>
+          <p class="import-tip">系统将自动抓取网页内容、提取标题和正文，然后按《写作要点》生成PLA机关军语要讯</p>
+        </div>
+        <!-- 文件导入 -->
+        <div class="import-content" id="importContentFile" style="display:none">
+          <div class="import-file-row">
+            <label class="import-file-label" for="importFileInput">
+              <span class="import-file-icon">FILE</span>
+              <span class="import-file-text" id="importFileText">点击选择文件或拖拽至此</span>
+              <span class="import-file-formats">支持 .txt / .docx / .pdf</span>
+            </label>
+            <input type="file" id="importFileInput" accept=".txt,.docx,.pdf" style="display:none" onchange="importFileSelected(this)" />
+            <button class="import-go-btn" id="importFileBtn" onclick="importFromFile()" disabled>生成要讯</button>
+          </div>
+        </div>
+        <!-- 文本导入 -->
+        <div class="import-content" id="importContentText" style="display:none">
+          <input type="text" id="importTextTitle" class="import-text-title" placeholder="标题（可选，不填则自动截取首行）" />
+          <textarea id="importTextArea" class="import-text-area" rows="6" placeholder="粘贴原始素材内容（新闻报道、研究论文摘要、情报简报等，至少30字）..."></textarea>
+          <div class="import-text-row">
+            <input type="text" id="importTextSource" class="import-text-source" placeholder="信息来源（可选，如：美防务一号网站）" />
+            <button class="import-go-btn" id="importTextBtn" onclick="importFromText()">生成要讯</button>
+          </div>
+        </div>
+        <!-- 导入状态 -->
+        <div class="import-status" id="importStatus" style="display:none">
+          <div class="import-status-icon" id="importStatusIcon">⏳</div>
+          <div class="import-status-text" id="importStatusText">正在抓取网页内容…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 两栏布局：候选列表 + 生成结果 -->
+    <div class="brief-main">
+      <!-- 左栏：候选文章列表 -->
+      <aside class="brief-candidates">
+        <h3 class="brief-section-title">📌 精品候选池（S/A级质量优先）</h3>
+        <div class="brief-cand-list" id="briefCandList">
+          <div class="brief-empty">正在加载候选文章…</div>
+        </div>
+      </aside>
+
+      <!-- 右栏：已生成要讯 -->
+      <main class="brief-results">
+        <h3 class="brief-section-title">已生成要讯</h3>
+        <div class="brief-result-list" id="briefResultList">
+          <div class="brief-empty">
+            <div style="font-size:28px;margin-bottom:12px">暂无内容</div>
+            <div style="font-weight:600;margin-bottom:6px">暂无要讯</div>
+            <div style="font-size:13px;opacity:.7">点击"一键生成今日要讯"或从左侧选择单篇生成</div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- 格式规范说明 -->
+    <details class="brief-format-help">
+      <summary>📖 写作规范 · 《写作要点》摘要</summary>
+      <div class="brief-help-content">
+        <div class="help-block">
+          <h4>选题原则</h4>
+          <ul>
+            <li><strong>选题要大</strong>（国家PLA相关）：PLA备战、装备部署、重大演训、核战略、颠覆性技术</li>
+            <li><strong>标题要亮</strong>（主语明确，警示收尾："值得警惕""值得关注""威胁"）</li>
+            <li><strong>行文要简</strong>（据XX报道，（一）（二）（三）分列）</li>
+            <li><strong>报送要快</strong>（当天）</li>
+          </ul>
+        </div>
+        <div class="help-block">
+          <h4>格式要求（命令.txt）</h4>
+          <ul>
+            <li>单段成文，300字以内</li>
+            <li>背景+影响+建议三段论</li>
+            <li>影响分三点：（1）（2）（3）</li>
+            <li>PLA军语文风：严谨、凝练、客观</li>
+          </ul>
+        </div>
+      </div>
+    </details>
+  </div>
+</div>
+
+<!-- ─── AI 分析浮动按钮（新闻页面用） ─── -->
+<div class="ai-fab" id="aiFab" style="display:none" onclick="aiAnalyzeSelected()">
+  <span class="ai-fab-icon">AI</span>
+  <span class="ai-fab-text">AI分析选中 (<span id="aiFabCount">0</span>)</span>
+</div>
+
+<!-- ─── 右键上下文菜单 ─── -->
+<div class="ctx-menu" id="ctxMenu" style="display:none">
+  <div class="ctx-item" onclick="ctxAiAnalyze()">AI深度分析</div>
+  <div class="ctx-item" onclick="ctxAiCompare()">加入对比</div>
+  <div class="ctx-item" onclick="ctxTranslate()">翻译全文</div>
+  <div class="ctx-item" onclick="ctxBookmark()">收藏/取消</div>
+  <div class="ctx-sep"></div>
+  <div class="ctx-item" onclick="ctxCopyLink()">复制链接</div>
+  <div class="ctx-item" onclick="ctxOpenNew()">新窗口打开</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     TAB: 我的追踪（Supabase Watchlist）
+     ═══════════════════════════════════════════════════════════ -->
+<div id="tab-content-tracking" class="tab-content" hidden>
+  <section class="v9-p3-panel v9-alert-workspace" aria-labelledby="v9AlertTitle">
+    <header class="v9-page-head">
+      <div><span class="v9-kicker">ALERT TRIAGE · EVIDENCE PRESERVED</span><h1 id="v9AlertTitle">告警分诊</h1><p>规则命中去重、认领、静默、升级、关闭，并一键复制证据链转为案件。</p></div>
+      <div class="v9-page-actions"><button class="v9-primary" id="v9AlertMaterialize" type="button">扫描当前新闻规则</button></div>
+    </header>
+    <div class="v9-alert-summary"><span>待处理 <strong id="v9AlertOpenCount">0</strong></span><span>已升级 <strong id="v9AlertEscalatedCount">0</strong></span><span>已转案件 <strong id="v9AlertCaseCount">0</strong></span></div>
+    <div id="v9AlertList" class="v9-alert-list"><div class="v9-panel-loading">尚无告警；运行规则扫描后显示。</div></div>
+  </section>
+  <div class="trk-zone">
+    <div class="trk-header">
+      <div class="trk-header-left">
+        <span class="trk-logo">📌</span>
+        <div>
+          <h2 data-cn="我的追踪清单" data-en="My Watchlist">我的追踪清单</h2>
+          <p class="trk-sub" id="trkStatusText">添加关键词/主题 → 自动从实时新闻里匹配追踪 · 云端持久化(Supabase)</p>
+        </div>
+      </div>
+      <div class="trk-header-right">
+        <span class="trk-stat"><span data-cn="追踪项" data-en="Topics">追踪项</span> <strong id="trkTopicCount">—</strong></span>
+        <button class="trk-refresh-btn" id="trkFavBtn" onclick="trackingToggleFav()" title="跨追踪项查看全部收藏">⭐ 收藏夹</button>
+        <button class="trk-refresh-btn" onclick="trackingSyncAlerts()" title="把追踪关键词同步到实时新闻的预警词">同步到预警</button>
+        <button class="trk-refresh-btn" onclick="trackingLoad()" title="刷新">刷新</button>
+      </div>
+    </div>
+
+    <!-- 添加追踪项 -->
+    <div class="trk-add">
+      <input id="trkLabel" class="trk-input trk-input-label" type="text" maxlength="120"
+             placeholder="追踪项名称，如：高超音速武器 / 台海 / F-35">
+      <input id="trkKeywords" class="trk-input trk-input-kw" type="text"
+             placeholder="关键词，逗号分隔，如：高超音速,乘波体,hypersonic">
+      <select id="trkMode" class="trk-select" title="匹配模式">
+        <option value="any">任一命中</option>
+        <option value="all">全部命中</option>
+      </select>
+      <button class="trk-add-btn" id="trkAddBtn" onclick="trackingAdd()">添加追踪</button>
+    </div>
+    <div class="trk-hint" id="trkHint"></div>
+
+    <!-- 追踪项列表（含实时命中数 + 展开查看命中文章） -->
+    <div class="trk-list" id="trkList"><div class="trk-empty">加载中…</div></div>
+    <!-- 收藏夹（跨追踪项的全部 star 文章，默认隐藏，由「收藏夹」按钮切换） -->
+    <div class="trk-fav" id="trkFav" hidden></div>
+  </div>
+</div>
+
+<!-- ═══ V9 智能体编队 ═══ -->
+<div id="tab-content-squad" class="tab-content" hidden>
+  <section class="v9-function-page v9-p4-workspace">
+    <header class="v9-page-head">
+      <div><span class="v9-kicker">LOCAL AGENT SQUAD · RECOVERABLE STATE</span><h1>智能体编队</h1><p>任务正文只在已解锁桌面处理；阶段、人工闸门与失败类型以密文持久化。</p></div>
+      <div class="v9-page-actions"><button class="v9-secondary" id="v9JobRefresh" type="button">刷新任务</button></div>
+    </header>
+    <div class="v9-task-grid v9-job-templates">
+      <button type="button" data-job-template="rapid_assessment"><span>01 · 快速研判</span><strong>把一条突发新闻扩展为可追溯研判卡</strong><em>搜集 → 精读 → 构架 → 成稿 → 校验</em></button>
+      <button type="button" data-job-template="deep_research"><span>02 · 专题深挖</span><strong>围绕目标实体建立证据链与时间线</strong><em>大纲处设置人工闸门</em></button>
+      <button type="button" data-job-template="scenario_simulation"><span>03 · 情景推演</span><strong>生成关键变量、触发器与三分支路径</strong><em>红队 → 蓝队 → 裁判</em></button>
+      <button type="button" data-job-template="brief_draft"><span>04 · 要讯成稿</span><strong>从证据池生成可校验要讯草案</strong><em>签发前再次人工确认</em></button>
+    </div>
+    <form id="v9JobForm" class="v9-p3-form v9-p4-form" hidden>
+      <input id="v9JobTemplate" type="hidden">
+      <input id="v9JobTitle" required placeholder="任务标题">
+      <textarea id="v9JobInstructions" placeholder="任务要求（可选）"></textarea>
+      <input id="v9JobEvidence" class="v9-evidence-drop" required placeholder="证据 ID（可从证据库拖入）">
+      <button type="submit">创建本地密文任务</button>
+    </form>
+    <div class="v9-job-workbench">
+      <aside id="v9JobList" class="v9-p4-list"><div class="v9-panel-loading">尚无本地智能体任务</div></aside>
+      <main id="v9JobDetail"><div class="v9-panel-loading">选择任务查看阶段与人工闸门。</div></main>
+    </div>
+  </section>
+</div>
+
+<!-- ═══ V9 情景推演 ═══ -->
+<div id="tab-content-scenario" class="tab-content" hidden>
+  <section class="v9-function-page v9-p4-workspace">
+    <header class="v9-page-head">
+      <div><span class="v9-kicker">SCENARIO LAB · INFERENCE, NOT FACT</span><h1>情景推演</h1><p>基准、升级、缓和并列保存；红队、蓝队、裁判输出始终标注为推演/推断。</p></div>
+      <div class="v9-page-actions"><button class="v9-primary" id="v9ScenarioNew" type="button">新建推演</button></div>
+    </header>
+    <div class="v9-inference-banner">⚠ 本屏全部内容属于情景推演，不得作为已验证事实引用。</div>
+    <form id="v9ScenarioCreateForm" class="v9-p3-form v9-p4-form" hidden>
+      <input id="v9ScenarioTitle" required placeholder="推演标题">
+      <textarea id="v9ScenarioQuestion" required placeholder="需要回答的核心问题"></textarea>
+      <input id="v9ScenarioEvidence" class="v9-evidence-drop" required placeholder="基础证据 ID">
+      <input id="v9ScenarioAssumptions" placeholder="初始假设（逗号分隔）">
+      <button type="submit">创建三分支推演</button>
+    </form>
+    <div class="v9-scenario-workbench">
+      <aside id="v9ScenarioList" class="v9-p4-list"><div class="v9-panel-loading">尚无情景推演</div></aside>
+      <main>
+        <div id="v9ScenarioDetail"><div class="v9-panel-loading">选择推演查看三分支。</div></div>
+        <form id="v9ScenarioEditForm" hidden>
+          <div class="v9-scenario-common">
+            <label>假设<input id="v9ScenarioEditAssumptions" placeholder="逗号分隔"></label>
+            <label>共同观察指标<input id="v9ScenarioObservables" placeholder="逗号分隔"></label>
+          </div>
+          <div class="v9-branch-editor" id="v9BranchEditors">
+            <fieldset data-branch="baseline"><legend>基准分支 · BASELINE</legend><textarea data-field="summary" placeholder="分支摘要"></textarea><input data-field="triggers" placeholder="触发器，逗号分隔"><input data-field="indicators" placeholder="观察指标，逗号分隔"><input data-field="counter" class="v9-evidence-drop" placeholder="反证 ID"><input data-field="confidence" type="number" min="0" max="1" step=".05" value="0"></fieldset>
+            <fieldset data-branch="escalation"><legend>升级分支 · ESCALATION</legend><textarea data-field="summary" placeholder="分支摘要"></textarea><input data-field="triggers" placeholder="触发器，逗号分隔"><input data-field="indicators" placeholder="观察指标，逗号分隔"><input data-field="counter" class="v9-evidence-drop" placeholder="反证 ID"><input data-field="confidence" type="number" min="0" max="1" step=".05" value="0"></fieldset>
+            <fieldset data-branch="deescalation"><legend>缓和分支 · DE-ESCALATION</legend><textarea data-field="summary" placeholder="分支摘要"></textarea><input data-field="triggers" placeholder="触发器，逗号分隔"><input data-field="indicators" placeholder="观察指标，逗号分隔"><input data-field="counter" class="v9-evidence-drop" placeholder="反证 ID"><input data-field="confidence" type="number" min="0" max="1" step=".05" value="0"></fieldset>
+          </div>
+          <div class="v9-team-editor">
+            <fieldset data-team="red"><legend>红队输出</legend><textarea data-field="text" placeholder="挑战既有判断"></textarea><input data-field="evidence" class="v9-evidence-drop" placeholder="引用证据 ID"></fieldset>
+            <fieldset data-team="blue"><legend>蓝队输出</legend><textarea data-field="text" placeholder="构造替代解释"></textarea><input data-field="evidence" class="v9-evidence-drop" placeholder="引用证据 ID"></fieldset>
+            <fieldset data-team="judge"><legend>裁判输出</legend><textarea data-field="text" placeholder="比较论证与不确定性"></textarea><input data-field="evidence" class="v9-evidence-drop" placeholder="引用证据 ID"></fieldset>
+          </div>
+          <button class="v9-primary" type="submit">保存版本化推演</button>
+        </form>
+      </main>
+    </div>
+  </section>
+</div>
+
+<!-- ═══ V9 版面计划 ═══ -->
+<div id="tab-content-delivery" class="tab-content" hidden>
+  <section class="v9-function-page v9-p5-delivery">
+    <header class="v9-page-head">
+      <div><span class="v9-kicker">PUBLISHING DESK · IMMUTABLE RELEASE</span><h1>版面计划</h1><p>Editor 编排版面，Approver 终审签发或撤回；签发固化正文、来源索引、内容哈希和审计记录。</p></div>
+      <div class="v9-page-actions"><button class="v9-secondary" id="v9PublicationRefresh" type="button">刷新版面</button><button class="v9-primary" type="button" data-v9-target="brief">返回写作室 →</button></div>
+    </header>
+    <div id="v9DeliverySummary" class="v9-delivery-summary" role="status">加载密文版面状态…</div>
+    <div class="v9-delivery-board v9-p5-board">
+      <section data-publication-column="evidence_needed"><header><span>01</span><b>待补证</b><em>0</em></header><div></div></section>
+      <section data-publication-column="editing"><header><span>02</span><b>编辑中</b><em>0</em></header><div></div></section>
+      <section data-publication-column="pending_approval"><header><span>03</span><b>待签发</b><em>0</em></header><div></div></section>
+      <section data-publication-column="signed"><header><span>04</span><b>已签发</b><em>0</em></header><div></div></section>
+    </div>
+    <section class="v9-recalled-ledger"><header><span>RECALLED</span><h2>撤回记录</h2></header><div id="v9RecalledList">暂无撤回记录</div></section>
+    <section class="v9-audit-ledger"><header><span>AUDIT TRAIL</span><h2>发布审计</h2></header><div id="v9AuditList">暂无审计事件</div></section>
+  </section>
+</div>
+
+  </section>
+</main>
+
+<div class="v9-cloud-panel" id="v9RecoveryPanel" hidden>
+  <article class="v9-cloud-card v9-recovery-card" role="dialog" aria-modal="true" aria-labelledby="v9RecoveryTitle">
+    <header>
+      <div><span class="v9-kicker">ZERO-KNOWLEDGE · RECOVERY</span><h2 id="v9RecoveryTitle">保存个人工作区恢复码</h2></div>
+    </header>
+    <section>
+      <p>这是解密组织数据的最后恢复手段。系统不会把它上传到服务器，也无法在丢失后替你找回。</p>
+      <code class="v9-recovery-code" id="v9RecoveryCode"></code>
+      <button class="v9-secondary" id="v9RecoveryCopy" type="button">复制恢复码</button>
+      <label class="v9-recovery-confirmation">
+        <input id="v9RecoverySaved" type="checkbox">
+        <span>我已将恢复码离线保存并完成核对</span>
+      </label>
+      <button class="v9-primary" id="v9RecoveryConfirm" type="button" disabled>完成安全初始化</button>
+    </section>
+  </article>
+</div>
+
+<div class="v9-cloud-panel" id="v9CloudPanel" hidden>
+  <article class="v9-cloud-card" role="dialog" aria-modal="true" aria-labelledby="v9CloudTitle">
+    <header>
+      <div><span class="v9-kicker">ZERO-KNOWLEDGE · SUPABASE STAGING</span><h2 id="v9CloudTitle">身份与设备</h2></div>
+      <button class="v9-cloud-close" id="v9CloudClose" type="button" aria-label="关闭">×</button>
+    </header>
+    <section>
+      <p id="v9CloudIdentity">正在检查本机会话…</p>
+      <form id="v9CloudLoginForm" autocomplete="off">
+        <label>受邀邮箱<input id="v9CloudEmail" type="email" required autocomplete="email"></label>
+        <button class="v9-primary" type="submit">发送邮箱登录链接</button>
+        <small>邮件可在默认浏览器打开；验证码只回到本机固定 loopback 端口，PKCE verifier 与 Refresh Token 均由 Windows DPAPI 保护。</small>
+      </form>
+      <div id="v9CloudWorkspace" hidden>
+        <label>当前组织<select id="v9CloudOrganization"></select></label>
+        <p class="v9-cloud-device-line" id="v9CloudDevices">正在读取设备状态…</p>
+        <p class="v9-cloud-device-line" id="v9CloudSyncStatus">尚未读取同步状态</p>
+        <div class="v9-cloud-actions">
+          <button class="v9-primary" id="v9CloudBootstrap" type="button" hidden>创建个人云组织</button>
+          <button class="v9-primary" id="v9CloudSync" type="button">立即同步密文</button>
+        </div>
+        <form id="v9CloudInviteForm" autocomplete="off">
+          <label>邀请邮箱<input id="v9CloudInviteEmail" type="email" autocomplete="off"></label>
+          <label>角色<select id="v9CloudInviteRole"><option value="collector">Collector</option><option value="analyst">Analyst</option><option value="editor">Editor</option><option value="approver">Approver</option><option value="admin">Admin</option><option value="owner">Owner</option></select></label>
+          <button class="v9-secondary" type="submit">邀请成员</button>
+        </form>
+        <button class="v9-secondary" id="v9CloudLogout" type="button">清除本机会话</button>
+      </div>
+    </section>
+    <section><p class="v9-cloud-status" id="v9CloudStatus" role="status" aria-live="polite">业务正文始终以密文进入 Supabase。</p></section>
+  </article>
+</div>
+
+<!-- ─── 首次使用引导 ─────────────────────────────────────── -->
+<div class="v9-onboarding" id="v9Onboarding" hidden>
+  <div class="v9-onboarding-backdrop" data-v9-dismiss></div>
+  <section class="v9-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="v9OnboardingTitle">
+    <header>
+      <span>FIRST RUN · 三分钟看懂</span>
+      <h2 id="v9OnboardingTitle">一条情报的完整旅程</h2>
+      <p>系统围绕一个闭环组织：情报自动流入并评分 → 值得深挖的建卷研判 → 智能体编队起草成稿 → 值班主编签发交付。每一步都能自动接力，也随时可人工介入。</p>
+    </header>
+    <div class="v9-onboarding-steps">
+      <article class="red"><em>01</em><h3>情报流入</h3><p>多信源自动抓取、翻译、评分。突发走电讯滚条，命中订阅规则的直接进告警队列。</p><small>实时新闻 · 电讯 · 告警分诊</small></article>
+      <article class="gold"><em>02</em><h3>研判建档</h3><p>值得深挖的条目入卷跟踪：挂实体、存证据、写批注，图谱与地图帮你看清关联。</p><small>案件工作区 · 实体图谱 · 证据库</small></article>
+      <article class="green"><em>03</em><h3>智能成稿</h3><p>把题目派给五人智能体编队：搜集→精读→构架→成稿→校验，大纲处停人工闸门。</p><small>智能体编队 · 写作室</small></article>
+      <article class="cyan"><em>04</em><h3>签发交付</h3><p>成稿进入看板流转，排进日刊版面，签发后进入客户门户，全程留审计痕迹。</p><small>版面计划 · 交付门户 · 审计</small></article>
+    </div>
+    <footer>
+      <span>⌘K 随处检索与执行　·　? 快捷键　·　告警页 ⚡ 闭环一键完整流程</span>
+      <div><button class="v9-secondary" id="v9FollowAlert" type="button">带我看告警闭环</button><button class="v9-primary" id="v9StartBtn" type="button">开始使用</button></div>
+    </footer>
+  </section>
+</div>
+
+<footer class="footer">
+  <span>
+    防务数据追踪系统 V9 · 情报流入 → 研判建档 → 智能成稿 → 签发交付 · 仅供学习研究
+  </span>
+</footer>
+
+<!-- 回到顶部按钮 -->
+<button id="backToTop" class="back-to-top" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="回到顶部">▲</button>
+
+<!-- 前端按 Tab 拆分为多文件，经典 <script> 顺序加载（共享全局作用域，保持内联 onclick 全局可见 + showTab 链式 override 顺序）。改前为单文件 app.js。 -->
+<script nonce="{{ g.csp_nonce }}" src="/static/js/util.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/core.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/news.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/china.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/thinktanks.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/ai.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/agent.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/brief.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/tracking.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/p3-workflow-v9.js?v=20260725-p3"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/p4-orchestration-v9.js?v=20260725-p4"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/p5-publication-v9.js?v=20260725-p5"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/command-hub-v9.js?v=20260725-p3"></script>
+<script nonce="{{ g.csp_nonce }}" type="module" src="/static/js/vendor/v9-supabase-auth.mjs?v=20260730-context"></script>
+</body>
+</html>

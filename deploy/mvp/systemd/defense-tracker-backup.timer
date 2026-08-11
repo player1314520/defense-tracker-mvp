@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly DefenseTracker backup (Asia/Shanghai)
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 Asia/Shanghai
+RandomizedDelaySec=15m
+Persistent=true
+Unit=defense-tracker-backup.service
+
+[Install]
+WantedBy=timers.target

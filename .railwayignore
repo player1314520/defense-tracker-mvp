@@ -1,0 +1,70 @@
+# Railway cloud deployment only runs v9_cloud.py and the v9 package.
+# Exclude desktop/full-text code and heavy local files.
+
+# Git history (huge)
+.git/
+
+# Claude / IDE workspace (contains worktrees = duplicate project)
+.claude/
+.vscode/
+.idea/
+
+# Compiled / build artifacts
+dist/
+build/
+*.spec
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Secrets & local state
+.access_token
+.ai_config.json
+.ai_config.key
+.email_config.json
+.email_config.key
+.feishu_config.json
+.supabase_config.json
+.supabase_v9_config.json
+.v9_local_master.key
+*.key
+.env
+.env.*
+
+# OS / editor junk
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Project-specific runtime / generated files
+ssl/
+data/
+*.ico
+*.log
+test_output.docx
+
+# Documentation (not needed at runtime)
+*.md
+docs/
+
+# Scripts & desktop launcher assets (cloud bot doesn't use them)
+scripts/
+launcher.py
+
+# Local-only Flask and legacy full-text bots are never cloud-deployed.
+app.py
+feishu_bot.py
+feishu_cloud.py
+feishu_common.py
+templates/
+static/
+
+# Other deploy variants (cloud uses Procfile + railway.json only)
+deploy/Dockerfile
+deploy/Dockerfile.cloud
+deploy/nginx.conf
+deploy/docker-compose.yml
+deploy/requirements.server.txt

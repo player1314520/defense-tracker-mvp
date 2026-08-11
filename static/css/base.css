@@ -1,0 +1,149 @@
+/* ═══════════════════════════════════════════════════════════
+   防务数据追踪系统 v8.0 Priority Scoring Edition · Defense Intelligence Hub
+   ═══════════════════════════════════════════════════════════ */
+:root {
+  --bg-base:   #060d1a;
+  --bg-panel:  #0c1829;
+  --bg-card:   #0f2038;
+  --bg-hover:  #162b47;
+  --border:    #1e3a5f;
+  --border-glow:#2563eb44;
+  --blue-1: #2563eb; --blue-2: #3b82f6; --blue-3: #60a5fa;
+  --green-1:#10b981; --green-2:#34d399;
+  --red-1:  #dc2626; --red-2:  #f87171;
+  --amber:  #f59e0b; --purple: #7c3aed;
+  --text-1: #e2e8f0; --text-2: #94a3b8; --text-3: #475569;
+  --font: 'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  --radius: 8px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg-base);color:var(--text-1);font-family:var(--font);font-size:14px;min-height:100vh;overflow-x:hidden}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:var(--bg-base)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--blue-1)}
+
+/* ── 顶部导航 ───────────────────────────────────────────── */
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:52px;
+  background:linear-gradient(90deg,#03081a,#0a1628 50%,#03081a);
+  border-bottom:1px solid var(--border);box-shadow:0 2px 20px rgba(37,99,235,.15);
+  position:sticky;top:0;z-index:200}
+.topbar-left{display:flex;align-items:center;gap:14px}
+.logo{font-size:17px;font-weight:700;letter-spacing:.5px;
+  background:linear-gradient(90deg,#60a5fa,#34d399);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.tagline{font-size:10px;letter-spacing:2px;color:var(--text-3);text-transform:uppercase}
+.topbar-right{display:flex;align-items:center;gap:10px}
+.clock{font-family:'Courier New',monospace;font-size:12px;color:var(--green-2);letter-spacing:1px}
+.status-pill{display:flex;align-items:center;gap:6px;background:#0d2a1a;border:1px solid #1a4a2e;
+  border-radius:20px;padding:4px 12px;font-size:12px;color:var(--green-2)}
+.status-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--green-1);
+  box-shadow:0 0 6px var(--green-1);animation:pulse 2s infinite}
+.status-pill.error{border-color:#4a1a1a;color:var(--red-2)}
+.status-pill.error .dot{background:var(--red-1);box-shadow:0 0 6px var(--red-1)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+.lang-btn{background:rgba(37,99,235,.15);border:1px solid var(--border);color:var(--blue-3);
+  border-radius:6px;padding:5px 12px;font-size:12px;font-weight:700;cursor:pointer;
+  transition:all .2s;letter-spacing:1px}
+.lang-btn:hover{background:var(--blue-1);color:#fff;border-color:var(--blue-1)}
+.refresh-btn{background:var(--blue-1);color:#fff;border:none;border-radius:6px;
+  padding:6px 12px;font-size:15px;cursor:pointer;transition:all .2s}
+.refresh-btn:hover{background:var(--blue-2)}
+.refresh-btn:active{transform:scale(.93)}
+
+/* ── 标签页 ─────────────────────────────────────────────── */
+.tab-nav{display:flex;align-items:center;gap:0;padding:0 20px;
+  background:var(--bg-panel);border-bottom:1px solid var(--border);
+  position:sticky;top:52px;z-index:190}
+.tab-btn{background:transparent;border:none;border-bottom:2px solid transparent;
+  padding:12px 20px;font-size:13px;font-weight:600;color:var(--text-3);
+  cursor:pointer;transition:all .2s;white-space:nowrap}
+.tab-btn:hover{color:var(--text-2)}
+.tab-btn.active{color:var(--blue-3);border-bottom-color:var(--blue-2)}
+.tab-stats{display:flex;gap:8px;margin-left:auto;align-items:center;padding:0 0 0 20px}
+.stat-chip{display:flex;align-items:center;gap:5px;background:var(--bg-card);
+  border:1px solid var(--border);border-radius:20px;padding:3px 10px;
+  font-size:11px;color:var(--text-3)}
+.stat-chip strong{color:var(--blue-3);font-size:13px}
+.update-chip strong{color:var(--green-2);font-size:11px}
+
+/* ── Tab 内容区 ─────────────────────────────────────────── */
+.tab-content{display:none}
+.tab-content.active{display:block}
+
+/* ── 新闻 Tab 网格 ──────────────────────────────────────── */
+.main-grid{display:grid;grid-template-columns:1fr 260px;gap:12px;padding:12px;
+  max-width:1600px;margin:0 auto}
+@media(max-width:1000px){.main-grid{grid-template-columns:1fr}}
+
+/* ── 面板 ───────────────────────────────────────────────── */
+.panel{background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.panel-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;
+  padding:11px 16px;border-bottom:1px solid var(--border);background:rgba(37,99,235,.06)}
+.panel-header h2{font-size:13px;font-weight:700;color:var(--text-1)}
+.source-tag{font-size:10px;color:var(--text-3);background:var(--bg-card);
+  border:1px solid var(--border);border-radius:4px;padding:2px 8px}
+
+/* ── 新闻面板 ───────────────────────────────────────────── */
+.news-panel{display:flex;flex-direction:column;height:calc(100vh - 120px)}
+.filter-bar{display:flex;gap:5px;flex-wrap:wrap}
+.filter-btn{background:var(--bg-card);border:1px solid var(--border);color:var(--text-2);
+  border-radius:4px;padding:3px 9px;font-size:11px;cursor:pointer;transition:all .2s}
+.filter-btn:hover{border-color:var(--blue-2);color:var(--blue-3)}
+.filter-btn.active{background:var(--blue-1);border-color:var(--blue-1);color:#fff}
+.news-list{flex:1;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:5px}
+
+/* ── 新闻卡片 ───────────────────────────────────────────── */
+.news-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:11px;cursor:pointer;transition:all .2s;border-left:3px solid transparent;
+  text-decoration:none;display:block;color:inherit}
+.news-card:hover{background:var(--bg-hover);border-color:var(--border-glow);transform:translateX(3px)}
+.news-card-top{display:flex;align-items:flex-start;gap:8px;margin-bottom:5px}
+.source-badge{font-size:10px;font-weight:700;white-space:nowrap;border-radius:3px;
+  padding:2px 7px;flex-shrink:0;background:rgba(37,99,235,.2);
+  border:1px solid rgba(37,99,235,.3);color:var(--blue-3)}
+.news-title{font-size:13px;font-weight:600;color:var(--text-1);line-height:1.4;flex:1}
+.news-meta{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-3)}
+.news-summary{font-size:12px;color:var(--text-2);margin-top:5px;line-height:1.5;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+
+/* ── 新闻侧栏 ───────────────────────────────────────────── */
+.news-aside{display:flex;flex-direction:column;gap:0;max-height:calc(100vh - 120px);overflow-y:auto}
+.feed-status-list{padding:8px;display:flex;flex-direction:column;gap:4px}
+.feed-row{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:4px;
+  font-size:12px;transition:background .2s}
+.feed-row:hover{background:var(--bg-hover)}
+.feed-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.feed-dot.ok{background:var(--green-1);box-shadow:0 0 4px var(--green-1)}
+.feed-dot.err{background:var(--red-1)}
+.feed-name{flex:1;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.feed-count{color:var(--blue-3);font-weight:700;font-size:11px}
+.feed-streak{color:#ef4444;font-size:10px;font-weight:700;padding:1px 5px;
+  background:rgba(239,68,68,.12);border-radius:3px;cursor:help}
+.feed-summary{display:flex;align-items:center;gap:10px;padding:8px 10px;
+  background:var(--bg-card);border:1px solid var(--border);border-radius:6px;
+  margin-bottom:6px;font-size:12px;flex-wrap:wrap}
+.feed-summary-total{color:var(--text-2);font-weight:600}
+.feed-summary-ok{color:#10b981;font-weight:700}
+.feed-summary-warn{color:#f59e0b;font-weight:700}
+.feed-summary-dead{color:#ef4444;font-weight:700}
+.feed-summary-toggle{margin-left:auto;background:transparent;border:1px solid var(--border);
+  color:var(--text-2);border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;
+  transition:all .2s}
+.feed-summary-toggle:hover{border-color:var(--blue-2);color:var(--blue-3)}
+.feed-details{display:flex;flex-direction:column;gap:4px}
+.quick-links{padding:8px;display:flex;flex-direction:column;gap:4px}
+.quick-link{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:4px;
+  background:var(--bg-card);border:1px solid var(--border);
+  text-decoration:none;color:var(--text-2);font-size:12px;transition:all .2s}
+.quick-link:hover{border-color:var(--blue-2);color:var(--blue-3);background:var(--bg-hover)}
+.quick-link-icon{font-size:14px}
+
+/* ── 加载 / 错误 ─────────────────────────────────────────── */
+.loading-state{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;padding:60px 20px;color:var(--text-3);text-align:center;line-height:1.6}
+.spinner{width:34px;height:34px;border:3px solid var(--border);border-top-color:var(--blue-2);
+  border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.error-state{padding:40px 20px;text-align:center;color:var(--red-2)}
+

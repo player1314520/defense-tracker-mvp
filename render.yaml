@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: defense-tracker-v9-coordinator
+    runtime: python
+    plan: free
+    buildCommand: pip install -r deploy/requirements.cloud.txt
+    startCommand: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 30 v9_cloud:app
+    healthCheckPath: /ready
+    envVars:
+      - key: V9_PRODUCTION_MODE
+        value: "true"
+      - key: V9_SUPABASE_URL
+        sync: false
+      - key: V9_SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: FEISHU_VERIFY_TOKEN
+        sync: false
+      - key: V9_COORDINATOR_TOKEN
+        sync: false
+      - key: V9_ALLOWED_ORIGINS
+        sync: false
+      - key: V9_CLOUD_DB_PATH
+        value: /data/v9-cloud.sqlite3
+      - key: PYTHON_VERSION
+        value: "3.11"

@@ -1,0 +1,173 @@
+/* ══════════════════════════════════════════════════════════
+   💬 飞书机器人配置面板 v1.0
+   ══════════════════════════════════════════════════════════ */
+.feishu-zone{padding:16px;max-width:1100px;margin:0 auto}
+
+/* 状态栏 */
+.feishu-status-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;
+  background:#0a1f1a;border:1px solid #1a4a2e;border-radius:8px;margin-bottom:16px;font-size:13px}
+.feishu-status-dot{font-size:10px;color:#64748b}
+.feishu-status-dot.ok{color:#10b981;text-shadow:0 0 6px #10b981}
+.feishu-status-dot.warn{color:#f59e0b}
+.feishu-webhook-url{margin-left:auto;font-family:monospace;font-size:11px;color:#475569}
+
+/* 双列网格 */
+.feishu-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:800px){.feishu-grid{grid-template-columns:1fr}}
+
+/* 面板 */
+.feishu-panel{background:var(--bg-panel);border:1px solid var(--border);border-radius:10px;padding:20px}
+.feishu-panel-title{font-size:14px;font-weight:700;color:var(--text-1);margin-bottom:10px;
+  padding-bottom:8px;border-bottom:1px solid var(--border)}
+.feishu-hint{font-size:12px;color:var(--text-3);margin-bottom:14px;line-height:1.6}
+.feishu-divider{border:none;border-top:1px solid var(--border);margin:18px 0}
+
+/* 表单 */
+.feishu-label{display:block;font-size:12px;color:var(--text-2);margin-bottom:5px;font-weight:600}
+.feishu-input{width:100%;padding:9px 12px;background:var(--bg-card);border:1px solid var(--border);
+  border-radius:7px;color:var(--text-1);font-size:13px;outline:none;margin-bottom:12px;
+  box-sizing:border-box;font-family:monospace}
+.feishu-input:focus{border-color:var(--blue-1);box-shadow:0 0 0 2px rgba(37,99,235,.15)}
+
+/* 按钮 */
+.feishu-btn-primary{width:100%;padding:10px;background:var(--blue-1);color:#fff;border:none;
+  border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:all .2s;margin-bottom:8px}
+.feishu-btn-primary:hover{background:var(--blue-2)}
+.feishu-btn-secondary{width:100%;padding:9px;background:transparent;color:var(--blue-3);
+  border:1px solid var(--blue-1);border-radius:8px;font-size:13px;cursor:pointer;transition:all .2s}
+.feishu-btn-secondary:hover{background:rgba(37,99,235,.1)}
+
+/* 保存提示 */
+.feishu-save-msg{font-size:12px;min-height:18px;margin-top:4px;text-align:center;
+  transition:opacity .3s;color:var(--green-1)}
+
+/* Webhook URL 显示 */
+.feishu-url-box{display:flex;align-items:center;gap:8px;padding:10px 12px;
+  background:var(--bg-card);border:1px solid var(--border);border-radius:7px;margin-bottom:12px}
+.feishu-url-box span{font-family:monospace;font-size:11px;color:var(--green-2);word-break:break-all;flex:1}
+.feishu-copy-btn{background:none;border:1px solid var(--border);border-radius:5px;
+  padding:4px 8px;cursor:pointer;font-size:14px;flex-shrink:0;color:var(--text-2)}
+.feishu-copy-btn:hover{border-color:var(--blue-1);color:var(--blue-3)}
+
+/* 配置向导步骤 */
+.feishu-steps{display:flex;flex-direction:column;gap:14px}
+.feishu-step{display:flex;gap:12px;align-items:flex-start}
+.feishu-step-num{width:26px;height:26px;border-radius:50%;background:var(--blue-1);color:#fff;
+  font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.feishu-step-body strong{font-size:13px;color:var(--text-1);display:block;margin-bottom:3px}
+.feishu-step-body p{font-size:12px;color:var(--text-3);line-height:1.6;margin:0}
+.feishu-step-body code{background:rgba(37,99,235,.15);color:var(--blue-3);
+  padding:1px 5px;border-radius:3px;font-size:11px;font-family:monospace}
+
+/* 使用方式 */
+.feishu-usage{display:flex;flex-direction:column;gap:8px}
+.feishu-usage-row{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-2)}
+.feishu-tag{background:rgba(37,99,235,.15);color:var(--blue-3);padding:2px 8px;
+  border-radius:4px;font-size:11px;font-weight:700;min-width:36px;text-align:center;flex-shrink:0}
+
+/* ══════════════════════════════════════════════════════════
+   📱 移动端适配 Beta（鸿蒙/手机版）
+   ══════════════════════════════════════════════════════════ */
+@media(max-width:480px){
+  /* 顶栏：紧凑化 */
+  .topbar{height:44px;padding:0 10px}
+  .logo{font-size:14px}
+  .tagline{display:none}
+  .clock{display:none}
+  .lang-btn{padding:4px 8px;font-size:10px}
+  .refresh-btn{padding:4px 8px;font-size:13px}
+  .status-pill{padding:3px 8px;font-size:10px}
+
+  /* 标签栏：横向滚动 */
+  .tab-nav{padding:0 6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+    scrollbar-width:none;top:44px;gap:0;flex-wrap:nowrap}
+  .tab-nav::-webkit-scrollbar{display:none}
+  .tab-btn{padding:8px 10px;font-size:11px;flex-shrink:0}
+  .tab-stats{display:none}
+
+  /* 主布局：单列 */
+  .main-grid{grid-template-columns:1fr!important;padding:6px;gap:8px}
+  .news-panel{height:auto;max-height:none}
+  #newsListContainer{max-height:calc(100vh - 150px);overflow-y:auto}
+
+  /* 筛选/排序：换行紧凑 */
+  .filter-bar{flex-wrap:wrap;gap:4px;padding:6px 8px}
+  .filter-btn{padding:8px 12px;font-size:10px;min-height:44px}
+  .ctrl-row{flex-direction:column;gap:6px;padding:6px 8px}
+  .sort-group,.star-filter-group{flex-wrap:wrap;gap:4px}
+  .sort-btn{padding:8px 12px;font-size:10px;min-height:44px}
+  .star-filter-btn{padding:3px 6px;font-size:10px}
+
+  /* 新闻卡片：全宽紧凑 */
+  .news-card{padding:8px 10px}
+  .news-title{font-size:14px;line-height:1.4}
+  .news-meta{font-size:11px;line-height:1.6;flex-wrap:wrap;gap:3px}
+  .news-footer{flex-wrap:wrap;gap:4px}
+  .news-footer button{padding:3px 6px;font-size:10px}
+  .news-tags{gap:3px}
+  .news-tags span{font-size:9px;padding:1px 5px}
+
+  /* 星级显示 */
+  .priority-stars{padding:2px 6px;font-size:9px}
+  .star-num{font-size:12px}
+
+  /* 搜索框 */
+  .search-bar-wrap{margin:4px 0}
+  .news-search-input{font-size:13px;padding:6px 8px 6px 28px}
+  .search-icon{left:8px;font-size:13px}
+
+  /* 面板头 */
+  .panel-header h2{font-size:13px}
+  .panel-header{padding:8px 10px}
+
+  /* 侧边统计面板隐藏（移动端节省空间） */
+  .side-panel,.priority-stats-panel{display:none}
+
+  /* 冲突追踪：单列 */
+  .conflict-zones-grid{grid-template-columns:1fr!important}
+  .conflict-card{padding:10px}
+
+  /* 地球仪：减小高度 */
+  .globe-layout{grid-template-columns:1fr!important;height:auto}
+  #globeContainer,.globe-wrap{height:50vh!important;min-height:280px}
+  .globe-info-panel{max-height:40vh}
+
+  /* AI面板 */
+  .ai-features-grid{grid-template-columns:1fr!important}
+  .ai-input-area textarea{font-size:13px;min-height:60px}
+  .ai-result-panel{max-height:50vh;overflow-y:auto}
+  .ai-config-bar{flex-direction:column;gap:6px}
+
+  /* 要讯写作 */
+  .brief-main{grid-template-columns:1fr!important}
+  .brief-quickbar{flex-direction:column;gap:6px}
+  .brief-result-item{padding:8px}
+
+  /* 智库目录 */
+  .tt-category-grid{grid-template-columns:1fr!important}
+
+  /* 数据图表 */
+  .data-grid{grid-template-columns:1fr!important}
+
+  /* 通用弹窗适配 */
+  .modal-body{width:95vw!important;max-width:95vw!important;margin:10px auto}
+
+  /* 底部留空（手机安全区域） */
+  body{padding-bottom:env(safe-area-inset-bottom,20px)}
+}
+
+/* 平板适配 */
+@media(min-width:481px) and (max-width:768px){
+  .topbar{height:48px;padding:0 12px}
+  .tagline{font-size:8px}
+  .tab-nav{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tab-btn{padding:10px 14px;font-size:12px}
+  .main-grid{grid-template-columns:1fr!important;padding:8px}
+  .news-panel{height:auto}
+  .filter-bar{flex-wrap:wrap}
+  .ai-features-grid{grid-template-columns:repeat(2,1fr)}
+  .globe-layout{grid-template-columns:1fr!important}
+  #globeContainer,.globe-wrap{height:55vh!important}
+  .side-panel{display:none}
+}
+

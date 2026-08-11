@@ -1,0 +1,38 @@
+name: defense-tracker-v9-staging
+
+services:
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.cloud
+    environment:
+      PORT: "8080"
+      V9_PRODUCTION_MODE: "false"
+      V9_CLOUD_DB_PATH: /data/v9-cloud.sqlite3
+      V9_COORDINATOR_TOKEN: ${V9_COORDINATOR_TOKEN:?set a staging token}
+      FEISHU_VERIFY_TOKEN: ${FEISHU_VERIFY_TOKEN:?set a staging verification token}
+      V9_ALLOWED_ORIGINS: ${V9_ALLOWED_ORIGINS:?set the exact staging portal origin}
+    ports:
+      - "127.0.0.1:8088:8080"
+    volumes:
+      - v9-staging-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  v9-staging-data:

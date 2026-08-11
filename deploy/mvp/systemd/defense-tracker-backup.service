@@ -1,0 +1,26 @@
+[Unit]
+Description=DefenseTracker encrypted offsite backup
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=MVP_PRODUCTION_ENV=/etc/defense-tracker/production.env
+ExecStart=/opt/defense-tracker/current/deploy/mvp/bin/backup.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

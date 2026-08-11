@@ -1,0 +1,157 @@
+/* ═══ 我的追踪（Watchlist）· 深蓝霓虹主题，作用域 #tab-content-tracking ═══ */
+.trk-zone { max-width: 1200px; margin: 0 auto; padding: 8px 12px 80px; }
+
+.trk-header {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; flex-wrap: wrap; margin: 6px 0 16px;
+  padding-bottom: 12px; border-bottom: 1px solid var(--border, #1e3a5f);
+}
+.trk-header-left { display: flex; align-items: center; gap: 12px; }
+.trk-logo {
+  font-size: 26px; line-height: 1;
+  filter: drop-shadow(0 0 6px var(--border-glow, #2563eb44));
+}
+.trk-header h2 { margin: 0; font-size: 18px; color: var(--ink1, #ece6da); font-family: var(--serif); font-weight: 500; }
+.trk-sub { margin: 2px 0 0; font-size: 12px; color: var(--text-2, #7e93ac); }
+.trk-header-right { display: flex; align-items: center; gap: 12px; }
+.trk-stat { font-size: 12px; color: var(--text-2, #7e93ac); }
+.trk-stat strong { color: var(--blue-3, #60a5fa); font-size: 15px; margin-left: 3px; }
+.trk-refresh-btn {
+  background: var(--bg-card, #0f2038); color: var(--text-1, #d9e2ec);
+  border: 1px solid var(--border, #1e3a5f); border-radius: var(--radius, 8px);
+  padding: 6px 14px; cursor: pointer; font-size: 12px;
+}
+.trk-refresh-btn:hover { background: var(--bg-hover, #162b47); }
+
+/* 添加区 */
+.trk-add {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  background: var(--bg-panel, #0c1829); border: 1px solid var(--border, #1e3a5f);
+  border-radius: var(--radius, 8px); padding: 12px;
+}
+.trk-input, .trk-select {
+  background: var(--bg-base, #060d1a); color: var(--text-1, #d9e2ec);
+  border: 1px solid var(--border, #1e3a5f); border-radius: 6px;
+  padding: 9px 12px; font-size: 13px; font-family: var(--font, sans-serif);
+}
+.trk-input:focus, .trk-select:focus {
+  outline: none; border-color: var(--blue-2, #3b82f6);
+  box-shadow: 0 0 0 2px var(--border-glow, #2563eb44);
+}
+.trk-input-label { flex: 1 1 240px; }
+.trk-input-kw { flex: 2 1 320px; }
+.trk-add-btn {
+  background: var(--blue-2, #2563eb); color: #fff; border: none;
+  border-radius: 6px; padding: 9px 20px; cursor: pointer; font-size: 13px; font-weight: 600;
+}
+.trk-add-btn:hover { background: var(--blue-3, #3b82f6); }
+.trk-add-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.trk-hint { min-height: 18px; margin: 8px 2px; font-size: 12px; color: var(--blue-3, #60a5fa); }
+.trk-hint-err { color: var(--red, #ef4444); }
+
+/* 列表 */
+.trk-list { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.trk-empty { padding: 28px 12px; text-align: center; color: var(--text-2, #7e93ac); font-size: 13px; }
+
+.trk-item {
+  background: var(--bg-card, #0f2038); border: 1px solid var(--border, #1e3a5f);
+  border-radius: var(--radius, 8px); overflow: hidden;
+}
+.trk-item-head {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; flex-wrap: wrap; padding: 12px 14px;
+}
+.trk-item-main { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.trk-item-label { font-size: 15px; font-weight: 600; color: var(--text-1, #d9e2ec); }
+.trk-item-kw { font-size: 12px; color: var(--amber, #f59e0b); }
+.trk-item-kw i { color: var(--text-2, #7e93ac); }
+.trk-item-mode {
+  font-size: 11px; color: var(--text-2, #7e93ac);
+  border: 1px solid var(--border, #1e3a5f); border-radius: 10px; padding: 1px 8px;
+}
+.trk-item-actions { display: flex; align-items: center; gap: 8px; }
+.trk-badge {
+  font-size: 12px; color: var(--blue-3, #60a5fa);
+  background: var(--bg-base, #060d1a); border: 1px solid var(--border, #1e3a5f);
+  border-radius: 10px; padding: 2px 10px; white-space: nowrap;
+}
+.trk-btn {
+  background: var(--bg-panel, #0c1829); color: var(--text-1, #d9e2ec);
+  border: 1px solid var(--border, #1e3a5f); border-radius: 6px;
+  padding: 5px 12px; cursor: pointer; font-size: 12px;
+}
+.trk-btn:hover { background: var(--bg-hover, #162b47); }
+.trk-btn-danger:hover { border-color: var(--red, #ef4444); color: var(--red, #ef4444); }
+
+/* 命中文章 */
+.trk-matches {
+  border-top: 1px solid var(--border, #1e3a5f);
+  background: var(--bg-base, #060d1a); padding: 4px 0;
+}
+.trk-hit {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 14px; border-bottom: 1px solid var(--border-glow, #1e3a5f33);
+}
+.trk-hit:last-child { border-bottom: none; }
+.trk-star {
+  flex: 0 0 auto; background: none; border: none; cursor: pointer;
+  font-size: 17px; line-height: 1; color: var(--text-2, #7e93ac); padding: 0 2px;
+}
+.trk-star.on { color: var(--amber, #f59e0b); }
+.trk-hit-title {
+  flex: 1 1 auto; min-width: 0; color: var(--text-1, #d9e2ec);
+  text-decoration: none; font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.trk-hit-title:hover { color: var(--blue-3, #60a5fa); text-decoration: underline; }
+.trk-hit-meta { flex: 0 0 auto; font-size: 11px; color: var(--text-2, #7e93ac); }
+
+/* 内联编辑表单 */
+.trk-edit {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  padding: 10px 14px; border-top: 1px solid var(--border, #1e3a5f);
+  background: var(--bg-panel, #0c1829);
+}
+.trk-edit .trk-edit-label { flex: 1 1 180px; }
+.trk-edit .trk-edit-kw { flex: 2 1 260px; }
+.trk-edit-en {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text-2, #7e93ac); cursor: pointer; white-space: nowrap;
+}
+.trk-edit-en input { accent-color: var(--blue-2, #2563eb); }
+
+/* 暂停(禁用)态 */
+.trk-item-off { opacity: .58; }
+.trk-item-offtag {
+  font-size: 11px; color: var(--amber, #f59e0b);
+  border: 1px solid var(--amber, #f59e0b); border-radius: 10px; padding: 1px 8px;
+}
+
+/* 命中相关度分 */
+.trk-hit-score {
+  flex: 0 0 auto; font-size: 11px; color: var(--purple, #7c3aed);
+  border: 1px solid var(--border, #1e3a5f); border-radius: 8px; padding: 1px 7px;
+}
+
+/* tab 角标：启用追踪项的命中总数 */
+.trk-tab-badge {
+  display: inline-block; margin-left: 6px; min-width: 16px; padding: 0 5px;
+  font-size: 10px; line-height: 16px; text-align: center; vertical-align: middle;
+  color: #fff; background: var(--red, #ef4444); border-radius: 9px;
+}
+/* 命中关键词高亮 */
+.trk-mark { background: transparent; color: var(--amber, #f59e0b); font-weight: 600; }
+
+/* 收藏夹面板（复用 .trk-hit 行样式） */
+.trk-fav {
+  margin-top: 12px; background: var(--bg-card, #0f2038);
+  border: 1px solid var(--border, #1e3a5f); border-radius: var(--radius, 8px); overflow: hidden;
+}
+.trk-fav-head {
+  padding: 10px 14px; font-size: 13px; font-weight: 600; color: var(--amber, #f59e0b);
+  border-bottom: 1px solid var(--border, #1e3a5f); background: var(--bg-panel, #0c1829);
+}
+
+/* 顶部 tab 按钮的一点点强调 */
+.track-tab.active { color: var(--amber, #f59e0b) !important; }

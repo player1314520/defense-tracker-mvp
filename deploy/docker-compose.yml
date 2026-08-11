@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  tracker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: defense-tracker
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: "1.0"
+    environment:
+      # ── 必填：非 loopback 部署必须显式启用访问令牌 ──
+      DEFENSE_TRACKER_BIND_HOST: "0.0.0.0"
+      ACCESS_TOKEN_REQUIRED: "1"
+      ACCESS_TOKEN: "${DEFENSE_TRACKER_ACCESS_TOKEN:?set DEFENSE_TRACKER_ACCESS_TOKEN}"
+      # ── AI 配置 ──
+      AI_API_KEY:  ""
+      AI_BASE_URL: "https://api.deepseek.com"
+      AI_MODEL:    "deepseek-chat"
+      # ── 飞书机器人（可选）──
+      FEISHU_APP_ID:       ""
+      FEISHU_APP_SECRET:   ""
+      FEISHU_VERIFY_TOKEN: ""
+    volumes:
+      # 持久化 access_token 文件，重启后不变
+      - ../data:/app/data
+    expose:
+      - "5000"
+    networks:
+      - tracker-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: defense-tracker-nginx
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: "0.25"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro   # nginx.conf 与 docker-compose.yml 同在 deploy/
+      - ./ssl:/etc/nginx/ssl:ro          # deploy/ssl/ 放 SSL 证书（见下方说明）
+      - nginx-cache:/var/cache/nginx
+    depends_on:
+      - tracker
+    networks:
+      - tracker-net
+
+volumes:
+  nginx-cache:
+
+networks:
+  tracker-net:
+    driver: bridge

@@ -1,0 +1,220 @@
+/* ═══════════════════════════════════════════════════════════
+   工作台三屏编辑室协调（报告源抓取 / 报告写作 / 智库目录）
+   —— 收尾"青黄不接"：桥接只换了色，这一层换"骨相"。
+   作用域限 #tab-content-ai / -agent / -thinktanks；末位加载压过旧霓虹。
+   设计稿依据 dc.html:279-431。不动布局、不碰共享 features.css，
+   只统一：杀阴影/渐变 → 衬线标题 + mono 小标签 → 直角扁平 + 编辑室线色。
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── 1. 底面 + 杀霓虹（阴影/文字光晕，编辑室一律无）── */
+#tab-content-ai, #tab-content-agent, #tab-content-thinktanks {
+  background: var(--bg); color: var(--ink1); font-family: var(--sans);
+}
+#tab-content-ai *, #tab-content-agent *, #tab-content-thinktanks * {
+  box-shadow: none !important; text-shadow: none !important;
+}
+
+/* ── 2. 标题 → 衬线；副标/说明 → 编辑室灰 ── */
+#tab-content-ai h1, #tab-content-ai h2, #tab-content-ai h3, #tab-content-ai h4,
+#tab-content-agent h1, #tab-content-agent h2, #tab-content-agent h3, #tab-content-agent h4,
+#tab-content-thinktanks h1, #tab-content-thinktanks h2, #tab-content-thinktanks h3, #tab-content-thinktanks h4 {
+  font-family: var(--serif) !important; font-weight: 500 !important;
+  color: var(--ink1) !important; letter-spacing: .2px;
+}
+
+/* ── 3. 小标签/角标/元信息 → mono ── */
+#tab-content-ai [class*="kicker"], #tab-content-ai [class*="label"], #tab-content-ai [class*="badge"],
+#tab-content-ai [class*="meta"], #tab-content-ai [class*="sub"], #tab-content-ai [class*="tag"],
+#tab-content-ai [class*="code"], #tab-content-ai [class*="stat"], #tab-content-ai [class*="count"],
+#tab-content-ai [class*="flag"], #tab-content-ai [class*="pill"],
+#tab-content-agent [class*="kicker"], #tab-content-agent [class*="label"], #tab-content-agent [class*="badge"],
+#tab-content-agent [class*="meta"], #tab-content-agent [class*="byline"], #tab-content-agent [class*="tag"],
+#tab-content-agent [class*="val"], #tab-content-agent [class*="date"], #tab-content-agent [class*="pill"],
+#tab-content-agent [class*="corrob"], #tab-content-agent [class*="verdict"],
+#tab-content-thinktanks [class*="kicker"], #tab-content-thinktanks [class*="label"],
+#tab-content-thinktanks [class*="badge"], #tab-content-thinktanks [class*="meta"],
+#tab-content-thinktanks [class*="tag"], #tab-content-thinktanks [class*="stat"], #tab-content-thinktanks [class*="count"] {
+  font-family: var(--mono) !important; letter-spacing: .3px;
+}
+
+/* ── 4. 直角扁平：交互件 + 卡片 ── */
+#tab-content-ai button, #tab-content-ai input, #tab-content-ai textarea, #tab-content-ai select,
+#tab-content-ai [class*="btn"], #tab-content-ai [class*="card"], #tab-content-ai [class*="panel"],
+#tab-content-ai [class*="chip"], #tab-content-ai [class*="badge"], #tab-content-ai [class*="field"],
+#tab-content-ai [class*="preset"], #tab-content-ai [class*="pill"],
+#tab-content-agent button, #tab-content-agent input, #tab-content-agent textarea, #tab-content-agent select,
+#tab-content-agent [class*="btn"], #tab-content-agent [class*="card"], #tab-content-agent [class*="panel"],
+#tab-content-agent [class*="chip"], #tab-content-agent [class*="pill"], #tab-content-agent [class*="field"],
+#tab-content-thinktanks button, #tab-content-thinktanks input, #tab-content-thinktanks select,
+#tab-content-thinktanks [class*="btn"], #tab-content-thinktanks [class*="card"], #tab-content-thinktanks [class*="panel"] {
+  border-radius: 0 !important;
+}
+
+/* ── 5. 面板/卡片背景压平（杀渐变）+ 编辑室线色 ── */
+#tab-content-ai .ai-zone, #tab-content-ai .consult-panel, #tab-content-ai [class*="settings-panel"],
+#tab-content-ai [class*="result-panel"], #tab-content-ai [class*="config-bar"],
+#tab-content-agent .agent-header, #tab-content-agent [class*="np-card"], #tab-content-agent [class*="evidence"],
+#tab-content-agent [class*="client-brief"], #tab-content-agent [class*="handoff"],
+#tab-content-thinktanks [class*="panel"], #tab-content-thinktanks [class*="card"] {
+  background-image: none !important;
+}
+#tab-content-ai [class*="panel"], #tab-content-ai [class*="card"], #tab-content-ai [class*="settings-grid"],
+#tab-content-agent [class*="panel"], #tab-content-agent [class*="card"],
+#tab-content-thinktanks [class*="panel"], #tab-content-thinktanks [class*="card"] {
+  border-color: var(--line2) !important;
+}
+
+/* ── 6. 主/次按钮编辑室化 ── */
+#tab-content-ai .ai-save-btn, #tab-content-ai .ai-qa-send, #tab-content-ai [class*="primary"],
+#tab-content-agent [class*="primary"], #tab-content-agent [class*="generate"], #tab-content-agent [class*="run"] {
+  background: var(--accent) !important; background-image: none !important;
+  color: #faf5ef !important; border: none !important; letter-spacing: 1px;
+}
+#tab-content-ai .ai-test-btn, #tab-content-ai .ai-config-btn, #tab-content-ai .ai-copy-btn,
+#tab-content-ai .ai-close-btn, #tab-content-agent .agent-link {
+  background: none !important; color: var(--ink3) !important;
+  border: 1px solid var(--line2) !important; font-family: var(--mono) !important;
+}
+#tab-content-ai .ai-test-btn:hover, #tab-content-ai .ai-config-btn:hover,
+#tab-content-agent .agent-link:hover { color: var(--ink1) !important; border-color: var(--ink3) !important; }
+
+/* ── 7. 输入件编辑室化 ── */
+#tab-content-ai input, #tab-content-ai textarea, #tab-content-ai select,
+#tab-content-agent input, #tab-content-agent textarea, #tab-content-agent select {
+  background: var(--bg) !important; color: var(--ink1) !important;
+  border: 1px solid var(--line2) !important; font-family: var(--sans);
+}
+
+/* ── 8. 进度/评分填充条：实心赭石/锈红（非渐变）── */
+#tab-content-agent .agent-dim-fill, #tab-content-ai .consult-ops-progress > * ,
+#tab-content-agent [class*="dim-fill"], #tab-content-ai [class*="progress-fill"] {
+  background: var(--ochre) !important; background-image: none !important;
+}
+#tab-content-agent .agent-dim-track, #tab-content-ai [class*="track"] {
+  background: var(--line) !important;
+}
+
+/* ── 9. Tab 内二级切换（ai-tab/agent-tab）→ 文字下划线式 ── */
+#tab-content-ai .ai-tab, #tab-content-agent .agent-tab {
+  background: none !important; background-image: none !important; border: none !important;
+  border-radius: 0 !important; color: var(--ink3) !important;
+  font-family: var(--sans) !important; position: relative;
+}
+#tab-content-ai .ai-tab.active, #tab-content-agent .agent-tab.active {
+  color: var(--ink1) !important; font-weight: 500 !important;
+}
+#tab-content-ai .ai-tab.active::after, #tab-content-agent .agent-tab.active::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--accent);
+}
+
+/* ── 10. 智库目录：站点链接行式（设计稿 dc:280-299）── */
+#tab-content-thinktanks a[class*="tt-"], #tab-content-thinktanks [class*="site"] {
+  text-decoration: none; color: var(--ink1);
+}
+#tab-content-thinktanks a[class*="tt-"] { font-family: var(--serif); }
+
+/* ── 11. gradient-text 标题/徽标（.ai-logo 等）→ 实心墨色 ── */
+#tab-content-ai .ai-logo, #tab-content-ai h1, #tab-content-ai h2, #tab-content-ai h3,
+#tab-content-agent .ai-logo, #tab-content-agent h1, #tab-content-agent h2, #tab-content-agent h3 {
+  background: none !important; background-image: none !important;
+  -webkit-text-fill-color: var(--ink1) !important;
+  -webkit-background-clip: border-box !important; background-clip: border-box !important;
+  color: var(--ink1) !important; font-family: var(--serif) !important;
+}
+
+/* ── 12. AI 供应商档位徽标 → 编辑室扁平（杀紫/靛/绿彩色渐变）── */
+#tab-content-ai .ai-preset-tier {
+  background: none !important; background-image: none !important;
+  border: 1px solid var(--line2) !important; color: var(--ink2) !important;
+  font-family: var(--mono) !important; border-radius: 0 !important;
+}
+#tab-content-ai .ai-preset-tier.flagship { color: var(--accent) !important; border-color: var(--accent) !important; }
+
+/* ── 13. 智库目录（tt-*/thinktank-*）编辑室化 ── */
+#tab-content-thinktanks .thinktank-search-bar {
+  border: 1px solid var(--line2) !important; background: var(--panel) !important; border-radius: 0 !important;
+}
+#tab-content-thinktanks .tt-search-input {
+  background: none !important; border: none !important; color: var(--ink1) !important; font-family: var(--sans) !important;
+}
+#tab-content-thinktanks .tt-cat-header { border-bottom: 1px solid var(--line2); padding-bottom: 8px; }
+#tab-content-thinktanks .tt-cat-icon { display: none; }
+#tab-content-thinktanks .tt-cat-name-cn {
+  font-family: var(--serif) !important; font-size: 18px; font-weight: 500; color: var(--ink1) !important;
+}
+#tab-content-thinktanks .tt-cat-name-en, #tab-content-thinktanks .tt-cat-count, #tab-content-thinktanks .tt-cat-desc {
+  font-family: var(--mono) !important; font-size: 10px; letter-spacing: .5px; color: var(--ink3) !important; text-transform: uppercase;
+}
+#tab-content-thinktanks .tt-site-name, #tab-content-thinktanks .tt-site-name-cn {
+  font-family: var(--serif) !important; color: var(--ink1) !important;
+}
+#tab-content-thinktanks .tt-site-desc-cn, #tab-content-thinktanks .tt-site-desc-en { color: var(--ink3) !important; }
+#tab-content-thinktanks .tt-site-url { font-family: var(--mono) !important; color: var(--ink3) !important; font-size: 10px; }
+#tab-content-thinktanks .tt-sites-grid > * {
+  border: 1px solid var(--line) !important; border-radius: 0 !important; background: none !important;
+}
+
+/* ── 14. 收尾：AI 结果头微渐变归零 ── */
+#tab-content-ai .ai-result-header { background-image: none !important; background: var(--panel) !important; }
+
+/* ═══ 密度松绑（用户反馈：字密密麻麻）═══
+   编辑室审美的核心是留白与呼吸感。骨相换过后仍沿用霓虹时代的紧凑度
+   （行距1.3/padding14/列gap12/正文10.5px），这里统一放松。作用域仍限三屏。 */
+
+/* 列间距 + 面板内边距：拉开呼吸 */
+#tab-content-ai .consult-workbench { gap: 22px !important; }
+#tab-content-ai .consult-panel,
+#tab-content-agent [class*="-panel"], #tab-content-agent .agent-main {
+  padding: 20px 18px !important;
+}
+#tab-content-ai .consult-panel-head { margin-bottom: 16px !important; }
+
+/* 正文 / 描述 / 摘要 / 证据 body：行距 1.7 + 字号 ≥12.5 + sans + 墨2 */
+#tab-content-ai .ai-preset-desc, #tab-content-ai .ai-config-sub,
+#tab-content-ai [class*="desc"], #tab-content-ai [class*="snippet"],
+#tab-content-ai [class*="-body"], #tab-content-ai [class*="summary"],
+#tab-content-agent [class*="desc"], #tab-content-agent [class*="-body"],
+#tab-content-agent [class*="reasons"], #tab-content-agent [class*="snippet"] {
+  line-height: 1.7 !important; font-size: 12.5px !important;
+  font-family: var(--sans) !important; color: var(--ink2) !important;
+  letter-spacing: 0 !important;
+}
+
+/* 证据卡 / 诊断卡 / 下一步项：卡内 padding + 卡间距 */
+#tab-content-ai [class*="evidence"], #tab-content-ai .consult-diagnosis-card,
+#tab-content-ai .consult-next-item, #tab-content-agent [class*="evidence"],
+#tab-content-agent [class*="np-card"] {
+  padding: 15px 16px !important; margin-bottom: 11px !important; line-height: 1.6;
+}
+
+/* 卡片标题：字重收到 600、行距松一点、别贴边 */
+#tab-content-ai [class*="title"], #tab-content-ai .consult-panel-head h3,
+#tab-content-agent [class*="title"] {
+  font-weight: 600 !important; line-height: 1.4 !important; margin-bottom: 6px !important;
+}
+
+/* 各类标签(筛选/来源/供应商/tier)：内边距 + 彼此间距（margin 兜底，不依赖容器 gap） */
+#tab-content-ai .consult-chip, #tab-content-ai .consult-source-pill,
+#tab-content-ai .consult-provider-chip, #tab-content-ai .consult-gap-pill,
+#tab-content-ai .ai-preset-tier, #tab-content-ai [class*="chip"], #tab-content-ai [class*="pill"],
+#tab-content-agent [class*="chip"], #tab-content-agent [class*="pill"], #tab-content-agent [class*="tag"] {
+  padding: 3px 10px !important; margin: 3px 4px 3px 0 !important;
+  line-height: 1.6 !important; font-size: 11px !important;
+}
+
+/* 标签容器：flex 换行 + gap（能命中就命中，双保险） */
+#tab-content-ai [class*="filter"], #tab-content-ai [class*="chips"],
+#tab-content-ai [class*="pills"], #tab-content-ai [class*="capability"],
+#tab-content-agent [class*="pills"], #tab-content-agent [class*="tags"] {
+  display: flex !important; flex-wrap: wrap !important; gap: 4px 2px !important; align-items: center;
+}
+
+/* 左栏能力/预设网格：拉开行距 */
+#tab-content-ai .ai-settings-grid, #tab-content-ai .ai-preset-grid,
+#tab-content-ai [class*="provider-presets"] { gap: 10px !important; }
+
+/* 校验清单 / 交付预检行：行高松开 */
+#tab-content-ai [class*="next-item"], #tab-content-ai [class*="ops-section"],
+#tab-content-agent [class*="dim"], #tab-content-agent [class*="valid-row"] {
+  line-height: 1.6 !important; padding-top: 3px; padding-bottom: 3px;
+}

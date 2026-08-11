@@ -1,0 +1,36 @@
+# Layer this file on top of the PINNED official Supabase docker-compose.yml.
+# Docker Compose >= 2.24.4 is required for the !override tag.
+services:
+  auth:
+    environment:
+      GOTRUE_HOOK_BEFORE_USER_CREATED_ENABLED: "${V9_AUTH_HOOK_ENABLED:?set the reviewed Owner bootstrap phase}"
+      GOTRUE_HOOK_BEFORE_USER_CREATED_URI: "pg-functions://postgres/public/hook_v9_before_user_created"
+
+  storage:
+    environment:
+      # 16 MiB plaintext plus the AES-GCM tag.  Caddy's 32 MiB transport
+      # ceiling accounts for JSON/base64 framing on non-Storage RPCs.
+      FILE_SIZE_LIMIT: "16777232"
+
+  functions:
+    environment:
+      V9_ALLOWED_ORIGINS: "https://${PORTAL_DOMAIN:?set the exact portal domain}"
+      V9_INVITE_REDIRECT_URL: "https://${PORTAL_DOMAIN:?set the exact portal domain}/portal/"
+      ACCESS_APPLICATION_HMAC_KEY: "${ACCESS_APPLICATION_HMAC_KEY:?set in the protected Supabase env}"
+      ACCESS_APPLICATION_ENCRYPTION_KEY: "${ACCESS_APPLICATION_ENCRYPTION_KEY:?set in the protected Supabase env}"
+      ACCESS_APPLICATION_ENCRYPTION_KEY_VERSION: "${ACCESS_APPLICATION_ENCRYPTION_KEY_VERSION:?set in the protected Supabase env}"
+    volumes:
+      - "${SUPABASE_FUNCTIONS_DEPLOY_DIR:?set the immutable function deployment path}:/home/deno/functions:ro"
+
+  kong:
+    ports: !override
+      - name: kong-http-loopback
+        target: 8000
+        published: "${SUPABASE_KONG_LOOPBACK_PORT:-18000}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+
+  # The Portal uses Kong. Direct Postgres/pooler host ports are not part of the
+  # public MVP surface and must not be published, even on a second interface.
+  supavisor:
+    ports: !override []

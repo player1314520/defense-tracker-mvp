@@ -1,0 +1,112 @@
+name: defense-tracker-mvp
+
+services:
+  portal:
+    image: "${PORTAL_IMAGE:?set a Git-SHA-tagged portal image}"
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 384m
+    cpus: "1.0"
+    environment:
+      PORT: "8080"
+      V9_CLOUD_DB_PATH: /data/portal.sqlite3
+      V9_LEGACY_COORDINATOR_ENABLED: "false"
+      V9_PRODUCTION_MODE: "true"
+      V9_ACCESS_APPLICATIONS_ENABLED: "true"
+      V9_SUPABASE_URL: "https://${API_DOMAIN:?set the exact API domain}"
+      V9_SUPABASE_PUBLISHABLE_KEY_FILE: /run/secrets/supabase_publishable_key
+      V9_ALLOWED_ORIGINS: "https://${PORTAL_DOMAIN:?set the exact portal domain}"
+      V9_AUTH_INVITED_SIGNUP_ENABLED: "${INVITED_SIGNUP_ENABLED:-false}"
+      V9_MAX_ACTIVE_USERS: "100"
+      V9_MAX_CONCURRENT_REQUESTS: "20"
+      V9_MAX_EVENTS_PER_USER_PER_DAY: "1000"
+      V9_SYNC_PAGE_LIMIT: "500"
+    secrets:
+      - supabase_publishable_key
+    volumes:
+      - portal-state:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    ports:
+      - "127.0.0.1:${PORTAL_LOOPBACK_PORT:-18080}:8080"
+    networks:
+      - portal-internal
+      # /ready performs a verified HTTPS probe against the exact public
+      # Supabase origin.  This dedicated network supplies only outbound NAT;
+      # no other MVP service joins it.
+      - portal-egress
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3); raise SystemExit(0 if r.status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    stop_grace_period: 30s
+
+  edge:
+    image: "${CADDY_IMAGE:?pin the Caddy image by digest}"
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: "0.5"
+    environment:
+      ACME_EMAIL: "${ACME_EMAIL:?set the ACME account email}"
+      PORTAL_DOMAIN: "${PORTAL_DOMAIN:?set the exact portal domain}"
+      API_DOMAIN: "${API_DOMAIN:?set the exact API domain}"
+      PORTAL_UPSTREAM: "127.0.0.1:${PORTAL_LOOPBACK_PORT:-18080}"
+      SUPABASE_UPSTREAM: "127.0.0.1:${SUPABASE_KONG_LOOPBACK_PORT:-18000}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    depends_on:
+      portal:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - caddy
+        - validate
+        - --config
+        - /etc/caddy/Caddyfile
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 30s
+
+secrets:
+  supabase_publishable_key:
+    file: "${MVP_SECRETS_DIR:?set a root-owned secrets directory}/supabase_publishable_key"
+
+volumes:
+  portal-state:
+  caddy-data:
+  caddy-config:
+
+networks:
+  portal-internal:
+    internal: true
+  portal-egress:
+    internal: false

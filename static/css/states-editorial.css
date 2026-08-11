@@ -1,0 +1,64 @@
+/* ═══════════════════════════════════════════════════════════
+   加载 / 空态 / spinner 统一（顶尖收尾 · 全站通用）
+   设计稿备了 shimmer/spin keyframes 却没用；此层把裸文本"加载中…/
+   暂无XX"和彩色 spinner 统一成报纸风：衬线斜体空态 + 细线编辑室环 +
+   可复用 shimmer 骨架。纯 CSS，作用于既有容器，不改任何 JS。
+   ═══════════════════════════════════════════════════════════ */
+@keyframes edSpin { to { transform: rotate(360deg); } }
+@keyframes edShimmer { 0% { background-position: -460px 0; } 100% { background-position: 460px 0; } }
+
+/* ── 空态：报纸风衬线斜体，居中克制 ── */
+.trk-empty, .brief-empty, .agent-empty, .consult-empty, .consult-asset-empty,
+.loading-state, [class*="-empty"] {
+  font-family: var(--serif) !important; font-style: italic;
+  color: var(--ink3) !important; text-align: center;
+  padding: 30px 16px; font-size: 14px; line-height: 1.6;
+  background: none !important; border-color: var(--line) !important;
+}
+/* 带副标题的空态（资料预览）：主行正体、副行 mono */
+.consult-asset-empty strong {
+  display: block; font-style: normal; font-family: var(--serif);
+  color: var(--ink2); font-size: 15px; margin-bottom: 5px;
+}
+.consult-asset-empty span {
+  font-style: normal; font-family: var(--mono); font-size: 11px;
+  letter-spacing: .3px; color: var(--ink4);
+}
+
+/* ── 加载态容器：居中 + mono 提示 ── */
+.ai-loading, .consult-loading {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 28px 16px; color: var(--ink3);
+}
+.ai-loading p, .consult-loading span {
+  font-family: var(--mono); font-size: 12px; letter-spacing: .5px; color: var(--ink3);
+}
+
+/* ── spinner → 细线编辑室环（替换彩色发光环）── */
+.ai-spinner, .ai-spinner-sm, .spinner {
+  border: 2px solid var(--line2) !important;
+  border-top-color: var(--accent) !important;
+  border-right-color: var(--accent) !important;
+  border-radius: 50% !important;
+  animation: edSpin .75s linear infinite !important;
+  background: none !important; box-shadow: none !important;
+}
+.ai-spinner, .spinner { width: 24px; height: 24px; }
+.ai-spinner-sm { width: 14px; height: 14px; border-width: 1.5px !important; }
+
+/* ── 可复用骨架：shimmer 条（列表/卡片加载占位）── */
+.ed-skeleton {
+  background: linear-gradient(90deg, var(--panel) 24%, var(--card) 38%, var(--panel) 62%);
+  background-size: 920px 100%;
+  animation: edShimmer 1.4s linear infinite;
+  height: 14px; border-radius: 0;
+}
+.ed-skeleton + .ed-skeleton { margin-top: 8px; }
+.ed-skeleton.w60 { width: 60%; }
+.ed-skeleton.w40 { width: 40%; }
+
+/* ── 键盘焦点环（a11y）：编辑室锈红外框，仅键盘导航时出现 ── */
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible,
+textarea:focus-visible, [role="tab"]:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent) !important; outline-offset: 2px !important;
+}

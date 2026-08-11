@@ -1,0 +1,65 @@
+/* ═══════════════════════════════════════════════════════════
+   Design Tokens · 编辑室/报纸审美 全局单一真相（第2步 P0-A）
+   来源：Claude Design 稿 防务追踪-实时新闻-顶尖升级.dc.html:31
+   放在 <head> 第一个 <link>：所有后续样式消费这里的变量。
+
+   相对设计稿的两处修正（前端审计 P0-A）：
+   · --ink3 7d7566→8a8172、--ink4 544d42→6a6255：原值对 --bg 对比度
+     4.2:1 / 2.3:1 不达标（WCAG AA 正文 4.5:1）；#544d42 降级为纯装饰线
+     用色 --line-deco，不再用于承载信息的文本
+   · 字体链不走 Google Fonts（CSP+GFW 拿不到），用系统衬线栈
+   ═══════════════════════════════════════════════════════════ */
+:root {
+  /* 面 */
+  --bg:      #12100e;   /* newsprint 底 */
+  --panel:   #17140f;
+  --card:    #1a1712;
+  --cardh:   #211d17;   /* card hover */
+  /* 线 */
+  --line:    rgba(240,230,214,.09);
+  --line2:   rgba(240,230,214,.16);
+  --line-deco: #544d42; /* 仅装饰性分隔，禁用于文本 */
+  /* 墨 */
+  --ink1:    #ece6da;   /* 主文本 */
+  --ink2:    #ada491;   /* 次级 */
+  --ink3:    #8a8172;   /* 弱化（已提亮达标） */
+  --ink4:    #6a6255;   /* 最弱（已提亮，仅大字号/非关键） */
+  /* 色 */
+  --accent:     #d1442f;             /* 锈红 */
+  --accentsoft: rgba(209,68,47,.13);
+  --ochre:      #b28a4d;             /* 赭石 */
+  /* 字 */
+  --serif: 'Songti SC','Noto Serif SC','Source Han Serif SC',Georgia,'Times New Roman',serif;
+  --sans:  'PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  --mono:  ui-monospace,'SFMono-Regular',Consolas,'PingFang SC',monospace;
+
+  /* ═══ 旧变量桥接（过渡期）═══
+     未迁移 Tab（报告源抓取/报告写作/智库等）的旧 CSS 全部消费下面这些
+     v5/v9/霓虹时代的变量名——在此重映射到编辑室值，让全站底色系一次统一。
+     每完成一个 Tab 的正式迁移并删净旧规则后，这块随最后一个旧文件一起删。 */
+  --bg-base:   var(--bg);
+  --bg-shell:  var(--bg);
+  --bg-panel:  var(--panel);
+  --bg-card:   var(--card);
+  --bg-card-2: var(--cardh);
+  --bg-hover:  var(--cardh);
+  --border:        rgba(240,230,214,.14);
+  --border-strong: rgba(240,230,214,.22);
+  --border-glow:   rgba(209,68,47,.18);
+  --text-1: var(--ink1);
+  --text-2: var(--ink2);
+  --text-3: var(--ink3);
+  --blue-1: #8d6a3f;            /* 旧蓝强调 → 深赭 */
+  --blue-2: var(--ochre);
+  --blue-3: #c9a86a;            /* 旧亮蓝 → 亮赭 */
+  --amber:  var(--ochre);
+  --purple: #a08058;            /* 旧紫 → 灰赭 */
+  --red-1:  var(--accent);
+  --red-2:  #e06a56;
+  --green-1: #7a8a5a;           /* 旧绿 → 橄榄 */
+  --green-2: #93a06b;
+  --font:   var(--sans);
+  --radius: 0;                  /* 编辑室：直角 */
+  --terminal-line:   var(--line);
+  --terminal-shadow: none;
+}

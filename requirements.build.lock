@@ -1,0 +1,2 @@
+-r requirements.runtime.lock
+PyInstaller==6.19.0
