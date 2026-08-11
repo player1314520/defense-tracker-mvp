@@ -76,6 +76,19 @@ except ImportError:
     Fernet = None
     InvalidToken = Exception
 
+
+def _format_cn_date(value: datetime) -> str:
+    return f"{value.year:04d}年{value.month:02d}月{value.day:02d}日"
+
+
+def _format_cn_month_day(value: datetime) -> str:
+    return f"{value.month:02d}月{value.day:02d}日"
+
+
+def _format_cn_datetime_minutes(value: datetime) -> str:
+    return f"{_format_cn_date(value)} {value.hour:02d}:{value.minute:02d}"
+
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from v9.redaction import install_redaction_filter
@@ -2001,7 +2014,7 @@ def api_ai_analyze():
                 f"- [{a['source']}] {a['title']} ({a['region']})"
                 for a in news
             ])
-            today = datetime.now().strftime("%Y年%m月%d日")
+            today = _format_cn_date(datetime.now())
             sys_prompt = SYSTEM_PROMPT_BRIEF.replace("{date}", today).replace("{count}", str(len(cache["news"])))
             messages = [
                 {"role": "system", "content": sys_prompt},
@@ -2061,7 +2074,7 @@ def api_ai_stream():
         with cache_lock:
             news = cache["news"][:80]
         headlines = "\n".join([f"- [{a['source']}] {a['title']} ({a['region']})" for a in news])
-        today = datetime.now().strftime("%Y年%m月%d日")
+        today = _format_cn_date(datetime.now())
         messages = [{"role": "system", "content": SYSTEM_PROMPT_BRIEF.replace("{date}", today).replace("{count}", str(len(cache["news"])))},
                     {"role": "user", "content": f"今日防务新闻：\n\n{headlines}"}]
     elif mode == "freeqa" and question:
@@ -2238,14 +2251,14 @@ def _build_brief_user_prompt(article: dict) -> str:
     # 尝试解析日期为中文格式
     try:
         dt = datetime.fromisoformat(date.replace("Z", "+00:00"))
-        date_cn = dt.strftime("%Y年%m月%d日")
-        pub_md = dt.strftime("%m月%d日")
+        date_cn = _format_cn_date(dt)
+        pub_md = _format_cn_month_day(dt)
     except:
         dt = datetime.now()
-        date_cn = dt.strftime("%Y年%m月%d日")
-        pub_md = dt.strftime("%m月%d日")
+        date_cn = _format_cn_date(dt)
+        pub_md = _format_cn_month_day(dt)
 
-    today_cn = datetime.now().strftime("%Y年%m月%d日")
+    today_cn = _format_cn_date(datetime.now())
 
     return f"""请根据以下境外防务原始素材，撰写一份PLA机关军语要讯（情报简报）：
 
@@ -3207,7 +3220,7 @@ def _consult_source_pack_meta_rows(session: dict, content: str) -> list[tuple[st
         ("已归档来源", line_value("已归档报告/分析来源：", line_value("已抓取报告/分析来源：", "0"))),
         ("机构检索目标", line_value("智库/机构检索目标：", "0")),
         ("资料包定位", "公开源报告/条令/政策文件/智库分析抓取交付，不是最终战略分析报告"),
-        ("生成时间", datetime.now().strftime("%Y年%m月%d日 %H:%M")),
+        ("生成时间", _format_cn_datetime_minutes(datetime.now())),
     ]
 
 
@@ -5202,16 +5215,16 @@ def _extract_file_text(file_storage) -> dict:
 
 def _build_brief_user_prompt_imported(title: str, body: str, source: str = "", url: str = "", pub_date: str = "") -> str:
     """为导入内容构造要讯写作prompt"""
-    today_cn = datetime.now().strftime("%Y年%m月%d日")
+    today_cn = _format_cn_date(datetime.now())
     # 解析日期
     date_cn = today_cn
-    pub_md = datetime.now().strftime("%m月%d日")
+    pub_md = _format_cn_month_day(datetime.now())
     if pub_date:
         for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d", "%Y/%m/%d"):
             try:
                 dt = datetime.strptime(pub_date.replace("+00:00","Z").replace("+08:00","Z")[:19], fmt.replace("%z","")[:19] if "%z" in fmt else fmt)
-                date_cn = dt.strftime("%Y年%m月%d日")
-                pub_md = dt.strftime("%m月%d日")
+                date_cn = _format_cn_date(dt)
+                pub_md = _format_cn_month_day(dt)
                 break
             except:
                 continue

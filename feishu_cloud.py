@@ -927,15 +927,16 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 
 
 def _build_user_prompt(title: str, body: str, source: str = "", url: str = "", pub_date: str = "") -> str:
-    today_cn = datetime.now().strftime("%Y年%m月%d日")
+    now = datetime.now()
+    today_cn = f"{now.year:04d}年{now.month:02d}月{now.day:02d}日"
     date_cn = today_cn
-    pub_md = datetime.now().strftime("%m月%d日")
+    pub_md = f"{now.month:02d}月{now.day:02d}日"
     if pub_date:
         for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
             try:
                 dt = datetime.strptime(pub_date[:19], fmt)
-                date_cn = dt.strftime("%Y年%m月%d日")
-                pub_md = dt.strftime("%m月%d日")
+                date_cn = f"{dt.year:04d}年{dt.month:02d}月{dt.day:02d}日"
+                pub_md = f"{dt.month:02d}月{dt.day:02d}日"
                 break
             except ValueError:
                 continue
@@ -975,7 +976,8 @@ def _build_brief_card(brief_text: str, source_info: dict) -> dict:
     title = (source_info.get("title") or "防务要讯")[:60]
     source = source_info.get("source", "")
     url = source_info.get("url", "")
-    ts = time.strftime("%m月%d日 %H:%M")
+    now = time.localtime()
+    ts = f"{now.tm_mon:02d}月{now.tm_mday:02d}日 {now.tm_hour:02d}:{now.tm_min:02d}"
     preview = brief_text[:1500] + ("…" if len(brief_text) > 1500 else "")
     elements = [
         {"tag": "div", "text": {"tag": "lark_md", "content": f"**素材标题**　{title}"}},
@@ -1116,7 +1118,8 @@ def _parse_brief_sections(text: str) -> dict:
 
     # ── Fallback 兜底：如果关键字段缺失，用可用内容填补 ──
     if not sec['event_time']:
-        sec['event_time'] = f"事件时间：{time.strftime('%Y年%m月%d日')}"
+        now = time.localtime()
+        sec['event_time'] = f"事件时间：{now.tm_year:04d}年{now.tm_mon:02d}月{now.tm_mday:02d}日"
         logger.warning("AI 输出缺少'事件时间'行，已自动填充今日日期")
     if not sec['title'] and sec['body']:
         # 从正文截取前 20 字作为标题
@@ -1656,7 +1659,8 @@ def _fetch_all_feeds() -> list:
 
 def _build_headline_card(articles: list) -> dict:
     """构建 RSS 摘要推送卡片（headlines 模式）"""
-    ts = time.strftime("%m月%d日 %H:%M")
+    now = time.localtime()
+    ts = f"{now.tm_mon:02d}月{now.tm_mday:02d}日 {now.tm_hour:02d}:{now.tm_min:02d}"
     elements = [
         {"tag": "div", "text": {"tag": "lark_md",
             "content": f"**自动扫描时间**　{ts}　｜　共发现 **{len(articles)}** 篇高价值文章"}},

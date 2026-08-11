@@ -35,6 +35,18 @@ def agent_db(monkeypatch, tmp_path):
     return db_file
 
 
+def test_chinese_date_format_is_locale_independent():
+    class DateLike:
+        year = 2026
+        month = 8
+        day = 9
+
+        def strftime(self, _format):
+            raise AssertionError("locale-sensitive strftime must not be used")
+
+    assert report_agent._format_chinese_date(DateLike()) == "2026年08月09日"
+
+
 def test_create_project_uses_report_type_defaults_and_records_event(agent_db):
     project = report_agent.create_project(
         title="台海态势日报",

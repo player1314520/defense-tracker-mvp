@@ -187,7 +187,8 @@ def _build_brief_card(brief_text: str, source_info: dict) -> dict:
     title  = (source_info.get("title") or "防务要讯")[:60]
     source = source_info.get("source", "")
     url    = source_info.get("url", "")
-    ts     = time.strftime("%m月%d日 %H:%M")
+    now    = time.localtime()
+    ts     = f"{now.tm_mon:02d}月{now.tm_mday:02d}日 {now.tm_hour:02d}:{now.tm_min:02d}"
 
     # 飞书卡片单元素内容限 5000 字符，分段展示
     preview = brief_text[:1500] + ("…" if len(brief_text) > 1500 else "")
@@ -302,7 +303,8 @@ def _parse_brief_sections(text: str) -> dict:
 
     # ── Fallback 兜底 ──
     if not sec['event_time']:
-        sec['event_time'] = f"事件时间：{time.strftime('%Y年%m月%d日')}"
+        now = time.localtime()
+        sec['event_time'] = f"事件时间：{now.tm_year:04d}年{now.tm_mon:02d}月{now.tm_mday:02d}日"
         logger.warning("AI 输出缺少'事件时间'行，已自动填充今日日期")
     if not sec['title'] and sec['body']:
         sec['title'] = sec['body'][:20].rstrip('，。、；') + "值得关注"

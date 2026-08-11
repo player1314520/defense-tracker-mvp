@@ -248,6 +248,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _format_chinese_date(value) -> str:
+    return f"{value.year:04d}年{value.month:02d}月{value.day:02d}日"
+
+
 def _json_dumps(value) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
@@ -1426,7 +1430,7 @@ def _add_title_page(doc, project: dict, front_matter: dict | None = None):
         ("分析框架", "技术—能力—规则 · PARA · FACT-DATA-CITE"),
         ("报告类型", REPORT_TYPE_DEFAULTS.get(project.get("report_type"), {}).get("label", "战略分析报告")),
         ("研究主题", project.get("topic") or title),
-        ("生成时间", datetime.now().strftime("%Y年%m月%d日")),
+        ("生成时间", _format_chinese_date(datetime.now())),
     ]
     if front_matter:  # 报纸式 masthead：与屏上 newspaper 视图同款
         meta_rows.extend([
