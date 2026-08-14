@@ -1,0 +1,35 @@
+{
+  "edition_date": "2026-08-14",
+  "edition": "001",
+  "title": "2026-08-14 防务开源观察",
+  "author": "",
+  "digest": "三项公开动作分别涉及海上协同、传感器工业合作与可部署医疗保障；逐项保留单源限制，并将分析明确标为推断。",
+  "content_html": "<h2>海上协同：澳舰支援美航母打击群</h2><p>澳大利亚国防部 2026 年 8 月 14 日称，HMAS Perth 在南海航行期间支援 USS George Washington 航母打击群。</p><p><strong>证据限制：</strong>目前仅采用澳方官方单源，尚未获得独立来源核验，不据此延伸判断行动细节。</p><h2>传感器工业：澳英深化 CEA AESA 雷达合作</h2><p>澳大利亚国防部 2026 年 8 月 13 日称，澳英签署联合声明，寻求深化 CEA Technologies 有源电子扫描阵列雷达合作。英国政府 2026 年 6 月 AUKMIN 联合声明可交叉支持双方推进防务工业与能力合作这一方向。</p><p><strong>证据限制：</strong>两份材料支持合作方向；具体项目范围、交付节奏与成果仍以未来公开文件为准。</p><h2>保障体系：升级可部署医疗能力</h2><p>澳大利亚国防部 2026 年 8 月 8 日宣布投入 4.21 亿澳元升级可部署医疗能力，其中包括三所野战医院。</p><p><strong>证据限制：</strong>目前仅采用澳方官方单源；预算执行、部署效果与实际形成能力尚待后续公开证据。</p><h2>推断</h2><p>近日公开动作同时覆盖海上协同、传感器工业合作和保障体系，说明能力建设并非只看武器平台。</p><p><strong>解释限制：</strong>这一归纳只描述公开动作覆盖的维度，不能据此推断战备水平或具体意图。</p>",
+  "source_urls": [
+    {
+      "title": "HMAS Perth support to USS George Washington",
+      "publisher": "Australian Government Department of Defence",
+      "url": "https://www.defence.gov.au/news-events/releases/2026-08-14/hmas-perth-support-uss-george-washington",
+      "published_at": "2026-08-14"
+    },
+    {
+      "title": "Australia and United Kingdom seek to deepen defence industry cooperation",
+      "publisher": "Australian Government Department of Defence",
+      "url": "https://www.defence.gov.au/news-events/releases/2026-08-13/australia-united-kingdom-seek-deepen-defence-industry-cooperation",
+      "published_at": "2026-08-13"
+    },
+    {
+      "title": "Australia-UK Ministerial Consultations: Joint Statement, June 2026",
+      "publisher": "Government of the United Kingdom",
+      "url": "https://www.gov.uk/government/publications/australia-uk-ministerial-consultations-joint-statement-june-2026/australia-uk-ministerial-consultations-joint-statement-june-2026",
+      "published_at": "2026-06"
+    },
+    {
+      "title": "Australian Government revolutionises life-saving deployable health care for the Australian Defence Force",
+      "publisher": "Australian Government Department of Defence",
+      "url": "https://www.defence.gov.au/news-events/releases/2026-08-08/australian-government-revolutionises-life-saving-deployable-health-care-australian-defence-force",
+      "published_at": "2026-08-08"
+    }
+  ],
+  "state": "review_pending"
+}
