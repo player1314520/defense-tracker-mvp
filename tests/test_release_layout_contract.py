@@ -1,0 +1,77 @@
+# -*- coding: utf-8 -*-
+import json
+from datetime import timezone
+from pathlib import Path
+
+import pytest
+
+from product_version import load_build_metadata
+from scripts.package_release_assets import parse_utc
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_release_layout_uses_tag_and_never_guesses_legacy_archive_identity():
+    source = (ROOT / "scripts" / "Build-AndShip.ps1").read_text(encoding="utf-8")
+    assert '("releases\\" + $version.release_tag)' in source
+    assert '("candidates\\" + $version.release_tag)' in source
+    assert "DEFENSE_TRACKER_LEGACY_ARCHIVE_ID" in source
+    assert "the build will never guess it" in source
+    assert '"unknown"' not in source
+
+
+def test_signed_candidate_workflow_consumes_the_tagged_candidate_directory():
+    workflow = (ROOT / ".github" / "workflows" / "v9-signed-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow.count("dist/candidates/v9.0.0/") == 2
+    assert '"dist\\candidates\\v9.0.0\\$env:RELEASE_SHA"' in workflow
+    assert "-CandidateOnly" in workflow
+    assert "dist/releases/9.0.0/" not in workflow
+    assert "dist/releases/v9.0.0/" not in workflow
+    assert '"dist\\releases\\9.0.0\\$env:RELEASE_SHA"' not in workflow
+
+
+def test_schema2_build_metadata_names_source_epoch_truthfully(tmp_path):
+    metadata = tmp_path / "build-metadata.json"
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "commit": "a" * 40,
+                "source_tree": "b" * 40,
+                "source_date_epoch_utc": "2026-08-28T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_build_metadata(metadata)
+    assert loaded is not None
+    assert loaded.source_date_epoch_utc == "2026-08-28T00:00:00Z"
+
+
+def test_release_manifest_times_require_real_utc_ordering():
+    started = parse_utc("2026-08-28T00:00:00.0000000Z", field="started")
+    finished = parse_utc("2026-08-28T00:00:01.0000000Z", field="finished")
+    assert started.tzinfo == timezone.utc
+    assert finished > started
+    with pytest.raises(ValueError, match="ending in Z"):
+        parse_utc("2026-08-28T00:00:00+08:00", field="started")
+
+
+def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
+    builder = (ROOT / "scripts" / "Build-AndShip.ps1").read_text(encoding="utf-8")
+    launcher = (ROOT / "launcher.py").read_text(encoding="utf-8")
+    assert "DEFENSE_TRACKER_SMOKE_EVIDENCE" in builder
+    assert "workspace_ready" in builder
+    assert "build_commit -eq $ExpectedCommit" in builder
+    assert "StatusCode -in @(200, 302)" not in builder
+    assert "document.querySelector('main.v9-workspace')" in launcher
+    assert "payload.build_commit" in launcher
+    assert "Invoke-InstallerLifecycleSmokeTest" in builder
+    assert "Silent uninstall left the installed application executable behind" in builder
+    assert "Invoke-DesktopSmokeTest $portableExe" in builder
+    assert "Invoke-LegacyMigrationSmokeTest" in builder
+    assert "Legacy migration overwrote existing runtime configuration" in builder

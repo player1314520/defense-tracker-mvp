@@ -63,11 +63,19 @@ ALLOWED_EMAIL_DOMAINS = {
     "example.test",
     "users.noreply.github.com",
 }
+ALLOWED_EMAIL_ADDRESSES = {
+    "noreply@github.com",
+}
 CONTENT_RULES = {
     "local Windows path": re.compile(
         r"[A-Za-z]:[\\/](?:Users|HuaweiMoveData)[\\/]", re.IGNORECASE
     ),
-    "retired user marker": re.compile("131" + "4520"),
+    # The public maintainer handle is explicitly approved for community metadata.
+    # Continue rejecting the same legacy numeric marker when it appears outside
+    # that exact public handle (for example in copied account material).
+    "unapproved legacy user marker": re.compile(
+        r"(?<!player)131" + "4520", re.IGNORECASE
+    ),
     "retired tunnel hostname": re.compile(
         "unclean-kasandra-" + "nonartistically\\.ngrok-free\\.dev",
         re.IGNORECASE,
@@ -121,9 +129,14 @@ def audit(root: Path) -> list[str]:
         except UnicodeDecodeError:
             continue
         for match in EMAIL_PATTERN.finditer(text):
+            address = match.group(0).lower()
             domain = match.group(1).lower()
             reserved = domain.endswith((".example", ".invalid", ".test"))
-            if domain not in ALLOWED_EMAIL_DOMAINS and not reserved:
+            if (
+                address not in ALLOWED_EMAIL_ADDRESSES
+                and domain not in ALLOWED_EMAIL_DOMAINS
+                and not reserved
+            ):
                 line = text.count("\n", 0, match.start()) + 1
                 issues.append(f"non-placeholder email: {normalized}:{line}")
         for label, pattern in CONTENT_RULES.items():

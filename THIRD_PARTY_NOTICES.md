@@ -1,8 +1,9 @@
 # Third-Party Notices
 
-The first-party all-rights-reserved notice does not replace or restrict rights
-granted by third-party licenses. The following components are directly vendored
-or used to generate checked-in browser assets.
+The repository's `AGPL-3.0-only` license applies to first-party covered
+material; it does not replace, relicense, or restrict rights granted by the
+licenses of separate third-party components. The following components are
+directly vendored or used to generate checked-in browser assets.
 
 ## Vendored browser libraries
 
@@ -14,7 +15,7 @@ or used to generate checked-in browser assets.
 - Copyright: 2018-present MarkedJS; 2011-2018 Christopher Jeffrey
 - Upstream: <https://github.com/markedjs/marked/tree/v12.0.0>
 - Bundled license text: [`THIRD_PARTY_LICENSES/marked-v12.0.0/LICENSE.md`](THIRD_PARTY_LICENSES/marked-v12.0.0/LICENSE.md)
-- Upstream: <https://github.com/markedjs/marked/blob/v12.0.0/LICENSE.md>
+- Upstream license: <https://github.com/markedjs/marked/blob/v12.0.0/LICENSE.md>
 
 The vendored file retains its upstream version, copyright, and MIT license
 header.
@@ -27,15 +28,15 @@ header.
 - Copyright: 2025 Dr.-Ing. Mario Heiderich, Cure53, and contributors
 - Upstream: <https://github.com/cure53/DOMPurify/tree/3.2.6>
 - Bundled dual-license text: [`THIRD_PARTY_LICENSES/DOMPurify-3.2.6/LICENSE`](THIRD_PARTY_LICENSES/DOMPurify-3.2.6/LICENSE)
-- Upstream: <https://github.com/cure53/DOMPurify/blob/3.2.6/LICENSE>
+- Upstream license: <https://github.com/cure53/DOMPurify/blob/3.2.6/LICENSE>
 
 The vendored file retains its upstream version and dual-license header.
 
 ## Generated Supabase browser bundles
 
 The checked-in files `static/js/vendor/v9-supabase-auth.mjs` and
-`web/v9-portal/supabase-client.mjs` are generated from the package manifest and
-lockfile under `web/v9-auth`.
+`web/v9-portal/supabase-client.mjs` are generated from the package manifest
+and lockfile under `web/v9-auth`.
 
 ### @supabase/supabase-js 2.95.0
 
@@ -44,7 +45,7 @@ lockfile under `web/v9-auth`.
 - Copyright: 2020 Supabase
 - Upstream: <https://github.com/supabase/supabase-js/tree/v2.95.0>
 - Bundled license text: [`THIRD_PARTY_LICENSES/supabase-js-v2.95.0/LICENSE`](THIRD_PARTY_LICENSES/supabase-js-v2.95.0/LICENSE)
-- Upstream: <https://github.com/supabase/supabase-js/blob/v2.95.0/LICENSE>
+- Upstream license: <https://github.com/supabase/supabase-js/blob/v2.95.0/LICENSE>
 
 ### esbuild 0.28.1
 
@@ -53,7 +54,7 @@ lockfile under `web/v9-auth`.
 - Copyright: 2020 Evan Wallace
 - Upstream: <https://github.com/evanw/esbuild/tree/v0.28.1>
 - Bundled license text: [`THIRD_PARTY_LICENSES/esbuild-v0.28.1/LICENSE.md`](THIRD_PARTY_LICENSES/esbuild-v0.28.1/LICENSE.md)
-- Upstream: <https://github.com/evanw/esbuild/blob/v0.28.1/LICENSE.md>
+- Upstream license: <https://github.com/evanw/esbuild/blob/v0.28.1/LICENSE.md>
 
 ## Inventory and compliance boundaries
 
@@ -62,10 +63,12 @@ This notice is not an exhaustive software bill of materials:
 1. transitive JavaScript packages are recorded in
    `web/v9-auth/package-lock.json` but are not all repeated here;
 2. Python packages, container images, the operator-supplied Supabase stack, and
-   operating-system packages have separate manifests and upstream licenses; and
-3. dependency names and license metadata have been checked, but this file is
-   not legal advice or a complete license-compliance audit.
+   operating-system packages have separate manifests and upstream licenses;
+3. a name, version, or checksum does not by itself establish license
+   compatibility or satisfy every notice/source obligation; and
+4. this inventory has not received a complete independent legal review.
 
 Before redistributing any build, regenerate its dependency inventory, review
-all transitive and container dependencies, and retain the complete upstream
-license and notice texts required by the selected licenses.
+all transitive and container dependencies, preserve required upstream license
+and notice texts, and confirm that the exact release's SPDX SBOM matches the
+shipped bytes.
