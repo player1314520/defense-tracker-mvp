@@ -1,0 +1,14 @@
+# Current single-maintainer ownership. This records review routing only; it does
+# not establish a legal entity, signing Publisher, or independent approval.
+* @player1314520
+
+/.github/ @player1314520
+/LICENSE @player1314520
+/SECURITY.md @player1314520
+/CLA_POLICY.md @player1314520
+/GOVERNANCE.md @player1314520
+/docs/RELEASE_SIGNING_POLICY.md @player1314520
+/docs/DATA_CONTRIBUTION_POLICY.md @player1314520
+/supabase/ @player1314520
+/deploy/ @player1314520
+/scripts/ @player1314520

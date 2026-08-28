@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/player1314520/defense-tracker-mvp/security/advisories/new
+    about: Report vulnerabilities privately. Do not disclose security details in an issue.
+  - name: Community discussions
+    url: https://github.com/player1314520/defense-tracker-mvp/discussions
+    about: Ask questions and discuss product or architecture proposals.
