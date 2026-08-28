@@ -1,0 +1,144 @@
+name: V9 portal image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact protected main commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: v9-portal-image-${{ inputs.release_sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-attest:
+    name: Build and attest immutable Portal image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      PYTHON_BASE_IMAGE: python:3.11.14-slim-bookworm@sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Bind build to protected main
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          remote_main="$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')"
+          [[ "${remote_main}" =~ ^[0-9a-f]{40}$ ]]
+          test "${remote_main}" = "${RELEASE_SHA}"
+          test "${GITHUB_SHA}" = "${RELEASE_SHA}"
+          test "${GITHUB_WORKFLOW_SHA}" = "${RELEASE_SHA}"
+          test "${GITHUB_WORKFLOW_REF}" = "${GITHUB_REPOSITORY}/.github/workflows/v9-portal-image.yml@refs/heads/main"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Authenticate to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GHCR_TOKEN}"
+          printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+      - name: Build and push exact Portal image
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repository="ghcr.io/${owner}/defense-tracker-portal"
+          log_file="$(mktemp)"
+          trap 'rm -f "${log_file}"' EXIT
+          deploy/mvp/bin/build-portal-image.sh \
+            "${repository}" \
+            "${PYTHON_BASE_IMAGE}" \
+            --push | tee "${log_file}"
+          mapfile -t image_references < <(
+            sed -n 's/^\[IMAGE\] Immutable release reference: //p' "${log_file}"
+          )
+          test "${#image_references[@]}" -eq 1
+          image_reference="${image_references[0]}"
+          digest="${image_reference#*@}"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "${image_reference}" = "${repository}@${digest}"
+          {
+            echo "repository=${repository}"
+            echo "digest=${digest}"
+            echo "image_reference=${image_reference}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Attest Portal image provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.build.outputs.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Verify registry attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REFERENCE: ${{ steps.build.outputs.image_reference }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE_REFERENCE}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --bundle-from-oci \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/v9-portal-image.yml" \
+            --source-ref refs/heads/main \
+            --source-digest "${RELEASE_SHA}" \
+            --deny-self-hosted-runners
+      - name: Write immutable image receipt
+        env:
+          IMAGE_REFERENCE: ${{ steps.build.outputs.image_reference }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          case "${ATTESTATION_URL}" in
+            https://github.com/*/attestations/*) ;;
+            *) exit 65 ;;
+          esac
+          install -d -m 0700 build/v9-portal-image
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          receipt = {
+              "schema": 1,
+              "release_commit": os.environ["RELEASE_SHA"],
+              "image_reference": os.environ["IMAGE_REFERENCE"],
+              "image_digest": os.environ["IMAGE_DIGEST"],
+              "base_image": os.environ["PYTHON_BASE_IMAGE"],
+              "attestation_url": os.environ["ATTESTATION_URL"],
+              "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          target = Path("build/v9-portal-image/portal-image.json")
+          target.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: v9-portal-image-${{ inputs.release_sha }}-${{ github.run_id }}
+          path: build/v9-portal-image/portal-image.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+          include-hidden-files: false
