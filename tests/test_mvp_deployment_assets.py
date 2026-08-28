@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 
 import pytest
 import yaml
@@ -237,6 +238,8 @@ def test_backup_and_restore_are_encrypted_offsite_and_isolated():
 
     assert "age --decrypt" in restore
     assert "sha256sum --check --status" in restore
+    assert 'assert_safe_tar "$payload/db-config.tar"' in restore
+    assert "archive links are not allowed" in restore
     assert "--network none" in restore
     assert "--pull never" in restore
     assert "docker volume create" in restore
@@ -251,9 +254,49 @@ def test_backup_and_restore_are_encrypted_offsite_and_isolated():
     assert "postgres-globals-existing.sql" in restore
     assert "!/^CREATE ROLE /" in restore
     assert "supabase_upstream_sha" in restore
+    assert 'assert_root_controlled_path "$config_file"' in restore
+    assert "DEFENSE_TRACKER_RELEASE_ROOT" in restore
+    assert "DEFENSE_TRACKER_RELEASE_SHA" in restore
+    assert "collector release checkout contains modified or untracked files" in restore
+    assert "Supabase override is not the exact release file" in restore
+    assert 'assert_root_controlled_path "$SUPABASE_STACK_DIR"' in restore
+    assert 'assert_root_controlled_path "$SUPABASE_OVERRIDE_FILE"' in restore
+    assert "--porcelain --untracked-files=all --ignore-submodules=none" in restore
+    assert "restore image checkout contains modified or untracked files" in restore
+    assert "db_image_id=" in restore
+    assert restore.count('"$db_image_id"') >= 2
+    assert '\"measurement_kind\":\"database_count\"' in restore
+    assert '\"records_restored\":%s' in restore
+    assert '"$database_count"' in restore
     assert "< \"$payload/postgres.sql\"" not in restore
     assert "docker compose down" not in restore
     assert "SUPABASE_STORAGE_DATA_DIR" not in restore
+
+
+def test_restore_archive_validator_rejects_even_relative_links(tmp_path):
+    restore = read(MVP / "bin" / "restore-dry-run.sh")
+    validators = [
+        source
+        for source in re.findall(r"<<'PY'\n(.*?)\nPY", restore, flags=re.DOTALL)
+        if "archive links are not allowed" in source
+    ]
+    assert len(validators) == 1
+    archive = tmp_path / "db-config.tar"
+    with tarfile.open(archive, "w") as handle:
+        member = tarfile.TarInfo("relative-link")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "safe-looking-relative-target"
+        handle.addfile(member)
+    result = subprocess.run(
+        [sys.executable, "-", str(archive)],
+        input=validators[0],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "archive links are not allowed" in result.stderr
 
 
 def test_release_and_rollback_retain_git_sha_images():
