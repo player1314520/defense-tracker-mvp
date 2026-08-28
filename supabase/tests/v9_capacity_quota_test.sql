@@ -137,7 +137,7 @@ insert into public.record_versions(
     '40000000-0000-0000-0000-000000000001'::uuid,
     1,'source','20000000-0000-0000-0000-000000000001'::uuid,
     decode(repeat('ee',17),'hex'),decode(repeat('11',12),'hex'),
-    decode(repeat('22',32),'hex'),decode(repeat('33',12),'hex'),1,
+    decode(repeat('22',48),'hex'),decode(repeat('33',12),'hex'),1,
     repeat('a',64)
 );
 

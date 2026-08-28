@@ -9,6 +9,12 @@ MIGRATION = (
     / "migrations"
     / "202608090021_mvp_device_sessions.sql"
 )
+SESSION_REGEX_COMPAT_MIGRATION = (
+    ROOT
+    / "supabase"
+    / "migrations"
+    / "202608280029_v9_session_id_regex_compat.sql"
+)
 
 
 def _sql() -> str:
@@ -73,6 +79,16 @@ def test_session_id_is_derived_only_from_verified_jwt_claims():
     assert "m.status = 'active'" in bind
     assert "device session is revoked" in bind
     assert "p_session_id" not in bind
+
+
+def test_current_session_id_avoids_postgres_regex_repeat_bound_limit():
+    sql = _compact(SESSION_REGEX_COMPAT_MIGRATION.read_text(encoding="utf-8"))
+
+    assert "create or replace function private.current_session_id()" in sql
+    assert "length(session_id) between 16 and 256" in sql
+    assert "session_id ~ '^[A-Za-z0-9._~-]+$'" in sql
+    assert "{16,256}" not in sql
+    assert "revoke all on function private.current_session_id()" in sql
 
 
 def test_revoking_device_or_member_revokes_bound_sessions():
