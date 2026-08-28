@@ -1,60 +1,96 @@
 # Public Release Scope
 
-## What this snapshot is
+## Community source
 
-This repository is intended to be published as a history-free, source-visible
-snapshot of the DefenseTracker V9 MVP. It provides reviewable first-party
+DefenseTracker V9 Community Edition is published under GNU AGPL v3 only
+(`AGPL-3.0-only`). The public repository contains reviewable first-party
 source, tests, the Portal, Supabase migrations and Edge Functions, and the
-isolated `deploy/mvp` release surface.
+isolated `deploy/mvp` deployment surface. Separate third-party materials keep
+their upstream licenses.
 
-The snapshot is not an open-source release. No first-party license is granted;
-third-party components retain their own licenses.
+The presence of source does not mean a stable Windows package or live Portal
+has passed the release gates. Only an immutable GitHub Release created from
+the exact protected default-branch commit may represent a stable version.
 
 ## Included public material
 
-- source required to run the local MVP and V9 Portal;
-- automated Python and JavaScript tests;
-- Supabase migrations and the MVP Edge Functions;
+- source required to run the local community edition and V9 Portal;
+- automated Python, JavaScript, and Supabase contract tests;
+- Supabase migrations and MVP Edge Functions;
 - `deploy/mvp` configuration, release, rollback, backup, and restore tooling;
-- inert configuration examples and public operational documentation; and
-- required third-party bundles and notices.
+- inert configuration examples and public operational documentation;
+- community governance, contribution, security, data, and signing policies;
+  and
+- required third-party bundles, license texts, notices, and release SBOM.
 
 ## Deliberately excluded material
 
-- private Git history and internal planning, task, handoff, staging, and review
-  evidence;
-- screenshots, personal paths, raw logs, local tool state, and account details;
-- credentials, `.env` files, tokens, keys, email lists, databases, and user
-  exports;
-- private source material, generated reports, historical selection records,
-  and date-specific operator scripts; and
-- build directories, unsigned installers, caches, and other reproducible or
+- credentials, `.env` files, tokens, private keys, signing configuration,
+  backup identities, real email addresses, databases, and user exports;
+- private planning, task, handoff, staging, review, and release evidence;
+- screenshots, QR codes, account details, personal paths, raw logs, local tool
+  state, or other personally identifiable information;
+- private source material, copied articles, paywalled text, internal documents,
+  generated reports, and historical selection records; and
+- caches, unsigned installers, mutable build environments, and other
   machine-local artifacts.
 
 ## Pre-publication gates
 
-Run these gates against the exact tree that will become the public repository:
+Run these gates against the exact commit and tracked tree to be published:
 
 1. `python scripts/verify_public_tree.py` passes.
-2. Python and JavaScript tests pass from clean dependency installations.
+2. Python, JavaScript, Edge Function, and deployment contract tests pass from
+   clean locked dependency installations.
 3. Checked-in browser bundles reproduce without a diff.
-4. Deployment shell, Python, YAML, and Compose assets pass static validation.
-5. The tracked-file and commit-metadata privacy scan reports no operational
-   secrets, personal contact details, private local paths, or private assets.
-6. `README.md`, `LICENSE`, `SECURITY.md`, and `THIRD_PARTY_NOTICES.md` match the
-   final tree.
-7. A fresh repository is created without importing private commit history.
+4. The entire tracked history and release tree pass secret, personal-data,
+   account-material, QR-code, local-path, and executable allowlist scans.
+5. License compatibility, governance documents, third-party notices, and the
+   generated SPDX SBOM match the exact release inputs.
+6. The Windows onedir and installer pass malware, archive, PE, VersionInfo,
+   Authenticode-chain, publisher, timestamp, and SHA-256 verification.
+7. Independent staging passes multi-user, multi-device, quota, revocation,
+   backup, restore, rollback, and observation gates.
+8. Production deploys the same accepted image digest and passes desktop and
+   mobile browser smoke tests before the stable release is created.
 
-Passing these gates authorizes neither a remote deployment nor a claim of live
-production readiness.
+Passing CI alone authorizes neither remote deployment nor a live-readiness
+claim.
+
+A signed candidate requires two source-registered Ed25519 decisions. The first
+reviews the hash-pinned application components before the first release
+signature; the second, using a distinct public key, reviews the exact unsigned
+installer, its full extracted payload, build recipe, tools, and bootstrap
+license. Stage A may sign the application and retain the attested unsigned
+installer review bundle, but cannot sign the installer or create final assets.
+Stage B must consume that exact run-bound bundle, authenticate the independent
+approval, and prove the signed installer has the same Authenticode-neutral bytes
+and complete payload before packaging. The evidence binds the exact commit,
+source tree, Publisher, dependency locks, installed package inventory,
+third-party notices, and final shipped bytes. If any evidence, reviewer,
+component, payload entry, signature, or binding is absent or mismatched,
+candidate creation stops. The stable verifier independently requires the two
+reviews, a final-shipped-bytes SBOM without `NOASSERTION`, and complete deployment
+evidence; no manifest flag may be changed after packaging.
+
+## Stable `v9.x` rule
+
+The stable tag must point to the exact accepted release commit. The Release is
+created only after every required asset and evidence check has passed. Once
+published as immutable, its tag and assets are never moved, deleted, or
+replaced. A defect is fixed in a new patch release such as `v9.0.1`.
+
+See [the release signing policy](RELEASE_SIGNING_POLICY.md).
 
 ## Honest boundaries
 
-- Static and local checks do not exercise a real VPS, DNS, TLS, SMTP, Supabase
-  deployment, backup target, or disaster-recovery host.
-- Synthetic tests do not establish cross-user isolation or revocation under
-  real multi-device concurrency.
-- The snapshot includes no signed or reproducible Windows installer.
-- Dependency notices are not a complete SBOM or legal compliance opinion.
-- Removing private history does not prove that every public-source input is
-  accurate, complete, or redistributable.
+- Local and CI checks do not exercise real DNS, TLS, SMTP, WAF, Supabase,
+  backup storage, monitoring, or disaster-recovery infrastructure.
+- Synthetic tests do not establish isolation, revocation, quotas, or encrypted
+  sync under real multi-user concurrency.
+- A valid signature authenticates a publisher and signed bytes; it does not
+  guarantee the absence of vulnerabilities or immediate SmartScreen
+  reputation.
+- A dependency inventory is not a complete legal-compliance opinion.
+- Public-source metadata and summaries may still be wrong, incomplete, biased,
+  or unsuitable for redistribution or operational use.

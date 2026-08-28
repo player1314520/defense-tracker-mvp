@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a scoped community-edition improvement.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user need without confidential or personal information.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: State the smallest useful behavior and its acceptance evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Security, privacy, legal, and operational risks
+      description: Identify affected trust boundaries and any data handling.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Product boundary
+      options:
+        - label: This proposal does not require publishing credentials, private data, internal material, or the legacy desktop workspace as a public service.
+          required: true

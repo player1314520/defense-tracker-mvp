@@ -1,41 +1,50 @@
-# DefenseTracker V9 MVP
+# DefenseTracker V9 Community Edition
 
-DefenseTracker is a local-first prototype for collecting public-source defense
-reporting, organizing evidence, drafting analytical products, and evaluating a
-role-aware encrypted synchronization workflow. This repository is a
-history-free, source-visible MVP snapshot intended for technical review and
-authorized evaluation.
+DefenseTracker is a local-first system for collecting lawfully available
+public-source defense reporting, organizing evidence, drafting analytical
+products, and collaborating through an encrypted, role-aware workspace.
+The public project is licensed under **GNU AGPL v3 only
+(`AGPL-3.0-only`)**.
 
-> **Status:** the source and release tooling have local automated-test and
-> static-validation coverage. No public production deployment, signed Windows
-> installer, live multi-user acceptance test, or independent security audit is
-> represented by this snapshot.
+> **Release status:** this source tree is being prepared for the `v9.0.0`
+> community release. A green CI run is not evidence that a signed Windows
+> package or a production Portal exists. Use only assets that appear in an
+> official GitHub Release and pass the published signature and checksum
+> checks.
 
-## MVP surfaces
+## Product boundary
 
-| Surface | Purpose | Current evidence boundary |
+| Surface | Purpose | Public boundary |
 |---|---|---|
-| Windows desktop/local workspace | Local research, evidence, drafting, and device-held key workflows | Source and automated tests; no signed public installer |
-| V9 Portal | Application/login entry point and role-aware team workflow | Local browser and contract-test scope; requires an operator-supplied Supabase environment for live use |
-| Optional WeChat publication tools | Prepare, stage, and explicitly approve public-account drafts | Simulated API and local vault tests only; public writes remain disabled by default and no real-account delivery is claimed |
-| Self-hosted cloud services | Supabase Auth, Postgres, Storage, Realtime, and Edge Functions | Deployment assets and static checks only in this snapshot |
-| MVP deployment | Caddy plus the isolated Portal and self-hosted Supabase | **Only [`deploy/mvp`](deploy/mvp) is supported**; all other deployment paths are outside the public MVP contract |
+| GitHub Pages | Public introduction, version notes, briefs, download verification, and links | Static public content only |
+| GitHub repository | AGPL source, issues, pull requests, discussions, and private security reports | No credentials, private source material, user exports, or operational data |
+| V9 Portal | Application review, invitation-only login, alerts, tasks, approvals, and device administration | Public signup stays disabled; access requires human approval and an invitation |
+| Signed Windows desktop | Full local collection, analysis, AI-assisted drafting, local data, and encrypted synchronization | Official packages must be signed and timestamped under the release policy |
 
-The encryption and access-control code is part of the MVP implementation, but
-it has not been independently audited. Treat it as reviewable engineering, not
-as a certification or a claim that a live environment is secure.
+The legacy Flask workspace is a desktop/local surface. It is not the public
+Portal and must not be exposed directly to the Internet. Real AI keys, Feishu
+configuration, account material, QR codes, private datasets, and internal
+documents are never part of the public deployment contract.
 
-## Requirements
+## Current evidence boundary
 
-- Python 3.11 or newer
-- Node.js 20 or newer for JavaScript tests and the Supabase client bundle
-- Windows for the desktop wrapper and DPAPI-specific tests
-- Docker Compose v2, Caddy, and a pinned self-hosted Supabase checkout only for
-  an authorized deployment evaluation
+| Area | What the repository can demonstrate | What still requires live evidence |
+|---|---|---|
+| Source | Reviewable code, automated tests, privacy gates, and deployment contracts | Independent security assessment |
+| Windows | Isolated two-stage build, independent installer-review, and verification tooling | Active independent reviewer keys, trusted publisher identity, valid Authenticode signature, clean-machine installation and migration tests |
+| Portal | Local browser and API contract tests | Separate staging/production infrastructure, real SMTP, WAF, backup/restore, and multi-user acceptance |
+| Operations | Documented health, rollback, and recovery gates | Measured availability, latency, recovery point, and recovery time |
 
 ## Local Portal smoke test
 
-The unconfigured Portal can be started locally without production credentials:
+Requirements:
+
+- Python 3.11 or newer;
+- Node.js 20 or newer for JavaScript tests and browser bundles;
+- Windows for the desktop wrapper and DPAPI-specific tests; and
+- Docker Compose v2 and Caddy only for an authorized deployment evaluation.
+
+Start the unconfigured Portal locally:
 
 ```sh
 python -m venv .venv
@@ -46,23 +55,21 @@ python -m pip install -r deploy/requirements.cloud.txt
 python v9_cloud.py
 ```
 
-Open <http://127.0.0.1:8080/portal/>. Without Supabase configuration, only the
-unconfigured/anonymous surface is expected to be usable. This is a smoke test,
-not a production deployment.
+Open <http://127.0.0.1:8080/portal/>. Without operator-supplied Supabase
+configuration, only the unconfigured/anonymous surface is expected to work.
+This is a smoke test, not a production deployment.
 
-For the Windows desktop wrapper, install `requirements.txt` in an isolated
-environment and run `python launcher.py`. Local startup may create ignored
-runtime state; do not copy that state into a public checkout.
+For the desktop wrapper, use an isolated environment and run
+`python launcher.py`. Local startup may create ignored runtime state; never
+copy that state into a public checkout or release package.
 
-## Tests and quality gates
-
-Install the Python test dependencies, including the direct YAML dependency used
-by the deployment-contract tests:
+## Tests and public-tree gate
 
 ```sh
 python -m pip install -r requirements-dev.txt "PyYAML==6.0.2"
 python -m compileall -q .
 python -m pytest -q
+python scripts/verify_public_tree.py
 ```
 
 Run the JavaScript tests and reproduce the checked-in browser bundles:
@@ -75,67 +82,83 @@ node --test tests/js/*.test.mjs tests/js/*.test.cjs
 git diff --exit-code -- static/js/vendor/v9-supabase-auth.mjs web/v9-portal/supabase-client.mjs
 ```
 
-The globbed `node --test` command above assumes a POSIX-compatible shell. The
-GitHub Actions workflow is the canonical cross-platform command record. Before
-publishing, also run the public-tree gate:
+The globbed `node --test` command assumes a POSIX-compatible shell. GitHub
+Actions is the canonical cross-platform command record.
 
-```sh
-python scripts/verify_public_tree.py
-```
+## Deployment
 
-## Supported deployment path
-
-Production-like evaluation is documented in
-[`docs/MVP_DEPLOY.md`](docs/MVP_DEPLOY.md) and implemented only under
-[`deploy/mvp`](deploy/mvp). It requires a clean, reviewed commit; images pinned
-by digest; an exact self-hosted Supabase upstream commit; externally stored
-configuration and secrets; live domain, TLS, SMTP, backup, restore, and
-multi-user verification; and an operator-managed rollback decision.
+Only [`deploy/mvp`](deploy/mvp) is the supported public deployment path.
+[Deployment guidance](docs/MVP_DEPLOY.md) requires an exact reviewed commit,
+images pinned by digest, a pinned self-hosted Supabase checkout, externally
+stored secrets, separate staging and production resources, live TLS/SMTP/WAF
+checks, backup and isolated restore exercises, and an operator-managed rollback
+decision.
 
 CI performs no deployment and receives no production secrets. Do not treat a
-green workflow, a successful image build, or a healthy local container as live
-production acceptance.
+successful image build or local health response as production acceptance.
 
-## Privacy and public-snapshot posture
+## Join the community
 
-- No operational secrets are required for local tests or CI. Checked-in example
-  values are inert placeholders; never commit `.env` files, tokens, private
-  keys, credentials, email lists, databases, or user exports.
-- The public snapshot intentionally excludes private commit history, internal
-  planning and evidence logs, screenshots, local paths and state, private source
-  material, generated reports, and build artifacts.
-- The Portal deployment context is created from a narrow committed-file
-  allowlist. Local configuration, tests, private materials, and uncommitted
-  files are not Portal image inputs.
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before filing an issue or pull
+  request.
+- Use [GitHub Discussions](https://github.com/player1314520/defense-tracker-mvp/discussions)
+  for design proposals and community questions.
+- Submit source suggestions only under the
+  [data contribution policy](docs/DATA_CONTRIBUTION_POLICY.md).
+- Report vulnerabilities privately under [SECURITY.md](SECURITY.md).
+- Follow the [Code of Conduct](CODE_OF_CONDUCT.md) and
+  [governance rules](GOVERNANCE.md).
+
+The contributor-license-agreement process is not active yet. Until the legal
+steward, exact CLA text, and signing authority have completed legal review,
+external pull requests may be discussed and reviewed but **must not be
+merged**. Issues, reproducible bug reports, and compliant public-source links
+remain welcome. See [CLA_POLICY.md](CLA_POLICY.md).
+
+## Privacy and source handling
+
+- Never commit `.env` files, tokens, private keys, credentials, personal
+  contact lists, account screenshots, QR codes, databases, user exports,
+  local paths, or raw logs.
+- A data suggestion may contain a lawful public URL, factual metadata, and the
+  contributor's own short summary. It must not contain copied articles,
+  paywalled text, personal data, real configuration, or suspected internal or
+  sensitive material.
+- The Portal deployment context is built from a narrow committed-file
+  allowlist. Local state, tests, uncommitted files, and private materials are
+  not Portal image inputs.
 - The desktop application can contact configured feeds, AI providers, and a
-  configured Supabase service. Operators must review those endpoints and the
-  data sent to them; “local-first” does not mean “no network access.”
-- Use only lawfully obtained public-source material. Generated analysis may be
-  incomplete or wrong and must not be treated as classified, operational, or
-  decision-authoritative intelligence.
-
-See [`SECURITY.md`](SECURITY.md) for private vulnerability reporting and
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for third-party components.
-
-## Honest boundaries
-
-This snapshot cannot establish that:
-
-1. the MVP works on a real VPS, domain, SMTP provider, or production Supabase
-   stack;
-2. role isolation, device revocation, encrypted sync, backup/restore, and
-   concurrency behave correctly across real users and machines;
-3. the cryptographic design or deployment configuration has passed an
-   independent security audit;
-4. a Windows installer is signed, timestamped, reproducible, or safe to
-   distribute;
-5. a single-VPS deployment is highly available or protected from DDoS; or
-6. public-source inputs and generated output are accurate, complete, or cleared
-   for redistribution.
+  configured Supabase service. Operators must review those endpoints and what
+  data is transmitted; local-first does not mean offline.
+- Generated analysis may be incomplete or wrong. It is not classified,
+  operational, or decision-authoritative intelligence.
 
 ## License
 
-The first-party source is **source-visible and all rights reserved**. This is
-not an open-source license, and no permission to use, copy, modify, deploy, or
-redistribute the first-party material is granted by publication. See
-[`LICENSE`](LICENSE). Third-party components remain under their own licenses.
+Unless a file or directory states otherwise, first-party material in this
+repository is licensed under [GNU AGPL v3 only](LICENSE), SPDX identifier
+`AGPL-3.0-only`. Network operators of modified versions must follow the
+Corresponding Source obligations in section 13.
+
+Third-party components remain under their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). A commercial license, if
+offered, requires a separate signed agreement with the verified rights holder;
+this repository does not grant one. See
+[COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
+
+## Honest boundaries
+
+This repository cannot establish that:
+
+1. a public `v9.0.0` installer exists, has a valid trusted timestamp, or has
+   acquired Microsoft SmartScreen reputation;
+2. the Portal works on real staging and production domains with real SMTP,
+   WAF, monitoring, backup, restore, and rollback;
+3. role isolation, revocation, quotas, and encrypted sync remain correct under
+   real multi-user and multi-device concurrency;
+4. the cryptographic design or release pipeline has passed an independent
+   security or legal audit;
+5. a single-server deployment is highly available or resistant to denial of
+   service; or
+6. public-source inputs and generated outputs are accurate, complete, lawful
+   to redistribute, or suitable for operational decisions.

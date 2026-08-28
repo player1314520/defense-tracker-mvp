@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible defect using synthetic, non-sensitive data.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities here. Do not include credentials, personal data, private logs, account screenshots, QR codes, real configuration, or restricted material.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Use the exact release version or commit SHA.
+      placeholder: v9.x.y or full commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - Windows desktop/local workspace
+        - V9 Portal
+        - Supabase/Edge Functions
+        - Deployment assets
+        - Documentation/community
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: Give minimal steps using synthetic data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Sanitized environment
+      description: OS/runtime versions only; redact usernames, paths, hostnames, and identifiers.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: This is not a vulnerability report and contains no secret, personal, account, private-source, or restricted material.
+          required: true

@@ -1,0 +1,42 @@
+name: Moderation request
+description: Flag public project content without repeating private or harmful material.
+title: "[Moderation] "
+labels:
+  - moderation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a public form and not a confidential reporting channel. Provide a public repository link only. Do not paste private evidence, personal data, threats, or security details.
+  - type: input
+    id: link
+    attributes:
+      label: Public repository link
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Harassment or abusive behavior
+        - Personal or private information
+        - Spam or impersonation
+        - Copyright or source-policy concern
+        - Other public moderation concern
+    validations:
+      required: true
+  - type: textarea
+    id: minimal_context
+    attributes:
+      label: Minimal public context
+      description: Do not repeat the content; explain only why review is needed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: public_only
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I included no private evidence, personal data, credential, vulnerability detail, or restricted material.
+          required: true

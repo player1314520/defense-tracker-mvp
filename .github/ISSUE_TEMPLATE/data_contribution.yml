@@ -1,0 +1,61 @@
+name: Public-source suggestion
+description: Suggest a lawful public URL, factual metadata, and your own short summary.
+title: "[Source] "
+labels:
+  - data-source
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Link to the original public page. Do not paste article text or upload files, screenshots, QR codes, account material, personal data, real configuration, or suspected internal/sensitive material.
+  - type: input
+    id: url
+    attributes:
+      label: Direct public URL
+      placeholder: https://
+    validations:
+      required: true
+  - type: input
+    id: publisher
+    attributes:
+      label: Publisher
+    validations:
+      required: true
+  - type: input
+    id: title
+    attributes:
+      label: Source title
+    validations:
+      required: true
+  - type: input
+    id: date
+    attributes:
+      label: Publication date
+      placeholder: YYYY-MM-DD or unknown
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Your original short summary
+      description: Summarize in your own words; do not copy substantial text.
+    validations:
+      required: true
+  - type: textarea
+    id: provenance
+    attributes:
+      label: Access and reuse notes
+      description: State why the URL is public and any known license or reuse limit.
+    validations:
+      required: true
+  - type: checkboxes
+    id: compliance
+    attributes:
+      label: Contribution checks
+      options:
+        - label: I accessed this source lawfully without bypassing a login, paywall, or access control.
+          required: true
+        - label: I provided only a URL, factual metadata, and my own summary; I did not copy third-party full text.
+          required: true
+        - label: This submission contains no personal data, account screenshot, QR code, credential, real configuration, private dataset, or suspected internal/classified material.
+          required: true
