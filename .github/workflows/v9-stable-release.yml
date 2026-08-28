@@ -1,0 +1,231 @@
+name: V9 stable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact protected main commit
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful V9 signed candidate run ID
+        required: true
+        type: string
+      deployment_evidence_run_id:
+        description: Successful V9 deployment verification run ID
+        required: true
+        type: string
+      portal_image_digest:
+        description: Exact production OCI sha256 digest
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: v9-stable-release
+  cancel-in-progress: false
+
+jobs:
+  publish-stable-release:
+    name: Reverify, attest and publish immutable release
+    environment: v9-production-release
+    # Stable publication is isolated from the candidate builder and requires a
+    # separately managed one-job runner registered with --ephemeral.
+    runs-on: [self-hosted, Windows, X64, defense-v9-stable-ephemeral]
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      DEPLOYMENT_EVIDENCE_RUN_ID: ${{ inputs.deployment_evidence_run_id }}
+      PORTAL_IMAGE_DIGEST: ${{ inputs.portal_image_digest }}
+      DEFENSE_TRACKER_PUBLISHER: ${{ vars.DEFENSE_TRACKER_PUBLISHER }}
+      DEFENSE_TRACKER_SIGNTOOL: ${{ vars.DEFENSE_TRACKER_SIGNTOOL }}
+      DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE: ${{ vars.DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+      - name: Require exact current main, CI and trusted source workflows
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE -cne 'ephemeral') {
+            throw "The production release environment has not declared an ephemeral runner."
+          }
+          if ($env:RELEASE_SHA -notmatch '^[0-9a-f]{40}$') { throw "Invalid release SHA." }
+          if ($env:PORTAL_IMAGE_DIGEST -notmatch '^sha256:[0-9a-f]{64}$') { throw "Invalid image digest." }
+          if ($env:CANDIDATE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid candidate run ID." }
+          if ($env:DEPLOYMENT_EVIDENCE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid evidence run ID." }
+          if ($env:GITHUB_REF -cne 'refs/heads/main' -or $env:GITHUB_SHA -cne $env:RELEASE_SHA) {
+            throw "Stable workflow must be dispatched from the exact protected main commit."
+          }
+          if ((git rev-parse HEAD) -ne $env:RELEASE_SHA) { throw "Checkout mismatch." }
+          git fetch --no-tags origin main
+          if ((git rev-parse refs/remotes/origin/main) -ne $env:RELEASE_SHA) { throw "Release is not current main." }
+          python scripts/verify_release_checks.py `
+            --repository $env:GITHUB_REPOSITORY `
+            --sha $env:RELEASE_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Required CI is not green." }
+          $candidate = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CANDIDATE_RUN_ID" | ConvertFrom-Json
+          if ($candidate.conclusion -ne 'success' -or
+              $candidate.head_sha -ne $env:RELEASE_SHA -or
+              $candidate.head_branch -ne 'main' -or
+              $candidate.path -ne '.github/workflows/v9-signed-candidate.yml' -or
+              $candidate.event -ne 'workflow_dispatch') {
+            throw "Candidate run is not the trusted workflow for this commit."
+          }
+          $evidence = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:DEPLOYMENT_EVIDENCE_RUN_ID" | ConvertFrom-Json
+          if ($evidence.conclusion -ne 'success' -or
+              $evidence.head_sha -ne $env:RELEASE_SHA -or
+              $evidence.path -ne '.github/workflows/v9-deployment-evidence.yml' -or
+              $evidence.event -ne 'workflow_dispatch') {
+            throw "Deployment evidence run is not trusted for this commit."
+          }
+      - name: Download exact signed candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: DefenseTracker-v9.0.0-${{ inputs.release_sha }}
+          path: candidate
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download exact live deployment evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: v9-deployment-evidence-${{ inputs.release_sha }}
+          path: deployment-evidence
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.deployment_evidence_run_id }}
+          github-token: ${{ github.token }}
+      - name: Reverify hashes, signatures, timestamp and deployment gates
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          python scripts\verify_release_assets.py candidate `
+            --expected-commit $env:RELEASE_SHA
+          python scripts\verify_deployment_evidence.py deployment-evidence `
+            --expected-commit $env:RELEASE_SHA `
+            --expected-image-digest $env:PORTAL_IMAGE_DIGEST `
+            --expected-candidate-run-id $env:CANDIDATE_RUN_ID
+          .\scripts\Verify-ReleaseAuthenticode.ps1 `
+            -AssetRoot candidate `
+            -PublisherName $env:DEFENSE_TRACKER_PUBLISHER `
+            -SignToolPath $env:DEFENSE_TRACKER_SIGNTOOL
+      - name: Verify candidate provenance is bound to exact workflow, ref and SHA
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-signed-candidate.yml"
+          Get-ChildItem candidate -File | ForEach-Object {
+            gh attestation verify $_.FullName `
+              --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow $signerWorkflow `
+              --source-ref refs/heads/main `
+              --source-digest $env:RELEASE_SHA
+            if ($LASTEXITCODE -ne 0) {
+              throw "Candidate provenance verification failed: $($_.Name)"
+            }
+          }
+      - name: Confirm immutable releases are already enabled
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) { throw "Admin-read token is missing." }
+          $setting = gh api `
+            -H 'Accept: application/vnd.github+json' `
+            -H 'X-GitHub-Api-Version: 2026-03-10' `
+            "/repos/$env:GITHUB_REPOSITORY/immutable-releases" | ConvertFrom-Json
+          if ($setting.enabled -ne $true) { throw "Immutable releases are not enabled." }
+      - name: Generate SLSA provenance for all six fixed assets
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: candidate/*
+      - name: Attach SPDX SBOM attestation to the portable application
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: candidate/DefenseTracker-v9.0.0-windows-x64-portable.zip
+          sbom-path: candidate/DefenseTracker-v9.0.0.spdx.json
+      - name: Verify newly generated stable attestations before release creation
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-stable-release.yml"
+          Get-ChildItem candidate -File | ForEach-Object {
+            gh attestation verify $_.FullName `
+              --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow $signerWorkflow `
+              --source-ref refs/heads/main `
+              --source-digest $env:RELEASE_SHA
+            if ($LASTEXITCODE -ne 0) { throw "Attestation verification failed: $($_.Name)" }
+          }
+      - name: Create complete draft, verify it, then publish once
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = python -c "from product_version import PRODUCT_VERSION; print(PRODUCT_VERSION.release_tag)"
+          if ($tag -ne 'v9.0.0') { throw "Unexpected release tag." }
+          $existingTag = git ls-remote --tags origin "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw "Unable to verify the remote release tag namespace." }
+          if (-not [string]::IsNullOrWhiteSpace($existingTag)) {
+            throw "Release tag already exists; immutable tags are never reused or moved."
+          }
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "Release or draft already exists; assets are never replaced." }
+          $manifest = Get-Content candidate\release-manifest.json -Raw | ConvertFrom-Json
+          $notes = @(
+            "# DefenseTracker $tag",
+            "",
+            "Release commit: ``$env:RELEASE_SHA``",
+            "Baseline commit: ``$($manifest.release.baseline_commit)``",
+            "Portal image: ``$env:PORTAL_IMAGE_DIGEST``",
+            "Publisher: $($manifest.signature.publisher)",
+            "",
+            "This release contains the signed Windows installer, portable application, SHA-256 list, schema-2 manifest, SPDX 2.3 SBOM and third-party notices. Full desktop features remain local; the web Portal is the authenticated collaboration surface."
+          )
+          $notes | Set-Content -LiteralPath release-notes.md -Encoding UTF8
+          $assets = @(Get-ChildItem candidate -File | Sort-Object Name | ForEach-Object { $_.FullName })
+          if ($assets.Count -ne 6) { throw "Fixed release asset count is not six." }
+          & gh release create $tag --draft --target $env:RELEASE_SHA `
+            --title "DefenseTracker $tag" --notes-file release-notes.md @assets
+          if ($LASTEXITCODE -ne 0) { throw "Draft release creation failed." }
+          $draft = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if ($draft.draft -ne $true -or $draft.assets.Count -ne 6 -or
+              $draft.target_commitish -ne $env:RELEASE_SHA) {
+            throw "Draft release is incomplete or targets the wrong commit."
+          }
+          foreach ($asset in $draft.assets) {
+            $local = Join-Path candidate $asset.name
+            $expectedDigest = 'sha256:' + (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($asset.state -ne 'uploaded' -or $asset.digest -ne $expectedDigest) {
+              throw "Draft asset digest mismatch: $($asset.name)"
+            }
+          }
+          $prematureTag = git ls-remote --tags origin "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw "Unable to reverify the remote release tag namespace." }
+          if (-not [string]::IsNullOrWhiteSpace($prematureTag)) {
+            throw "A release tag appeared before immutable publication; refusing to continue."
+          }
+          gh release edit $tag --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw "Draft publication failed." }
+          $published = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if ($published.draft -ne $false -or $published.immutable -ne $true -or
+              $published.assets.Count -ne 6 -or
+              $published.target_commitish -ne $env:RELEASE_SHA) {
+            throw "Published release is not immutable or differs from the approved commit/assets."
+          }
+          git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+          if ((git rev-list -n 1 $tag) -ne $env:RELEASE_SHA) { throw "Published tag does not point to the release commit." }

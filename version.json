@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "product_name": "DefenseTracker",
+  "semantic_version": "9.0.0",
+  "windows_file_version": "9.0.0.0",
+  "display_version": "V9",
+  "release_tag": "v9.0.0",
+  "release_baseline": "5402cb5b6b05540315f24ba82014551644113805"
+}

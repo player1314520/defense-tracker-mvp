@@ -1,0 +1,278 @@
+name: V9 signed candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact protected main commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: v9-signed-candidate
+  cancel-in-progress: false
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_LINUX_X64_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  RELEASE_SHA: ${{ inputs.release_sha }}
+  PREPARATION_ARTIFACT_NAME: DefenseTracker-v9.0.0-preparation-${{ inputs.release_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+  FINAL_CANDIDATE_DIR: dist/candidates/v9.0.0/${{ inputs.release_sha }}
+
+jobs:
+  verify-source:
+    name: Verify protected source and CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Reverify release-era Git identity and metadata policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          python scripts/verify_git_history.py --revision "${RELEASE_SHA}"
+      - name: Re-scan complete Git history with pinned Gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tool_dir="$RUNNER_TEMP/gitleaks-${GITLEAKS_VERSION}"
+          report="$RUNNER_TEMP/gitleaks-report.json"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_LINUX_X64_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$tool_dir"
+          tar -xzf "$archive" -C "$tool_dir" gitleaks
+          if ! "$tool_dir/gitleaks" git --redact --no-banner --exit-code 1 \
+            --report-format json --report-path "$report" --log-opts="--all" . \
+            >/dev/null 2>&1; then
+            echo "::error::Pinned Gitleaks full-history scan failed; sensitive findings are intentionally not printed."
+            exit 1
+          fi
+      - name: Require exact current main and six successful CI checks
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "${GITHUB_REF}" = "refs/heads/main"
+          test "${GITHUB_SHA}" = "${RELEASE_SHA}"
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          git fetch --no-tags origin main
+          test "$(git rev-parse refs/remotes/origin/main)" = "${RELEASE_SHA}"
+          python scripts/verify_release_checks.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --sha "${RELEASE_SHA}"
+          test "$(python -c 'from product_version import PRODUCT_VERSION; print(PRODUCT_VERSION.release_tag)')" = "v9.0.0"
+
+  prepare-installer-review:
+    name: Sign reviewed application and prepare unsigned installer
+    needs: verify-source
+    environment: v9-trusted-signing
+    runs-on: [self-hosted, Windows, X64, defense-v9-candidate-ephemeral]
+    timeout-minutes: 90
+    env:
+      AZURE_CORE_OUTPUT: none
+      DEFENSE_TRACKER_BUILD_PYTHON: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON }}
+      DEFENSE_TRACKER_PUBLISHER: ${{ vars.DEFENSE_TRACKER_PUBLISHER }}
+      DEFENSE_TRACKER_SIGNING_PROVIDER: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER }}
+      DEFENSE_TRACKER_TIMESTAMP_URL: ${{ vars.DEFENSE_TRACKER_TIMESTAMP_URL }}
+      DEFENSE_TRACKER_SIGNTOOL: ${{ vars.DEFENSE_TRACKER_SIGNTOOL }}
+      DEFENSE_TRACKER_ISCC: ${{ vars.DEFENSE_TRACKER_ISCC }}
+      DEFENSE_TRACKER_7ZIP: ${{ vars.DEFENSE_TRACKER_7ZIP }}
+      DEFENSE_TRACKER_DEFENDER: ${{ vars.DEFENSE_TRACKER_DEFENDER }}
+      DEFENSE_TRACKER_AZURE_SIGNING_DLIB: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_DLIB }}
+      DEFENSE_TRACKER_AZURE_SIGNING_METADATA: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_METADATA }}
+      DEFENSE_TRACKER_DIGICERT_KEY_ALIAS: ${{ vars.DEFENSE_TRACKER_DIGICERT_KEY_ALIAS }}
+      DEFENSE_TRACKER_DIGICERT_CERT_FILE: ${{ vars.DEFENSE_TRACKER_DIGICERT_CERT_FILE }}
+      DEFENSE_TRACKER_BUILD_PYTHON_SHA256: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON_SHA256 }}
+      DEFENSE_TRACKER_SIGNTOOL_SHA256: ${{ vars.DEFENSE_TRACKER_SIGNTOOL_SHA256 }}
+      DEFENSE_TRACKER_ISCC_SHA256: ${{ vars.DEFENSE_TRACKER_ISCC_SHA256 }}
+      DEFENSE_TRACKER_7ZIP_SHA256: ${{ vars.DEFENSE_TRACKER_7ZIP_SHA256 }}
+      DEFENSE_TRACKER_DEFENDER_SHA256: ${{ vars.DEFENSE_TRACKER_DEFENDER_SHA256 }}
+      DEFENSE_TRACKER_AZURE_SIGNING_DLIB_SHA256: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_DLIB_SHA256 }}
+      DEFENSE_TRACKER_AZURE_SIGNING_METADATA_SHA256: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_METADATA_SHA256 }}
+      DEFENSE_TRACKER_INNO_LICENSE_TEXT: ${{ vars.DEFENSE_TRACKER_INNO_LICENSE_TEXT }}
+      DEFENSE_TRACKER_INNO_LICENSE_TEXT_SHA256: ${{ vars.DEFENSE_TRACKER_INNO_LICENSE_TEXT_SHA256 }}
+      DEFENSE_TRACKER_INNO_COPYRIGHT_TEXT: ${{ vars.DEFENSE_TRACKER_INNO_COPYRIGHT_TEXT }}
+      DEFENSE_TRACKER_COMPLIANCE_EVIDENCE: ${{ vars.DEFENSE_TRACKER_COMPLIANCE_EVIDENCE }}
+      DEFENSE_TRACKER_COMPLIANCE_SIGNATURE: ${{ vars.DEFENSE_TRACKER_COMPLIANCE_SIGNATURE }}
+      DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256: ${{ vars.DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256 }}
+      DEFENSE_TRACKER_PREPARATION_ARTIFACT_NAME: ${{ env.PREPARATION_ARTIFACT_NAME }}
+      DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE: ${{ vars.DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+      - name: Azure OIDC login for application signing
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'AzureArtifactSigning' }}
+        uses: Azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Prepare exact application and unsigned installer review bundle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE -cne 'ephemeral') {
+            throw "Application-signing environment has not declared an ephemeral runner."
+          }
+          if ($env:RELEASE_SHA -notmatch '^[0-9a-f]{40}$' -or
+              $env:GITHUB_REF -cne 'refs/heads/main' -or $env:GITHUB_SHA -cne $env:RELEASE_SHA -or
+              (git rev-parse HEAD) -ne $env:RELEASE_SHA) {
+            throw "Preparation must use the exact protected main commit."
+          }
+          .\scripts\Prepare-BuildEnv.ps1 -RequireExpectedPythonHash
+          .\scripts\Build-AndShip.ps1 `
+            -ExpectedReleaseSha $env:RELEASE_SHA `
+            -RequireSignedInstaller `
+            -CandidateOnly
+      - name: Attest candidate build provenance before review retention
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/candidate-preparations/v9.0.0/${{ inputs.release_sha }}/${{ github.run_id }}/**/*
+      - name: Retain candidate preparation bundle for independent review
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.PREPARATION_ARTIFACT_NAME }}
+          path: dist/candidate-preparations/v9.0.0/${{ inputs.release_sha }}/${{ github.run_id }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+          include-hidden-files: false
+
+  finalize-signed-candidate:
+    name: Independently approve and sign exact installer
+    needs: prepare-installer-review
+    environment: v9-installer-signing-review
+    runs-on: [self-hosted, Windows, X64, defense-v9-installer-ephemeral]
+    timeout-minutes: 90
+    env:
+      AZURE_CORE_OUTPUT: none
+      PREPARATION_ROOT: ${{ runner.temp }}\DefenseTracker-v9-preparation
+      DEFENSE_TRACKER_BUILD_PYTHON: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON }}
+      DEFENSE_TRACKER_PUBLISHER: ${{ vars.DEFENSE_TRACKER_PUBLISHER }}
+      DEFENSE_TRACKER_SIGNING_PROVIDER: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER }}
+      DEFENSE_TRACKER_TIMESTAMP_URL: ${{ vars.DEFENSE_TRACKER_TIMESTAMP_URL }}
+      DEFENSE_TRACKER_SIGNTOOL: ${{ vars.DEFENSE_TRACKER_SIGNTOOL }}
+      DEFENSE_TRACKER_ISCC: ${{ vars.DEFENSE_TRACKER_ISCC }}
+      DEFENSE_TRACKER_7ZIP: ${{ vars.DEFENSE_TRACKER_7ZIP }}
+      DEFENSE_TRACKER_DEFENDER: ${{ vars.DEFENSE_TRACKER_DEFENDER }}
+      DEFENSE_TRACKER_AZURE_SIGNING_DLIB: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_DLIB }}
+      DEFENSE_TRACKER_AZURE_SIGNING_METADATA: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_METADATA }}
+      DEFENSE_TRACKER_DIGICERT_KEY_ALIAS: ${{ vars.DEFENSE_TRACKER_DIGICERT_KEY_ALIAS }}
+      DEFENSE_TRACKER_DIGICERT_CERT_FILE: ${{ vars.DEFENSE_TRACKER_DIGICERT_CERT_FILE }}
+      DEFENSE_TRACKER_BUILD_PYTHON_SHA256: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON_SHA256 }}
+      DEFENSE_TRACKER_SIGNTOOL_SHA256: ${{ vars.DEFENSE_TRACKER_SIGNTOOL_SHA256 }}
+      DEFENSE_TRACKER_ISCC_SHA256: ${{ vars.DEFENSE_TRACKER_ISCC_SHA256 }}
+      DEFENSE_TRACKER_7ZIP_SHA256: ${{ vars.DEFENSE_TRACKER_7ZIP_SHA256 }}
+      DEFENSE_TRACKER_DEFENDER_SHA256: ${{ vars.DEFENSE_TRACKER_DEFENDER_SHA256 }}
+      DEFENSE_TRACKER_AZURE_SIGNING_DLIB_SHA256: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_DLIB_SHA256 }}
+      DEFENSE_TRACKER_AZURE_SIGNING_METADATA_SHA256: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_METADATA_SHA256 }}
+      DEFENSE_TRACKER_INNO_LICENSE_TEXT_SHA256: ${{ vars.DEFENSE_TRACKER_INNO_LICENSE_TEXT_SHA256 }}
+      DEFENSE_TRACKER_INNO_COPYRIGHT_TEXT: ${{ vars.DEFENSE_TRACKER_INNO_COPYRIGHT_TEXT }}
+      DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256: ${{ vars.DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256 }}
+      DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE: ${{ vars.DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE }}
+      DEFENSE_TRACKER_INSTALLER_REVIEW_SIGNATURE: ${{ vars.DEFENSE_TRACKER_INSTALLER_REVIEW_SIGNATURE }}
+      DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE_SHA256: ${{ vars.DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE_SHA256 }}
+      DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE: ${{ vars.DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+      - name: Download the exact preparation artifact from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.PREPARATION_ARTIFACT_NAME }}
+          path: ${{ env.PREPARATION_ROOT }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify preparation run and every attested file
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE -cne 'ephemeral') {
+            throw "Installer-signing environment has not declared an ephemeral runner."
+          }
+          if ($env:RELEASE_SHA -notmatch '^[0-9a-f]{40}$' -or
+              $env:GITHUB_REF -cne 'refs/heads/main' -or $env:GITHUB_SHA -cne $env:RELEASE_SHA) {
+            throw "Installer finalization must use the exact protected main commit."
+          }
+          $run = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" | ConvertFrom-Json
+          if ($run.head_sha -cne $env:RELEASE_SHA -or
+              $run.path -cne '.github/workflows/v9-signed-candidate.yml' -or
+              $run.event -cne 'workflow_dispatch') {
+            throw "Preparation run provenance is not trusted."
+          }
+          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-signed-candidate.yml"
+          Get-ChildItem -LiteralPath $env:PREPARATION_ROOT -Recurse -File | ForEach-Object {
+            gh attestation verify $_.FullName `
+              --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow $signerWorkflow `
+              --source-ref refs/heads/main `
+              --source-digest $env:RELEASE_SHA
+            if ($LASTEXITCODE -ne 0) { throw "Preparation provenance verification failed." }
+          }
+      - name: Azure OIDC login for installer signing
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'AzureArtifactSigning' }}
+        uses: Azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Finalize independently reviewed installer candidate
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\scripts\Prepare-BuildEnv.ps1 -RequireExpectedPythonHash
+          .\scripts\Finalize-SignedCandidate.ps1 `
+            -ExpectedReleaseSha $env:RELEASE_SHA `
+            -PreparationRoot $env:PREPARATION_ROOT `
+            -ExpectedPreparationRunId $env:GITHUB_RUN_ID `
+            -ExpectedPreparationRunAttempt $env:GITHUB_RUN_ATTEMPT `
+            -ExpectedPreparationArtifactName $env:PREPARATION_ARTIFACT_NAME
+      - name: Reverify fixed six-asset candidate contract
+        shell: powershell
+        run: |
+          .\.venv-build\Scripts\python.exe scripts\verify_release_assets.py `
+            "dist\candidates\v9.0.0\$env:RELEASE_SHA" `
+            --expected-commit $env:RELEASE_SHA
+      - name: Attest finalized candidate build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/candidates/v9.0.0/${{ inputs.release_sha }}/*
+      - name: Retain candidate without creating a tag or release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: DefenseTracker-v9.0.0-${{ inputs.release_sha }}
+          path: ${{ env.FINAL_CANDIDATE_DIR }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+          include-hidden-files: false
