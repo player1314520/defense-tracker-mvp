@@ -375,6 +375,20 @@ def test_credential_vault_encrypts_the_entire_json_with_injected_protector(tmp_p
     assert vault.load() == expected
 
 
+def test_missing_vault_does_not_initialize_windows_dpapi(tmp_path, monkeypatch):
+    import v9.supabase_client as supabase_client
+
+    monkeypatch.setattr(
+        supabase_client,
+        "WindowsDpapiProtector",
+        lambda: pytest.fail("missing vault must not initialize Windows DPAPI"),
+    )
+
+    vault = WechatCredentialVault(tmp_path / ".wechat_mp.vault")
+
+    assert vault.load() is None
+
+
 def test_vault_rejects_any_approval_private_key_material(tmp_path):
     class FakeProtector:
         def protect(self, value):

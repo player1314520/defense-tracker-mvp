@@ -364,12 +364,15 @@ class WechatCredentialVault:
         if path is None:
             path = resolve_runtime_paths().vault_path
         self.path = Path(path)
-        if protector is None:
-            from v9.supabase_client import WindowsDpapiProtector
-
-            protector = WindowsDpapiProtector()
         self.protector = protector
         self.file_security = file_security
+
+    def _get_protector(self) -> Any:
+        if self.protector is None:
+            from v9.supabase_client import WindowsDpapiProtector
+
+            self.protector = WindowsDpapiProtector()
+        return self.protector
 
     def save(self, credentials: Mapping[str, Any]) -> None:
         unknown = set(credentials) - self._ALLOWED_FIELDS
@@ -390,7 +393,7 @@ class WechatCredentialVault:
             raise ValueError("private keys are forbidden")
         plaintext = _canonical_json({"schema": 1, "credentials": normalized}).encode("utf-8")
         try:
-            protected = self.protector.protect(plaintext)
+            protected = self._get_protector().protect(plaintext)
         except Exception as exc:
             raise CredentialVaultError("credential protection failed") from exc
         envelope = {
@@ -416,7 +419,7 @@ class WechatCredentialVault:
             if envelope.get("schema") != 1:
                 raise ValueError("unsupported schema")
             protected = base64.b64decode(envelope["protected_payload"], validate=True)
-            plaintext = self.protector.unprotect(protected)
+            plaintext = self._get_protector().unprotect(protected)
             payload = json.loads(plaintext.decode("utf-8"))
             if payload.get("schema") != 1 or not isinstance(payload.get("credentials"), dict):
                 raise ValueError("invalid payload")
