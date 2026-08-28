@@ -119,6 +119,13 @@ def test_candidate_workflow_separates_application_and_installer_trust_environmen
     assert "DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE" in workflow
     assert "DEFENSE_TRACKER_INSTALLER_REVIEW_SIGNATURE" in workflow
     assert "DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE_SHA256" in workflow
+    assert "      DEFENSE_TRACKER_PREPARATION_ARTIFACT_NAME: ${{ env." not in workflow
+    workflow_lines = workflow.splitlines()
+    preparation_root = (
+        "PREPARATION_ROOT: ${{ runner.temp }}\\DefenseTracker-v9-preparation"
+    )
+    assert f"      {preparation_root}" not in workflow_lines
+    assert workflow_lines.count(f"          {preparation_root}") == 2
     assert workflow.index("Attest candidate build provenance") < workflow.index(
         "Retain candidate preparation bundle"
     )

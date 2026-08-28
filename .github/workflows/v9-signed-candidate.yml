@@ -115,7 +115,7 @@ jobs:
       DEFENSE_TRACKER_COMPLIANCE_EVIDENCE: ${{ vars.DEFENSE_TRACKER_COMPLIANCE_EVIDENCE }}
       DEFENSE_TRACKER_COMPLIANCE_SIGNATURE: ${{ vars.DEFENSE_TRACKER_COMPLIANCE_SIGNATURE }}
       DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256: ${{ vars.DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256 }}
-      DEFENSE_TRACKER_PREPARATION_ARTIFACT_NAME: ${{ env.PREPARATION_ARTIFACT_NAME }}
+      DEFENSE_TRACKER_PREPARATION_ARTIFACT_NAME: DefenseTracker-v9.0.0-preparation-${{ inputs.release_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
       DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE: ${{ vars.DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -170,7 +170,6 @@ jobs:
     timeout-minutes: 90
     env:
       AZURE_CORE_OUTPUT: none
-      PREPARATION_ROOT: ${{ runner.temp }}\DefenseTracker-v9-preparation
       DEFENSE_TRACKER_BUILD_PYTHON: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON }}
       DEFENSE_TRACKER_PUBLISHER: ${{ vars.DEFENSE_TRACKER_PUBLISHER }}
       DEFENSE_TRACKER_SIGNING_PROVIDER: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER }}
@@ -209,12 +208,14 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ env.PREPARATION_ARTIFACT_NAME }}
-          path: ${{ env.PREPARATION_ROOT }}
+          path: ${{ runner.temp }}\DefenseTracker-v9-preparation
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
       - name: Verify preparation run and every attested file
         shell: powershell
+        env:
+          PREPARATION_ROOT: ${{ runner.temp }}\DefenseTracker-v9-preparation
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE -cne 'ephemeral') {
@@ -248,6 +249,8 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Finalize independently reviewed installer candidate
         shell: powershell
+        env:
+          PREPARATION_ROOT: ${{ runner.temp }}\DefenseTracker-v9-preparation
         run: |
           $ErrorActionPreference = "Stop"
           .\scripts\Prepare-BuildEnv.ps1 -RequireExpectedPythonHash
