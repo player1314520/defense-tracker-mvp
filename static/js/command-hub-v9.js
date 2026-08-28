@@ -41,8 +41,8 @@
     }
     track.innerHTML = items.map((item, index) => {
       const divider = index < items.length - 1 ? '<b>◆</b>' : '';
-      const href = safeUrl(item.url || '#');
-      return `<a href="${escHtml(href)}" target="_blank" rel="noopener">` +
+      const href = safeExternalUrl(item.url);
+      return `<a href="${escHtml(href)}" target="_blank" rel="noopener noreferrer">` +
         `${escHtml(item.age_label)} · ${escHtml(item.title)}</a>${divider}`;
     }).join('');
   }
@@ -52,8 +52,8 @@
     const score = ready ? String(region.score) : '—';
     const meter = ready ? Math.max(0, Math.min(100, region.score)) : 0;
     const evidenceLinks = (region.evidence || []).slice(0, 5).map(item => {
-      const href = safeUrl(item.url || '#');
-      return `<li><a href="${escHtml(href)}" target="_blank" rel="noopener">` +
+      const href = safeExternalUrl(item.url);
+      return `<li><a href="${escHtml(href)}" target="_blank" rel="noopener noreferrer">` +
         `${escHtml(item.title)}</a><span>${escHtml(item.source)}</span></li>`;
     }).join('');
     const formula = region.formula || {};
@@ -120,7 +120,7 @@
         <h2>${escHtml(content.title || '无标题证据')}</h2>
         <p>${escHtml(content.summary || '暂无摘要')}</p>
         <footer><span>${escHtml(content.source || provenance.source || '未知来源')}</span>
-          <a href="${escHtml(safeUrl(provenance.url || '#'))}" target="_blank" rel="noopener">打开原文 ↗</a>
+          <a href="${escHtml(safeExternalUrl(provenance.url))}" target="_blank" rel="noopener noreferrer">打开原文 ↗</a>
         </footer>
       </article>`;
     }).join('');

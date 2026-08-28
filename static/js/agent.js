@@ -667,7 +667,7 @@ function agentRenderEvidence() {
         <div class="agent-evidence-title">${escHtml(ev.title)}</div>
         ${verdict}
         <div class="agent-evidence-reasons">${reasons}</div>
-        ${ev.link ? `<a class="agent-link" href="${escHtml(ev.link)}" target="_blank" rel="noopener">原文</a>` : ''}
+        ${ev.link ? `<a class="agent-link" href="${escHtml(safeExternalUrl(ev.link))}" target="_blank" rel="noopener noreferrer">原文</a>` : ''}
       </div>
     </div>`;
   }).join('');

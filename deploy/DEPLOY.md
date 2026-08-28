@@ -1,4 +1,8 @@
-# 防务追踪系统 — 公网部署指南
+# 防务追踪系统 — 旧版单机工作台部署指南
+
+本文件只描述受控网络中的旧 Flask 工作台，不是 V9 社区 Portal 的生产部署说明。
+公网 Portal 请使用 `docs/MVP_DEPLOY.md` 的独立 Supabase/Caddy 流程；不得把本地 AI、
+写作素材、飞书配置或真实运行数据打包上传。
 
 ## 方案一：Docker + Nginx（推荐）
 
@@ -48,6 +52,8 @@ environment:
   FEISHU_APP_ID:       "cli_xxxxxxxx"
   FEISHU_APP_SECRET:   "xxxxxxxx"
   FEISHU_VERIFY_TOKEN: "xxxxxxxx"
+  FEISHU_ENCRYPT_KEY:  "xxxxxxxx"
+  FEISHU_TENANT_KEY:   "tenant-key-from-event"
 ```
 
 ### 6. 修改 nginx.conf
@@ -94,7 +100,7 @@ $env:NGROK_DOMAIN = 'your-ngrok-domain.example'
 | SSRF防护 | ✅ | 禁止访问私有/内网地址 |
 | 安全响应头 | ✅ | CSP / X-Frame-Options / nosniff |
 | 文件上传限制 | ✅ | 最大16MB |
-| 飞书Webhook签名验证 | ✅ | 必须配置 FEISHU_VERIFY_TOKEN；缺失时 webhook 固定返回 503 |
+| 飞书Webhook身份验证 | ✅ | 必须同时配置 Verify Token、Encrypt Key、Tenant Key；缺失时固定返回 503 |
 | 飞书消息去重 | ✅ | 防重试导致重复生成 |
 | HTTPS Cookie | ✅ | 公网HTTPS下自动设置 secure 标志 |
 | Nginx限速 | ✅ | 登录页5r/m，API 30r/m |
@@ -108,7 +114,8 @@ $env:NGROK_DOMAIN = 'your-ngrok-domain.example'
    https://your-domain.com/api/feishu/webhook
    ```
 2. 在系统「💬 飞书机器人」标签页填入 App ID 和 App Secret
-3. 复制「验证令牌」填入 docker-compose.yml 的 `FEISHU_VERIFY_TOKEN`
+3. 通过安全渠道把「验证令牌」「Encrypt Key」和预期 Tenant Key 分别注入
+   `FEISHU_VERIFY_TOKEN`、`FEISHU_ENCRYPT_KEY`、`FEISHU_TENANT_KEY`；不要写入仓库。
 4. 重启容器：`docker compose restart tracker`
 
 ---

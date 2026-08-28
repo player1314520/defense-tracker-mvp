@@ -4,6 +4,9 @@
     auto_https disable_redirects
     servers {
         protocols h1 h2
+        trusted_proxies static {$WAF_TRUSTED_PROXY_CIDRS}
+        client_ip_headers X-Forwarded-For
+        trusted_proxies_strict
     }
 }
 
@@ -32,7 +35,7 @@ https://{$PORTAL_DOMAIN} {
     }
 
     @portal_public {
-        path / /health /ready /favicon.ico /portal /portal/*
+        path / /health /ready /api/status /favicon.ico /portal /portal/*
     }
 
     handle @portal_public {
@@ -45,7 +48,7 @@ https://{$PORTAL_DOMAIN} {
             header_up -X-Real-IP
             header_up -X-Forwarded-For
             header_up -CF-Connecting-IP
-            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-For {client_ip}
         }
     }
 
@@ -64,8 +67,30 @@ https://{$API_DOMAIN} {
         max_size 32MB
     }
 
+    # Realtime has its own route so an upstream WAF can allow WebSocket
+    # upgrades without weakening the application endpoint's request policy.
+    @realtime_api {
+        path /realtime/v1/*
+    }
+
+    handle @realtime_api {
+        reverse_proxy {$SUPABASE_UPSTREAM} {
+            health_uri /auth/v1/health
+            health_interval 15s
+            health_timeout 3s
+            header_up X-Forwarded-Proto https
+            header_up X-Forwarded-Host {host}
+            header_up -X-Real-IP
+            header_up -X-Forwarded-For
+            header_up -CF-Connecting-IP
+            header_up -X-V9-Client-IP
+            header_up X-V9-Client-IP {client_ip}
+            header_up X-Forwarded-For {client_ip}
+        }
+    }
+
     @public_api {
-        path /auth/v1/* /rest/v1/* /graphql/v1/* /realtime/v1/* /storage/v1/* /functions/v1/access-applications /functions/v1/access-applications/* /functions/v1/invite-member /functions/v1/invite-member/*
+        path /auth/v1/* /rest/v1/* /graphql/v1/* /storage/v1/* /functions/v1/access-applications /functions/v1/access-applications/* /functions/v1/invite-member /functions/v1/invite-member/*
     }
 
     handle @public_api {
@@ -79,8 +104,8 @@ https://{$API_DOMAIN} {
             header_up -X-Forwarded-For
             header_up -CF-Connecting-IP
             header_up -X-V9-Client-IP
-            header_up X-V9-Client-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
+            header_up X-V9-Client-IP {client_ip}
+            header_up X-Forwarded-For {client_ip}
         }
     }
 

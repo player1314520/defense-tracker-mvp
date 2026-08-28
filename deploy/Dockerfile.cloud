@@ -3,9 +3,13 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY deploy/requirements.cloud.txt requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
-COPY v9_cloud.py ./
+ARG DEFENSE_TRACKER_BUILD_COMMIT
+RUN printf '%s' "$DEFENSE_TRACKER_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+ENV DEFENSE_TRACKER_BUILD_COMMIT=${DEFENSE_TRACKER_BUILD_COMMIT}
+
+COPY v9_cloud.py feishu_webhook_security.py product_version.py version.json ./
 COPY v9/__init__.py v9/cloud.py ./v9/
 COPY web/v9-portal ./web/v9-portal
 

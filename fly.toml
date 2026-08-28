@@ -5,10 +5,13 @@ primary_region = "hkg"   # 香港，对国内 + 飞书 API 延迟均最低
 
 [build]
   dockerfile = "deploy/Dockerfile.cloud"
+# Production builds fail closed unless deployment supplies the reviewed commit:
+# fly deploy --build-arg DEFENSE_TRACKER_BUILD_COMMIT=<40 lowercase hex SHA>
 
 [env]
   PORT = "8080"
   V9_CLOUD_DB_PATH = "/data/v9-cloud.sqlite3"
+  FEISHU_DEDUPE_DB = "/data/feishu-event-dedupe.sqlite3"
   V9_PRODUCTION_MODE = "true"
 
 # 持久化卷：会话数据跨部署保留

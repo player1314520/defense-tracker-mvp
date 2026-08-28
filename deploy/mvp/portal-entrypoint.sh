@@ -36,14 +36,22 @@ case "${V9_MAX_CONCURRENT_REQUESTS:-}" in
     *) fail "V9_MAX_CONCURRENT_REQUESTS must be 20 for the MVP" ;;
 esac
 
+case "${V9_MAX_EVENTS_PER_USER_PER_DAY:-}" in
+    1000) ;;
+    *) fail "V9_MAX_EVENTS_PER_USER_PER_DAY must be 1000 for the MVP" ;;
+esac
+
+printf '%s' "${DEFENSE_TRACKER_BUILD_COMMIT:-}" | grep -Eq '^[0-9a-f]{40}$' ||
+    fail "DEFENSE_TRACKER_BUILD_COMMIT must be a full lowercase Git SHA"
+
 case "${V9_PRODUCTION_MODE:-}" in
     true) ;;
     *) fail "V9_PRODUCTION_MODE must be true" ;;
 esac
 
 case "${V9_ACCESS_APPLICATIONS_ENABLED:-}" in
-    true) ;;
-    *) fail "V9_ACCESS_APPLICATIONS_ENABLED must be true" ;;
+    true|false) ;;
+    *) fail "V9_ACCESS_APPLICATIONS_ENABLED must be true or false" ;;
 esac
 
 key_file=${V9_SUPABASE_PUBLISHABLE_KEY_FILE:-/run/secrets/supabase_publishable_key}

@@ -688,7 +688,7 @@ function consultRenderReadingQueue() {
     const preview = asset.asset_id
       ? `<button type="button" onclick="consultPreviewAsset('${escJsArg(asset.asset_id)}')">预览</button>`
       : '';
-    const open = asset.url ? `<a href="${escHtml(asset.url)}" target="_blank" rel="noopener">来源</a>` : '';
+    const open = asset.url ? `<a href="${escHtml(safeExternalUrl(asset.url))}" target="_blank" rel="noopener noreferrer">来源</a>` : '';
     return `<div class="consult-queue-item ${escHtml(status)}">
       <div>
         <strong>${escHtml(title).slice(0, 92)}</strong>
@@ -832,7 +832,7 @@ function consultRenderCaptureCockpit(stats = consultEvidenceStats()) {
     const title = src.title || src.payload?.title || ev.title || src.url || ev.url || '受限资料';
     const reason = src.failure_reason || src.payload?.diagnosis?.label || ev.payload?.diagnosis?.label || src.status || '需要复核';
     const preview = src.asset_id ? `<button type="button" onclick="consultPreviewAsset('${escJsArg(src.asset_id)}')">诊断</button>` : '';
-    const open = (src.url || ev.url) ? `<a href="${escHtml(src.url || ev.url)}" target="_blank" rel="noopener">网页</a>` : '';
+    const open = (src.url || ev.url) ? `<a href="${escHtml(safeExternalUrl(src.url || ev.url))}" target="_blank" rel="noopener noreferrer">网页</a>` : '';
     return `<div class="consult-restricted-item ${escHtml(src.status || consultEvidenceStatus(ev))}">
       <div><strong>${escHtml(title).slice(0, 72)}</strong><small>${escHtml(reason).slice(0, 94)}</small></div>
       <div>${preview}${open}</div>
@@ -1202,7 +1202,7 @@ function consultRenderEvidence(meta) {
       : (!isTarget && consultCanExtract(ev)
         ? `<button class="consult-evidence-action" onclick="consultArchiveThenPreview('${escHtml(ev.evidence_id)}')" type="button">抓取预览</button>`
         : '');
-    const link = ev.url ? `<a class="consult-evidence-link" href="${escHtml(ev.url)}" target="_blank" rel="noopener">打开来源</a>` : '';
+    const link = ev.url ? `<a class="consult-evidence-link" href="${escHtml(safeExternalUrl(ev.url))}" target="_blank" rel="noopener noreferrer">打开来源</a>` : '';
     const actions = (previewAction || link) ? `<div class="consult-evidence-links">${previewAction}${link}</div>` : '';
     const failure = asset?.failure_reason ? `<div class="consult-evidence-failure">${escHtml(asset.failure_reason).slice(0, 180)}</div>` : '';
     return `<article class="consult-evidence-card${selected ? ' selected' : ''}">
@@ -1305,8 +1305,8 @@ function consultRenderAssetPreview(data) {
     : data?.preview_mode === 'pdf' && fileUrl
     ? `<iframe class="consult-asset-frame" src="${escHtml(fileUrl)}#view=FitH"></iframe>`
     : `<div class="consult-reader-layout">${outlineHtml}<div class="consult-document-paper">${consultPreviewTextHtml(data?.text || '')}</div></div>`;
-  const openLink = asset.url ? `<a class="consult-preview-link" href="${escHtml(asset.url)}" target="_blank" rel="noopener">打开网页</a>` : '';
-  const downloadLink = downloadUrl ? `<a class="consult-preview-link" href="${escHtml(downloadUrl)}" target="_blank" rel="noopener">下载原件</a>` : '';
+  const openLink = asset.url ? `<a class="consult-preview-link" href="${escHtml(safeExternalUrl(asset.url))}" target="_blank" rel="noopener noreferrer">打开网页</a>` : '';
+  const downloadLink = downloadUrl ? `<a class="consult-preview-link" href="${escHtml(safeUrl(downloadUrl))}" target="_blank" rel="noopener">下载原件</a>` : '';
   box.className = 'consult-asset-preview';
   box.innerHTML = `<div class="consult-asset-head">
       <div>
@@ -2024,7 +2024,8 @@ function ctxCopyLink() {
 function ctxOpenNew() {
   hideCtxMenu();
   const article = getCtxArticle();
-  if (article) window.open(article.link, '_blank');
+  const url = article ? safeExternalUrl(article.link) : '#';
+  if (url !== '#') window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 // AI 浮动按钮

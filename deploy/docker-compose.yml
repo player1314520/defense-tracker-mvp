@@ -18,10 +18,12 @@ services:
       AI_API_KEY:  ""
       AI_BASE_URL: "https://api.deepseek.com"
       AI_MODEL:    "deepseek-chat"
-      # ── 飞书机器人（可选；未配置验证令牌时 webhook 固定返回 503）──
+      # ── 飞书机器人（可选；三项 webhook 身份材料缺一即固定返回 503）──
       FEISHU_APP_ID:       "${FEISHU_APP_ID:-}"
       FEISHU_APP_SECRET:   "${FEISHU_APP_SECRET:-}"
       FEISHU_VERIFY_TOKEN: "${FEISHU_VERIFY_TOKEN:-}"
+      FEISHU_ENCRYPT_KEY:  "${FEISHU_ENCRYPT_KEY:-}"
+      FEISHU_TENANT_KEY:   "${FEISHU_TENANT_KEY:-}"
     volumes:
       # 持久化 access_token 文件，重启后不变
       - ../data:/app/data

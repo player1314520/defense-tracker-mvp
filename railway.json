@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 30 v9_cloud:app",
+    "startCommand": "DEFENSE_TRACKER_BUILD_COMMIT=$RAILWAY_GIT_COMMIT_SHA gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 30 v9_cloud:app",
     "healthcheckPath": "/ready",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10

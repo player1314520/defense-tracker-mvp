@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily DefenseTracker access-data retention purge (Asia/Shanghai)
+
+[Timer]
+OnCalendar=*-*-* 03:05:00 Asia/Shanghai
+Persistent=true
+Unit=defense-tracker-retention.service
+
+[Install]
+WantedBy=timers.target

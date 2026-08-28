@@ -15,6 +15,7 @@ services:
   functions:
     environment:
       V9_ALLOWED_ORIGINS: "https://${PORTAL_DOMAIN:?set the exact portal domain}"
+      V9_ACCESS_APPLICATIONS_ENABLED: "${ACCESS_APPLICATIONS_ENABLED:-false}"
       V9_INVITE_REDIRECT_URL: "https://${PORTAL_DOMAIN:?set the exact portal domain}/portal/"
       ACCESS_APPLICATION_HMAC_KEY: "${ACCESS_APPLICATION_HMAC_KEY:?set in the protected Supabase env}"
       ACCESS_APPLICATION_ENCRYPTION_KEY: "${ACCESS_APPLICATION_ENCRYPTION_KEY:?set in the protected Supabase env}"

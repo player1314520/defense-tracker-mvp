@@ -128,6 +128,15 @@ function allowedOrigins(): Set<string> {
   return new Set(local);
 }
 
+function accessApplicationsEnabled(): boolean {
+  const configured = (Deno.env.get("V9_ACCESS_APPLICATIONS_ENABLED") || "false")
+    .trim()
+    .toLowerCase();
+  if (configured === "true") return true;
+  if (configured === "false") return false;
+  throw new TypeError("invalid_access_application_setting");
+}
+
 function publishableKey(): string {
   const namedKeys = Deno.env.get("SUPABASE_PUBLISHABLE_KEYS") || "";
   if (!namedKeys) return "";
@@ -301,10 +310,19 @@ async function listApplications(
     return response(503, { error: "server_not_configured" }, origin);
   }
   const applications: Array<Record<string, unknown>> = [];
+  let purgedRowSeen = false;
   try {
     for (const raw of data.items) {
       if (!isPlainObject(raw)) throw new TypeError("invalid_application_row");
       const item = { ...raw };
+      // The retention migration excludes purged contacts before pagination.
+      // Keep this guard as a fail-closed rollout boundary: if a compatible RPC
+      // explicitly marks a purged row, never send its empty crypto material to
+      // the decryptor and never expose a correlatable list entry.
+      if (item.contact_purged === true) {
+        purgedRowSeen = true;
+        continue;
+      }
       const normalized = await decryptEmail({
         ciphertext: item.email_ciphertext,
         nonce: item.email_nonce,
@@ -333,7 +351,9 @@ async function listApplications(
   }
   return response(200, {
     applications,
-    next_cursor: data.next_cursor ?? null,
+    // A legacy/incompatible RPC could use a purged row ID as its cursor.  Do
+    // not return that identifier; stopping pagination is the safe fallback.
+    next_cursor: purgedRowSeen ? null : data.next_cursor ?? null,
   }, origin);
 }
 
@@ -470,6 +490,13 @@ Deno.serve(async (request: Request) => {
     return response(503, { error: "server_not_configured" }, origin);
   }
   if (input.action === "apply") {
+    try {
+      if (!accessApplicationsEnabled()) {
+        return response(503, { error: "applications_closed" }, origin);
+      }
+    } catch {
+      return response(503, { error: "server_not_configured" }, origin);
+    }
     let secrets: ReturnType<typeof applicationSecrets>;
     try {
       secrets = applicationSecrets();

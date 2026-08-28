@@ -190,6 +190,16 @@ def test_edge_uses_one_action_endpoint_and_generic_apply_response():
     assert "raw_email" not in source
 
 
+def test_edge_application_gate_defaults_closed_and_is_server_enforced():
+    source = EDGE.read_text(encoding="utf-8")
+
+    assert 'Deno.env.get("V9_ACCESS_APPLICATIONS_ENABLED") || "false"' in source
+    assert 'error: "applications_closed"' in source
+    apply_branch = source.index('if (input.action === "apply")')
+    submit = source.index("return await applyForAccess", apply_branch)
+    assert source.index("accessApplicationsEnabled()", apply_branch) < submit
+
+
 def test_apply_rate_source_uses_only_the_trusted_proxy_contract():
     source = EDGE.read_text(encoding="utf-8").lower()
 
@@ -221,6 +231,19 @@ def test_list_and_decision_require_jwt_and_only_return_masked_email():
     assert "provisioning_status: item.provisioning_status ?? null" in source
     assert '[functions.access-applications]' in CONFIG.read_text(encoding="utf-8")
     assert "verify_jwt = false" in CONFIG.read_text(encoding="utf-8")
+
+
+def test_edge_never_decrypts_or_returns_explicitly_purged_contacts():
+    source = EDGE.read_text(encoding="utf-8")
+    list_start = source.index("async function listApplications")
+    decision_start = source.index("async function decideApplication", list_start)
+    body = source[list_start:decision_start]
+    guard = body.index("if (item.contact_purged === true)")
+    decrypt = body.index("const normalized = await decryptEmail")
+
+    assert guard < decrypt
+    assert "contact_purged:" not in body
+    assert "next_cursor: purgedRowSeen ? null : data.next_cursor ?? null" in body
 
 
 def test_access_provisioning_wire_has_explicit_bounded_outcomes():

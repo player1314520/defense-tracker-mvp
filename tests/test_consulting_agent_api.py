@@ -396,9 +396,15 @@ def test_consult_source_pack_exports_docx(monkeypatch, tmp_path):
         assert any(name.endswith(".pdf") for name in names)
         assert "manifest.json" in names
         assert any(name.startswith("sources/") and name.endswith(".txt") for name in names)
-        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        manifest_text = zf.read("manifest.json").decode("utf-8")
+        manifest = json.loads(manifest_text)
         assert manifest["session_id"] == session["session_id"]
         assert manifest["assets"][0]["status"] == "archived"
+        assert "source_archive_path" not in manifest
+        assert "local_path" not in manifest["assets"][0]
+        assert "text_path" not in manifest["assets"][0]
+        assert manifest["assets"][0]["archive_members"]["text"] in names
+        assert str(tmp_path) not in manifest_text
         assert "failures.json" in names
         assert "needs_user_input.json" in names
         docx_name = next(name for name in names if name.endswith(".docx"))

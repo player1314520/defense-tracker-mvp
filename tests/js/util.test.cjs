@@ -9,7 +9,7 @@ const path = require('node:path');
 
 const util = require(path.join(__dirname, '..', '..', 'static', 'js', 'util.js'));
 const {
-  fmtDate, escHtml, escJsArg, escAttrJs, safeUrl,
+  fmtDate, escHtml, escJsArg, escAttrJs, safeUrl, safeExternalUrl,
   getCookie, apiFetch, ensureFileExt, filenameFromContentDisposition,
 } = util;
 
@@ -72,6 +72,17 @@ test('safeUrl 拦截 javascript:/data:/vbscript: 等', () => {
   assert.strictEqual(safeUrl('vbscript:msgbox(1)'), '#');
   assert.strictEqual(safeUrl(null), '#');
   assert.strictEqual(safeUrl(''), '#');
+});
+
+test('safeExternalUrl 仅放行绝对 HTTP(S) 原文链接', () => {
+  assert.strictEqual(safeExternalUrl('https://example.com/a'), 'https://example.com/a');
+  assert.strictEqual(safeExternalUrl('http://example.com/a?q=1'), 'http://example.com/a?q=1');
+  assert.strictEqual(safeExternalUrl('javascript:alert(1)'), '#');
+  assert.strictEqual(safeExternalUrl('data:text/html,x'), '#');
+  assert.strictEqual(safeExternalUrl('mailto:user@example.com'), '#');
+  assert.strictEqual(safeExternalUrl('https://user:password@example.com/a'), '#');
+  assert.strictEqual(safeExternalUrl('/relative'), '#');
+  assert.strictEqual(safeExternalUrl(''), '#');
 });
 
 // ── ensureFileExt ─────────────────────────────────────────

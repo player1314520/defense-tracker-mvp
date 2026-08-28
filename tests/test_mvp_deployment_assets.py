@@ -1,6 +1,7 @@
 """Static release gates for the isolated MVP deployment surface."""
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 import json
 import os
@@ -8,6 +9,7 @@ import re
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 
@@ -56,7 +58,13 @@ def test_production_compose_exposes_only_portal_and_edge_with_hardening():
     assert portal["environment"]["V9_MAX_CONCURRENT_REQUESTS"] == "20"
     assert portal["environment"]["V9_LEGACY_COORDINATOR_ENABLED"] == "false"
     assert portal["environment"]["V9_PRODUCTION_MODE"] == "true"
-    assert portal["environment"]["V9_ACCESS_APPLICATIONS_ENABLED"] == "true"
+    assert "ACCESS_APPLICATIONS_ENABLED" in portal["environment"][
+        "V9_ACCESS_APPLICATIONS_ENABLED"
+    ]
+    assert portal["environment"]["V9_MAX_EVENTS_PER_USER_PER_DAY"] == "1000"
+    assert "MVP_EXPECTED_RELEASE_SHA" in portal["environment"][
+        "DEFENSE_TRACKER_BUILD_COMMIT"
+    ]
     assert portal["secrets"] == ["supabase_publishable_key"]
     assert portal["healthcheck"]["test"]
 
@@ -81,6 +89,7 @@ def test_reverse_proxy_uses_two_exact_domains_and_loopback_upstreams():
     assert "{$SUPABASE_UPSTREAM}" in caddy
     assert "*." not in caddy
     assert "@public_api" in caddy
+    assert "@realtime_api" in caddy
     assert " path \\\n" not in caddy
     for path in ("/auth/v1/*", "/rest/v1/*", "/storage/v1/*"):
         assert path in caddy
@@ -93,7 +102,7 @@ def test_reverse_proxy_uses_two_exact_domains_and_loopback_upstreams():
         assert path in caddy
     assert "/functions/v1/*" not in caddy
     assert "@portal_public" in caddy
-    for path in ("/health", "/ready", "/portal/*"):
+    for path in ("/health", "/ready", "/api/status", "/portal/*"):
         assert path in caddy
     assert "max_size 256KB" in caddy
     assert "max_size 32MB" in caddy
@@ -105,16 +114,18 @@ def test_reverse_proxy_uses_two_exact_domains_and_loopback_upstreams():
     assert "header_up -X-Forwarded-For" in caddy
     assert "header_up -CF-Connecting-IP" in caddy
     assert "header_up -X-V9-Client-IP" in caddy
-    assert "header_up X-V9-Client-IP {remote_host}" in caddy
-    assert "header_up X-Forwarded-For {remote_host}" in caddy
+    assert "trusted_proxies static {$WAF_TRUSTED_PROXY_CIDRS}" in caddy
+    assert "trusted_proxies_strict" in caddy
+    assert "header_up X-V9-Client-IP {client_ip}" in caddy
+    assert "header_up X-Forwarded-For {client_ip}" in caddy
     api_proxy = caddy.split("https://{$API_DOMAIN}", 1)[1]
     source_header_steps = (
         "header_up -X-Real-IP",
         "header_up -X-Forwarded-For",
         "header_up -CF-Connecting-IP",
         "header_up -X-V9-Client-IP",
-        "header_up X-V9-Client-IP {remote_host}",
-        "header_up X-Forwarded-For {remote_host}",
+        "header_up X-V9-Client-IP {client_ip}",
+        "header_up X-Forwarded-For {client_ip}",
     )
     assert [api_proxy.index(step) for step in source_header_steps] == sorted(
         api_proxy.index(step) for step in source_header_steps
@@ -134,6 +145,7 @@ def test_reverse_proxy_uses_two_exact_domains_and_loopback_upstreams():
     assert "V9_AUTH_HOOK_ENABLED" in override
     assert "ACCESS_APPLICATION_HMAC_KEY" in override
     assert "ACCESS_APPLICATION_ENCRYPTION_KEY" in override
+    assert "V9_ACCESS_APPLICATIONS_ENABLED" in override
     assert "SUPABASE_FUNCTIONS_DEPLOY_DIR" in override
     assert "FILE_SIZE_LIMIT: \"16777232\"" in override
     assert "kong:" in override
@@ -151,6 +163,7 @@ def test_portal_image_is_minimal_nonroot_and_generated_from_git_allowlist():
     assert 'io.defensetracker.mvp.backend-migration-policy="${BACKEND_MIGRATION_POLICY}"' in dockerfile
     assert "USER 10001:10001" in dockerfile
     assert "v9_cloud.py /app/v9_cloud.py" in dockerfile
+    assert "feishu_webhook_security.py /app/feishu_webhook_security.py" in dockerfile
     assert "v9 /app/v9" in dockerfile
     assert "web/v9-portal /app/web/v9-portal" in dockerfile
     for forbidden in ("app.py", "templates", "static", "素材库", "tests", ".env"):
@@ -158,6 +171,7 @@ def test_portal_image_is_minimal_nonroot_and_generated_from_git_allowlist():
 
     context_builder = read(ROOT / "scripts" / "prepare_mvp_portal_context.py")
     assert '"v9_cloud.py"' in context_builder
+    assert '"feishu_webhook_security.py"' in context_builder
     assert '"web/v9-portal/"' in context_builder
     assert '"deploy/requirements.cloud.txt"' in context_builder
     assert '"素材库"' in context_builder  # explicit denylist
@@ -168,7 +182,28 @@ def test_portal_image_is_minimal_nonroot_and_generated_from_git_allowlist():
 
     entrypoint = read(MVP / "portal-entrypoint.sh")
     assert "V9_PRODUCTION_MODE must be true" in entrypoint
-    assert "V9_ACCESS_APPLICATIONS_ENABLED must be true" in entrypoint
+    assert "V9_ACCESS_APPLICATIONS_ENABLED must be true or false" in entrypoint
+    assert "V9_MAX_EVENTS_PER_USER_PER_DAY must be 1000" in entrypoint
+    assert "DEFENSE_TRACKER_BUILD_COMMIT must be a full lowercase Git SHA" in entrypoint
+
+
+def test_retention_job_uses_only_service_role_rpc_and_aggregate_output():
+    purge = read(MVP / "bin" / "purge-access-applications.sh")
+    service = read(MVP / "systemd" / "defense-tracker-retention.service")
+    timer = read(MVP / "systemd" / "defense-tracker-retention.timer")
+
+    assert "SUPABASE_SECRET_KEY" in purge
+    assert "/rest/v1/rpc/purge_expired_access_application_data" in purge
+    assert "Authorization: Bearer $secret_key" in purge
+    assert '--header "@$header_file"' in purge
+    assert '--header "Authorization: Bearer $secret_key"' not in purge
+    assert "unset secret_key\nstatus=$(curl" in purge
+    assert "set -x" not in purge
+    assert "print(matches[0], end=\"\")" in purge
+    assert "[RETENTION]" in purge
+    assert "NoNewPrivileges=true" in service
+    assert "ProtectSystem=strict" in service
+    assert "03:05:00 Asia/Shanghai" in timer
 
 
 def test_backup_and_restore_are_encrypted_offsite_and_isolated():
@@ -309,6 +344,7 @@ def test_supabase_install_is_hash_tracked_and_deploys_migrations_and_functions()
         "public.put_user_ai_credential(jsonb)",
         "public.put_mvp_first_owner_key_envelope(integer,text,text,text)",
         "public.submit_access_application(text,text,text,integer,text,text,text)",
+        "public.purge_expired_access_application_data()",
         "public.hook_v9_before_user_created(jsonb)",
     ):
         assert signature in verifier
@@ -321,6 +357,8 @@ def test_supabase_install_is_hash_tracked_and_deploys_migrations_and_functions()
     assert "aclexplode" in verifier
     assert "a.grantee = 0" in verifier
     assert "device registration RPC grants are not authenticated-only" in verifier
+    assert "database capacity or daily-event quota contract is missing" in verifier
+    assert "access retention RPC grants are not service-role-only" in verifier
     assert "register_device_acl" in verifier
     assert "mvp_backend_releases" in verifier
     assert "backend.sha" in verifier
@@ -456,6 +494,7 @@ def test_public_probe_covers_runtime_without_printing_credentials():
     for endpoint in (
         "/ready",
         "/portal/config.json",
+        "/api/status",
         "/auth/v1/health",
         "/storage/v1/status",
         "/functions/v1/access-applications",
@@ -465,8 +504,71 @@ def test_public_probe_covers_runtime_without_printing_credentials():
     assert "Sec-WebSocket-Key" in probe
     assert "101" in probe
     assert "hmac.compare_digest" in probe
+    assert "verify_release_metadata" in probe
+    assert "load_product_version_metadata" in probe
+    assert 'source_root / "version.json"' in probe
+    assert 'Path("/app/version.json")' in probe
+    assert '"wire_compatibility": "mvp-wire-v1"' in probe
     assert "authentication-required business flows are not part of this probe" in probe
     assert "print(key" not in probe
+
+
+def test_external_origin_probe_is_redaction_safe_and_fail_closed():
+    probe = read(MVP / "bin" / "probe-origin-isolation.py")
+    for protected_name in (
+        "DEFENSE_TRACKER_STAGING_ORIGIN_TARGET",
+        "DEFENSE_TRACKER_PRODUCTION_ORIGIN_TARGET",
+        "DEFENSE_TRACKER_ORIGIN_EVIDENCE_HMAC_KEY",
+    ):
+        assert protected_name in probe
+    for gate in (
+        "public_edge_https_reachable",
+        "origin_tcp_80_blocked",
+        "origin_tcp_443_blocked",
+        "origin_sni_443_blocked",
+    ):
+        assert gate in probe
+    assert "hmac.new" in probe
+    assert "target_hmac_sha256" in probe
+    assert "address.is_global" in probe
+    assert "public_addresses & target_addresses" in probe
+    assert '"/health"' in probe
+    assert "print(target" not in probe
+    assert "json.dumps(evidence" in probe
+    assert '"status": "pass" if passed else "fail"' in probe
+
+
+def test_public_probe_reads_release_values_from_version_json(tmp_path):
+    script = MVP / "bin" / "probe-public.py"
+    spec = importlib.util.spec_from_file_location("defense_probe_public", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    version_path = tmp_path / "version.json"
+    version_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "semantic_version": "10.2.3",
+                "display_version": "V10",
+                "release_tag": "v10.2.3",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    version = module.load_product_version_metadata(version_path)
+    payload = {
+        "version": "10.2.3",
+        "display_version": "V10",
+        "release_tag": "v10.2.3",
+        "build_commit": "a" * 40,
+        "wire_compatibility": "mvp-wire-v1",
+    }
+
+    module.verify_release_metadata(payload, "a" * 40, version)
+    with pytest.raises(module.ProbeFailure):
+        module.verify_release_metadata(payload | {"version": "9.0.0"}, "a" * 40, version)
 
 
 def test_first_owner_bootstrap_is_out_of_band_empty_database_and_idempotent():
@@ -500,10 +602,26 @@ def test_supabase_required_env_has_current_auth_url_and_function_secrets():
     assert "ACCESS_APPLICATION_HMAC_KEY=" in required
     assert "ACCESS_APPLICATION_ENCRYPTION_KEY=" in required
     assert "ACCESS_APPLICATION_ENCRYPTION_KEY_VERSION=1" in required
+    for port in range(49231, 49236):
+        assert (
+            f"http://127.0.0.1:{port}/api/v9/auth/callback" in required
+        )
+    assert "DISABLE_SIGNUP=true" in required
     production = read(MVP / "production.env.example")
     assert "SUPABASE_FUNCTIONS_DEPLOY_DIR=" in production
     assert "PORTAL_IMAGE=registry.example.invalid/defense-tracker/portal@sha256:" in production
     assert "V9_AUTH_HOOK_ENABLED=false" in production
+    assert "ACCESS_APPLICATIONS_ENABLED=false" in production
+    assert "MVP_EXTERNAL_WAF_ENABLED=true" in production
+    assert "MVP_WAF_REALTIME_WEBSOCKET_ALLOWED=true" in production
+    assert "WAF_TRUSTED_PROXY_CIDRS=" in production
+    preflight = read(MVP / "bin" / "preflight.sh")
+    assert "defense-tracker-backup.timer" in preflight
+    assert "defense-tracker-retention.timer" in preflight
+    assert "systemctl is-enabled --quiet" in preflight
+    assert "systemctl is-active --quiet" in preflight
+    assert "WAF flags and CIDRs are configuration only" in preflight
+    assert "external v9 deployment evidence origin-isolation gates" in preflight
 
 
 def test_desktop_release_gate_requires_inno_sha256_timestamp_and_dual_verification():
@@ -513,12 +631,16 @@ def test_desktop_release_gate_requires_inno_sha256_timestamp_and_dual_verificati
     assert "Assert-CleanReleaseCommit" in gate
     assert "signtool.exe" in gate
     assert "ISCC.exe" in gate
-    assert "/fd SHA256 /tr $Timestamp /td SHA256" in gate
+    assert '"/fd", "SHA256", "/tr", $Timestamp, "/td", "SHA256"' in gate
+    assert "AzureArtifactSigning" in gate
+    assert "DigiCertKeyLocker" in gate
+    assert "X509NameType]::SimpleName" in gate
+    assert "SigningCertificateThumbprint" not in gate
     assert "Get-AuthenticodeSignature" in gate
     assert "TimeStamperCertificate" in gate
     assert "pip install" not in gate
-    assert "DefenseTracker.previous" in gate
-    assert "Remove-Item -LiteralPath $rollbackRoot" in gate  # enumerated rotation
+    assert 'Join-Path $distRoot "archive"' in gate
+    assert "previous-active-release.json" in gate
     assert "recursesubdirs" in installer
     assert "PrivilegesRequired=lowest" in installer
 

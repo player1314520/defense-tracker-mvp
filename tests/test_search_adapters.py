@@ -1,3 +1,6 @@
+import json
+import logging
+
 import pytest
 
 import search_adapters
@@ -144,6 +147,64 @@ def test_multi_provider_search_records_provider_errors_without_aborting(monkeypa
     assert len(rows) == 1
     assert "tavily" in meta["provider_errors"]
     assert meta["provider_stats"]["brave"]["returned"] == 1
+
+
+def test_serpapi_query_key_never_crosses_provider_error_boundary(monkeypatch):
+    secret = "serp-secret-must-not-leak"
+
+    class ForbiddenResponse:
+        status_code = 403
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(search_adapters.requests, "get", lambda *args, **kwargs: ForbiddenResponse())
+
+    rows, meta = search_adapters.search_web_multi(
+        ["defense report"],
+        target_count=1,
+        providers=["serpapi"],
+        config={"serpapi_api_key": secret},
+        include_pdf=False,
+        include_doctrine=False,
+        max_provider_queries=1,
+    )
+
+    assert rows == []
+    assert meta["provider_errors"] == {"serpapi": "UPSTREAM_AUTH"}
+    assert secret not in json.dumps(meta, ensure_ascii=False)
+
+
+def test_arbitrary_provider_exception_text_is_replaced_with_stable_code(monkeypatch):
+    secret = "credential-in-raw-exception"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"request failed: https://upstream.test/?api_key={secret}")
+
+    monkeypatch.setattr(search_adapters, "_search_serpapi", fail)
+    _, meta = search_adapters.search_web_multi(
+        ["defense report"],
+        target_count=1,
+        providers=["serpapi"],
+        config={"serpapi_api_key": secret},
+        include_pdf=False,
+        include_doctrine=False,
+        max_provider_queries=1,
+    )
+
+    assert meta["provider_errors"] == {"serpapi": "PROVIDER_FAILURE"}
+    assert secret not in json.dumps(meta, ensure_ascii=False)
+
+
+def test_urllib3_diagnostic_record_redacts_query_api_key(caplog):
+    secret = "serp-log-redaction-value"
+    logger = logging.getLogger("urllib3.connectionpool")
+
+    with caplog.at_level(logging.DEBUG, logger="urllib3.connectionpool"):
+        logger.debug("GET /search.json?q=test&api_key=%s HTTP/1.1", secret)
+
+    assert secret not in caplog.text
+    assert "api_key=[REDACTED]" in caplog.text
 
 
 def test_relevance_filter_uses_chinese_region_and_capability_terms(monkeypatch):

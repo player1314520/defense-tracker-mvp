@@ -109,13 +109,29 @@
     <div class="error">{{ error }}</div>
     {% endif %}
 
-    <form method="POST" action="/login" autocomplete="off">
+    <form id="loginForm" method="POST" action="/login" autocomplete="off">
       <label for="token">访问令牌</label>
       <input type="password" id="token" name="token" placeholder="粘贴访问令牌..." autofocus>
+      <input type="hidden" id="desktopBootstrap" name="desktop_bootstrap" value="">
       <button type="submit">进入系统</button>
     </form>
 
-    <p class="hint">令牌由管理员生成，每次服务重启后更新<br>查看控制台输出获取当前令牌</p>
+    <p class="hint">令牌由管理员或本机安全配置提供<br>桌面版会使用一次性能力自动建立会话</p>
   </div>
+  {% if desktop_bootstrap_enabled %}
+  <script nonce="{{ g.csp_nonce }}">
+    (() => {
+      const match = window.location.hash.match(/^#desktop=([A-Za-z0-9_-]{32,128})$/);
+      if (!match) return;
+      history.replaceState(null, '', '/login');
+      const bootstrap = document.getElementById('desktopBootstrap');
+      const token = document.getElementById('token');
+      const form = document.getElementById('loginForm');
+      bootstrap.value = match[1];
+      token.value = '';
+      form.requestSubmit();
+    })();
+  </script>
+  {% endif %}
 </body>
 </html>

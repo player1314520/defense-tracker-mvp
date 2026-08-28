@@ -1,0 +1,149 @@
+name: V9 deployment verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact protected main commit deployed
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful V9 signed candidate run ID
+        required: true
+        type: string
+      portal_image_digest:
+        description: Exact production OCI sha256 digest
+        required: true
+        type: string
+      staging_origin:
+        description: Exact public staging HTTPS origin without a trailing slash
+        required: true
+        type: string
+      production_origin:
+        description: Exact public production HTTPS origin without a trailing slash
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify-origin-isolation:
+    name: Verify origin isolation from an external runner
+    if: github.ref == 'refs/heads/main'
+    environment: v9-production-evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      STAGING_ORIGIN: ${{ inputs.staging_origin }}
+      PRODUCTION_ORIGIN: ${{ inputs.production_origin }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Reject direct origin access without disclosing protected targets
+        env:
+          DEFENSE_TRACKER_STAGING_ORIGIN_TARGET: ${{ secrets.DEFENSE_TRACKER_STAGING_ORIGIN_TARGET }}
+          DEFENSE_TRACKER_PRODUCTION_ORIGIN_TARGET: ${{ secrets.DEFENSE_TRACKER_PRODUCTION_ORIGIN_TARGET }}
+          DEFENSE_TRACKER_ORIGIN_EVIDENCE_HMAC_KEY: ${{ secrets.DEFENSE_TRACKER_ORIGIN_EVIDENCE_HMAC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          remote_main="$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')"
+          [[ "${remote_main}" =~ ^[0-9a-f]{40}$ ]]
+          test "${remote_main}" = "${RELEASE_SHA}"
+          test -n "${DEFENSE_TRACKER_STAGING_ORIGIN_TARGET}"
+          test -n "${DEFENSE_TRACKER_PRODUCTION_ORIGIN_TARGET}"
+          test -n "${DEFENSE_TRACKER_ORIGIN_EVIDENCE_HMAC_KEY}"
+          umask 077
+          install -d -m 0700 build/v9-origin-isolation
+          python3 deploy/mvp/bin/probe-origin-isolation.py \
+            --staging-origin "${STAGING_ORIGIN}" \
+            --production-origin "${PRODUCTION_ORIGIN}" \
+            --output build/v9-origin-isolation/origin-isolation.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: v9-origin-isolation-${{ github.run_id }}-${{ inputs.release_sha }}
+          path: build/v9-origin-isolation/origin-isolation.json
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: false
+
+  verify-live-evidence:
+    name: Verify machine-readable staging and production evidence
+    needs: verify-origin-isolation
+    environment: v9-production-evidence
+    runs-on: [self-hosted, Linux, X64, defense-deploy-auditor]
+    timeout-minutes: 15
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      PORTAL_IMAGE_DIGEST: ${{ inputs.portal_image_digest }}
+      STAGING_ORIGIN: ${{ inputs.staging_origin }}
+      PRODUCTION_ORIGIN: ${{ inputs.production_origin }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: v9-origin-isolation-${{ github.run_id }}-${{ inputs.release_sha }}
+          path: build/v9-origin-isolation
+      - name: Verify externally collected evidence fail-closed
+        env:
+          EVIDENCE_ROOT: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_EVIDENCE_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${EVIDENCE_ROOT}"
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${PORTAL_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "${CANDIDATE_RUN_ID}" =~ ^[1-9][0-9]{0,19}$ ]]
+          origin_pattern='^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(:443)?$'
+          [[ "${STAGING_ORIGIN}" =~ ${origin_pattern} ]]
+          [[ "${PRODUCTION_ORIGIN}" =~ ${origin_pattern} ]]
+          test "${STAGING_ORIGIN}" != "${PRODUCTION_ORIGIN}"
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          root="${EVIDENCE_ROOT}/${RELEASE_SHA}"
+          test -d "${root}"
+          destination='build/v9-deployment-evidence'
+          test ! -e "${destination}"
+          install -d -m 0700 "${destination}"
+          for evidence_name in \
+            deployment-evidence.json \
+            staging-probe.json \
+            production-probe.json \
+            staging-observations.jsonl \
+            production-observations.jsonl \
+            backup-restore.json
+          do
+            test -f "${root}/${evidence_name}"
+            test ! -L "${root}/${evidence_name}"
+            install -m 0600 "${root}/${evidence_name}" "${destination}/${evidence_name}"
+          done
+          isolation='build/v9-origin-isolation/origin-isolation.json'
+          test -f "${isolation}"
+          test ! -L "${isolation}"
+          install -m 0600 "${isolation}" "${destination}/origin-isolation.json"
+          python3 scripts/verify_deployment_evidence.py "${destination}" \
+            --seal-origin-isolation \
+            --expected-commit "${RELEASE_SHA}" \
+            --expected-image-digest "${PORTAL_IMAGE_DIGEST}" \
+            --expected-candidate-run-id "${CANDIDATE_RUN_ID}" \
+            --expected-staging-origin "${STAGING_ORIGIN}" \
+            --expected-production-origin "${PRODUCTION_ORIGIN}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: v9-deployment-evidence-${{ inputs.release_sha }}
+          path: build/v9-deployment-evidence/*
+          if-no-files-found: error
+          retention-days: 5
+          include-hidden-files: false

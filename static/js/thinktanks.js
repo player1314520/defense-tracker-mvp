@@ -29,7 +29,7 @@ function renderThinktanks(cats) {
       <div class="tt-sites-grid">
         ${cat.sites.map((site, i) => `
           <a class="tt-site-card ${cat.id==='china_zone'?'china-card':''} ${cat.id==='us_eu_china_analysis'?'elite-card':''}"
-             href="${escHtml(site.url)}" target="_blank" rel="noopener"
+             href="${escHtml(safeExternalUrl(site.url))}" target="_blank" rel="noopener noreferrer"
              data-search="${[site.name,site.name_cn,site.desc_cn,site.desc_en].join(' ').toLowerCase()}"
              style="animation-delay:${i*0.04}s">
             <div class="tt-site-name">${escHtml(site.name)}</div>
