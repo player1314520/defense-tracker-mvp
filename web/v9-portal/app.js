@@ -17,7 +17,11 @@ import {
   workflowRequest,
   workflowTargets,
 } from "./policy.mjs";
-import { logoutPortalSession } from "./session.mjs";
+import {
+  clearLegacyAuthSessions,
+  createPortalAuthStorage,
+  logoutPortalSession,
+} from "./session.mjs";
 
 const byId = (id) => document.getElementById(id);
 const state = {
@@ -83,10 +87,14 @@ const authStorage = {
   removeItem: (key) => databaseOperation(
     "auth", "readwrite", (store) => store.delete(key),
   ),
+  keys: () => databaseOperation(
+    "auth", "readonly", (store) => store.getAllKeys(),
+  ),
   clear: () => databaseOperation(
     "auth", "readwrite", (store) => store.clear(),
   ),
 };
+const portalAuthStorage = createPortalAuthStorage(authStorage);
 
 function safeStatusMessage(message) {
   return String(message || "")
@@ -1235,10 +1243,10 @@ async function handleCallback() {
     throw new Error("登录回调参数无效，仅接受 PKCE 授权码");
   }
   if (codes.length === 0) return;
-  const result = await state.client.auth.exchangeCodeForSession(codes[0]);
-  if (result?.error) throw result.error;
   url.search = "";
   history.replaceState({}, "", url);
+  const result = await state.client.auth.exchangeCodeForSession(codes[0]);
+  if (result?.error) throw result.error;
 }
 
 async function acceptPendingInvitations() {
@@ -1263,10 +1271,13 @@ async function initialize() {
   );
   if (!config.configured) throw new Error("移动门户尚未配置 Supabase Staging");
   state.accessApplicationsEnabled = config.access_applications_enabled === true;
+  // v9.1 and earlier persisted the full Supabase session.  Keep only the
+  // one-time PKCE verifier required across the emailed callback navigation.
+  await clearLegacyAuthSessions(authStorage);
   state.client = createPortalClient(
     config.url,
     config.publishable_key,
-    authStorage,
+    portalAuthStorage,
   );
   byId("login-submit").disabled = false;
   byId("application-submit").disabled = !state.accessApplicationsEnabled;
@@ -1326,7 +1337,7 @@ byId("logout").addEventListener("click", async (event) => {
       removeWakeChannel: async () => {
         if (wakeChannel) await state.client.removeChannel(wakeChannel);
       },
-      clearAuth: () => authStorage.clear(),
+      clearAuth: () => portalAuthStorage.clear(),
       clearMemory: () => {
         state.session = null;
         state.records = [];

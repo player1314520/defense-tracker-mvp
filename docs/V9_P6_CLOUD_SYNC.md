@@ -22,8 +22,12 @@
   - 只提供总览、告警、审批和任务状态。
   - AES-256-GCM 数据密钥解封和正文解密全部由浏览器 Web Crypto 完成，
     与 Python 桌面信封互操作。
-  - 当前会话令牌请求后立即清空，组织密钥仅保留在当前页面内存；
-    不使用 localStorage/sessionStorage，关闭页面清空。
+  - PKCE 回调参数在兑换前即从地址栏清空；访问令牌和刷新令牌仅写入
+    页面内存，组织密钥也不持久化。Supabase 可能把认证事件短暂广播给
+    同时打开的同源页面，因此同源上下文属于同一信任边界；刷新、关闭后
+    再打开的页面仍需重新登录。`auth` IndexedDB 只允许一次性
+    `*-code-verifier` 跨邮件回调导航，门户启动时会删除旧版可能遗留的
+    其他 Auth 会话项；不使用 localStorage/sessionStorage 持久化认证令牌。
 - 非破坏旧数据迁移
   - 对明确允许的 user state、报告 Agent、抓取 Agent、质量训练业务表，
     先建立经 `PRAGMA integrity_check` 验证的 `.pre-v9.bak`，再逐行加密导入

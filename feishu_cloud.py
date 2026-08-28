@@ -2190,7 +2190,7 @@ def _fetch_one_feed(feed: dict) -> list:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     try:
         headers = {**_BROWSER_HEADERS}
-        r = requests.get(feed["url"], headers=headers, timeout=12, allow_redirects=True)
+        r = _safe_get_once(feed["url"], headers=headers, timeout=12)
         r.raise_for_status()
         parsed = feedparser.parse(r.content)
         for entry in parsed.entries[:15]:

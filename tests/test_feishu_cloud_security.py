@@ -209,6 +209,36 @@ def test_feishu_cloud_rejects_private_connected_peer(monkeypatch):
         cloud._validate_connected_peer(response)
 
 
+def test_feishu_cloud_rss_uses_ssrf_safe_transport(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    response = requests.Response()
+    response.status_code = 200
+    response._content = b"<rss/>"
+    response._content_consumed = True
+    calls = []
+
+    def fake_safe_get(url, *, headers, timeout, max_bytes=cloud.MAX_FETCH_BYTES):
+        calls.append((url, headers, timeout, max_bytes))
+        return response
+
+    monkeypatch.setattr(cloud, "_safe_get_once", fake_safe_get)
+    monkeypatch.setattr(
+        cloud.requests,
+        "get",
+        lambda *args, **kwargs: pytest.fail("RSS must not bypass the SSRF-safe transport"),
+    )
+    monkeypatch.setattr(cloud.feedparser, "parse", lambda _content: type("Feed", (), {"entries": []})())
+
+    feed = {
+        "url": "https://example.test/feed.xml",
+        "name": "Example",
+        "name_cn": "示例",
+        "focus": "test",
+    }
+    assert cloud._fetch_one_feed(feed) == []
+    assert calls == [(feed["url"], cloud._BROWSER_HEADERS, 12, cloud.MAX_FETCH_BYTES)]
+
+
 def test_legacy_history_endpoint_does_not_expose_items(monkeypatch):
     cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
     cloud._history[:] = [{"brief_preview": "sensitive"}]

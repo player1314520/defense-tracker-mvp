@@ -3,9 +3,10 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 
-const [html, source] = await Promise.all([
+const [html, source, authSource] = await Promise.all([
   readFile(new URL("../../web/v9-portal/index.html", import.meta.url), "utf8"),
   readFile(new URL("../../web/v9-portal/app.js", import.meta.url), "utf8"),
+  readFile(new URL("../../web/v9-auth/src/portal.js", import.meta.url), "utf8"),
 ]);
 
 
@@ -43,6 +44,34 @@ test("工作流、申请和设备动作共用防双击 busy 门禁", () => {
   assert.match(source, /listAccessApplications/);
   assert.match(source, /decideAccessApplication/);
   assert.match(source, /runBusyAction\("logout"/);
+});
+
+
+test("Portal 会话不写持久存储且启动时清理旧版令牌", () => {
+  assert.match(authSource, /persistSession:\s*true/);
+  assert.match(authSource, /\bstorage\s*,/);
+  const initialize = source.slice(
+    source.indexOf("async function initialize()"),
+    source.indexOf('byId("login-form")'),
+  );
+  assert.match(initialize, /await clearLegacyAuthSessions\(authStorage\)/);
+  assert.match(initialize, /createPortalClient\([\s\S]*portalAuthStorage/);
+  assert.ok(
+    initialize.indexOf("await clearLegacyAuthSessions(authStorage)")
+      < initialize.indexOf("createPortalClient("),
+  );
+});
+
+
+test("PKCE 回调在兑换前清除地址栏 code，失败也不残留历史", () => {
+  const callback = source.slice(
+    source.indexOf("async function handleCallback()"),
+    source.indexOf("async function acceptPendingInvitations()"),
+  );
+  assert.ok(
+    callback.indexOf("history.replaceState")
+      < callback.indexOf("exchangeCodeForSession"),
+  );
 });
 
 

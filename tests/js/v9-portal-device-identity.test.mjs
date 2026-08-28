@@ -128,6 +128,8 @@ async function loadPortal(organizationId) {
     safeApplicationSummary: (value) => value,
     workflowRequest: () => ({}),
     workflowTargets: () => [],
+    createPortalAuthStorage: (storage) => storage,
+    clearLegacyAuthSessions: async () => {},
     logoutPortalSession: async () => ({}),
   };
   const createElement = (value = "") => ({
@@ -173,6 +175,8 @@ async function loadPortal(organizationId) {
         safeApplicationSummary,
         workflowRequest,
         workflowTargets,
+        createPortalAuthStorage,
+        clearLegacyAuthSessions,
         logoutPortalSession,
       } = globalThis.__portalTestDeps;\n`,
   );
