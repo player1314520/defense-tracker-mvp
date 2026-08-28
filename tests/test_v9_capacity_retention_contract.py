@@ -21,6 +21,9 @@ PUSH = (
     / "migrations"
     / "202607300020_v9_push_runtime_fix.sql"
 )
+CAPACITY_TEST = (
+    ROOT / "supabase" / "tests" / "v9_capacity_quota_test.sql"
+)
 
 
 def compact(path: Path) -> str:
@@ -64,6 +67,15 @@ def test_duplicate_push_returns_before_quota_triggered_insert():
 
     assert duplicate < event_insert
     assert "perform pg_advisory_xact_lock" in push[:duplicate]
+
+
+def test_capacity_fixture_supplies_required_request_hashes():
+    sql = compact(CAPACITY_TEST)
+
+    assert sql.count("operation,applied,request_hash") == 3
+    assert sql.count("extensions.digest(") == 3
+    assert "'50000000-0000-0000-0000-000000001001','sha256'" in sql
+    assert "'50000000-0000-0000-0000-000000000001','sha256'" in sql
 
 
 def test_access_retention_is_bounded_and_service_role_only():

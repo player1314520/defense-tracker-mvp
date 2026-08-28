@@ -144,8 +144,11 @@ insert into public.record_versions(
 set local request.jwt.claim.sub =
     '00000000-0000-0000-0001-000000000001';
 
+-- Direct quota fixtures use a deterministic event-ID hash. Production RPCs
+-- hash the complete canonical request payload instead.
 insert into public.sync_events(
-    event_id,organization_id,device_id,record_id,version_id,operation,applied
+    event_id,organization_id,device_id,record_id,version_id,
+    operation,applied,request_hash
 )
 select
     format(
@@ -156,7 +159,17 @@ select
     '20000000-0000-0000-0000-000000000001'::uuid,
     '30000000-0000-0000-0000-000000000001'::uuid,
     '40000000-0000-0000-0000-000000000001'::uuid,
-    'upsert',true
+    'upsert',true,
+    encode(
+        extensions.digest(
+            format(
+                '50000000-0000-0000-0000-%s',
+                lpad(i::text,12,'0')
+            ),
+            'sha256'
+        ),
+        'hex'
+    )
 from generate_series(1,1000) as series(i);
 
 select is(
@@ -174,14 +187,20 @@ select throws_ok(
     $$
         insert into public.sync_events(
             event_id,organization_id,device_id,record_id,version_id,
-            operation,applied
+            operation,applied,request_hash
         ) values (
             '50000000-0000-0000-0000-000000001001'::uuid,
             '10000000-0000-0000-0000-000000000001'::uuid,
             '20000000-0000-0000-0000-000000000001'::uuid,
             '30000000-0000-0000-0000-000000000001'::uuid,
             '40000000-0000-0000-0000-000000000001'::uuid,
-            'upsert',true
+            'upsert',true,
+            encode(
+                extensions.digest(
+                    '50000000-0000-0000-0000-000000001001','sha256'
+                ),
+                'hex'
+            )
         )
     $$,
     'P0001',
@@ -193,14 +212,20 @@ select lives_ok(
     $$
         insert into public.sync_events(
             event_id,organization_id,device_id,record_id,version_id,
-            operation,applied
+            operation,applied,request_hash
         ) values (
             '50000000-0000-0000-0000-000000000001'::uuid,
             '10000000-0000-0000-0000-000000000001'::uuid,
             '20000000-0000-0000-0000-000000000001'::uuid,
             '30000000-0000-0000-0000-000000000001'::uuid,
             '40000000-0000-0000-0000-000000000001'::uuid,
-            'upsert',true
+            'upsert',true,
+            encode(
+                extensions.digest(
+                    '50000000-0000-0000-0000-000000000001','sha256'
+                ),
+                'hex'
+            )
         ) on conflict (event_id) do nothing
     $$,
     'a duplicate event ID remains idempotent at the hard limit'
