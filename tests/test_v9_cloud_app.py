@@ -529,8 +529,8 @@ def test_cloud_deployment_allowlist_excludes_full_text_runtime():
     procfile = (root / "Procfile").read_text(encoding="utf-8")
 
     assert {"cryptography", "flask", "gunicorn"}.issubset(requirements)
-    assert re.search(r"(?m)^cryptography==50\.0\.0 \\$", requirements_text)
-    assert "cryptography>=50.0.0" in (
+    assert re.search(r"(?m)^cryptography==50\.0\.1 \\$", requirements_text)
+    assert "cryptography>=50.0.1" in (
         root / "deploy/requirements.server.txt"
     ).read_text(encoding="utf-8")
     assert requirements_text.count("--hash=sha256:") >= len(requirements)
