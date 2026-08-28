@@ -899,6 +899,19 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
     assert ".png" not in deployment.lower()
 
 
+def test_ci_pins_actionlint_and_validates_all_workflows():
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+
+    assert 'ACTIONLINT_VERSION: "1.7.12"' in workflow
+    assert (
+        'ACTIONLINT_LINUX_X64_SHA256: '
+        '"8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"'
+        in workflow
+    )
+    assert "sha256sum --check --strict" in workflow
+    assert '"$tool_dir/actionlint" -no-color -shellcheck= -pyflakes=' in workflow
+
+
 def test_compliance_reviewer_registry_is_fail_closed_until_legal_activation():
     registry = json.loads(
         (ROOT / "release" / "compliance-reviewers.json").read_text(encoding="utf-8")
