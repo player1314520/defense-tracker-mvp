@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 umask 077
+TRUSTED_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+readonly TRUSTED_PATH
+PATH=$TRUSTED_PATH
+export PATH
 
 usage() {
     printf '%s\n' "usage: $0 ENCRYPTED_BACKUP AGE_IDENTITY_FILE [CHECKSUM_FILE]" >&2
@@ -16,23 +20,102 @@ checksum_file=${3:-$encrypted_backup.sha256}
     exit 66
 }
 
-config_file=${MVP_PRODUCTION_ENV:-/etc/defense-tracker/production.env}
-[ -f "$config_file" ] || { printf '%s\n' "production configuration is missing" >&2; exit 64; }
-set -a
-# shellcheck disable=SC1090
-. "$config_file"
-set +a
-: "${SUPABASE_STACK_DIR:?SUPABASE_STACK_DIR is required}"
-: "${SUPABASE_UPSTREAM_SHA:?SUPABASE_UPSTREAM_SHA is required}"
-: "${SUPABASE_OVERRIDE_FILE:?SUPABASE_OVERRIDE_FILE is required}"
-: "${BACKUP_STAGING_DIR:?BACKUP_STAGING_DIR is required}"
-
-for command_name in docker age tar sha256sum python3 grep awk git; do
+for command_name in docker age tar sha256sum python3 grep awk git stat readlink dirname; do
     command -v "$command_name" >/dev/null 2>&1 || {
         printf '%s\n' "required preinstalled restore command is missing: $command_name" >&2
         exit 69
     }
 done
+
+assert_root_controlled_path() {
+    target=$1
+    label=$2
+    [ -e "$target" ] || {
+        printf '%s\n' "$label is missing" >&2
+        exit 66
+    }
+    resolved=$(readlink -f -- "$target")
+    [ "$resolved" = "$target" ] || {
+        printf '%s\n' "$label must be an absolute path without symlinks" >&2
+        exit 77
+    }
+    current=$resolved
+    while :; do
+        owner_uid=$(stat -c '%u' -- "$current")
+        permissions=$(stat -c '%a' -- "$current")
+        group_digit=$((permissions / 10 % 10))
+        other_digit=$((permissions % 10))
+        [ "$owner_uid" = 0 ] || {
+            printf '%s\n' "$label path is not root-owned" >&2
+            exit 77
+        }
+        case "$group_digit:$other_digit" in
+            2:*|3:*|6:*|7:*|*:2|*:3|*:6|*:7)
+                printf '%s\n' "$label path is group- or other-writable" >&2
+                exit 77
+                ;;
+        esac
+        [ "$current" = / ] && break
+        current=$(dirname -- "$current")
+    done
+}
+
+collector_release_root=${DEFENSE_TRACKER_RELEASE_ROOT:?DEFENSE_TRACKER_RELEASE_ROOT is required}
+collector_release_sha=${DEFENSE_TRACKER_RELEASE_SHA:?DEFENSE_TRACKER_RELEASE_SHA is required}
+readonly collector_release_root collector_release_sha
+config_file=${MVP_PRODUCTION_ENV:-/etc/defense-tracker/production.env}
+assert_root_controlled_path "$config_file" "production configuration"
+set -a
+# shellcheck disable=SC1090
+. "$config_file"
+set +a
+PATH=$TRUSTED_PATH
+export PATH
+: "${SUPABASE_STACK_DIR:?SUPABASE_STACK_DIR is required}"
+: "${SUPABASE_UPSTREAM_SHA:?SUPABASE_UPSTREAM_SHA is required}"
+: "${SUPABASE_OVERRIDE_FILE:?SUPABASE_OVERRIDE_FILE is required}"
+: "${BACKUP_STAGING_DIR:?BACKUP_STAGING_DIR is required}"
+
+printf '%s' "$collector_release_sha" | grep -Eq '^[0-9a-f]{40}$' || {
+    printf '%s\n' "collector release SHA is invalid" >&2
+    exit 65
+}
+assert_root_controlled_path "$collector_release_root" "collector release checkout"
+release_git_directory=$(git -C "$collector_release_root" rev-parse --absolute-git-dir 2>/dev/null || true)
+[ -n "$release_git_directory" ] || {
+    printf '%s\n' "collector release Git directory is unavailable" >&2
+    exit 65
+}
+assert_root_controlled_path "$release_git_directory" "collector release Git directory"
+release_head=$(git -C "$collector_release_root" rev-parse --verify HEAD 2>/dev/null || true)
+[ "$release_head" = "$collector_release_sha" ] || {
+    printf '%s\n' "collector release checkout differs from the requested release" >&2
+    exit 65
+}
+release_worktree_status=$(git -C "$collector_release_root" status \
+    --porcelain --untracked-files=all --ignore-submodules=none)
+[ -z "$release_worktree_status" ] || {
+    printf '%s\n' "collector release checkout contains modified or untracked files" >&2
+    exit 77
+}
+trusted_override_file="$collector_release_root/deploy/mvp/supabase.production.override.yml"
+configured_override_file=$(readlink -f -- "$SUPABASE_OVERRIDE_FILE")
+[ "$configured_override_file" = "$trusted_override_file" ] || {
+    printf '%s\n' "Supabase override is not the exact release file" >&2
+    exit 77
+}
+git -C "$collector_release_root" ls-files --error-unmatch \
+    deploy/mvp/supabase.production.override.yml >/dev/null 2>&1 || {
+        printf '%s\n' "Supabase override is not tracked by the release commit" >&2
+        exit 77
+    }
+assert_root_controlled_path "$trusted_override_file" "Supabase override file"
+SUPABASE_OVERRIDE_FILE=$trusted_override_file
+
+backup_staging_parent=$(dirname -- "$BACKUP_STAGING_DIR")
+assert_root_controlled_path "$backup_staging_parent" "backup staging parent"
+mkdir -p "$BACKUP_STAGING_DIR"
+assert_root_controlled_path "$BACKUP_STAGING_DIR" "backup staging directory"
 
 expected_hash=$(awk 'NR == 1 {print $1}' "$checksum_file")
 actual_hash=$(sha256sum "$encrypted_backup" | awk '{print $1}')
@@ -41,7 +124,6 @@ actual_hash=$(sha256sum "$encrypted_backup" | awk '{print $1}')
     exit 65
 }
 
-mkdir -p "$BACKUP_STAGING_DIR"
 work_dir=$(mktemp -d "$BACKUP_STAGING_DIR/restore-dry-run-XXXXXX")
 bundle="$work_dir/bundle.tar"
 payload="$work_dir/payload"
@@ -85,9 +167,7 @@ with tarfile.open(archive, "r:*") as handle:
         if member.ischr() or member.isblk() or member.isfifo():
             raise SystemExit("archive contains a device or FIFO")
         if member.issym() or member.islnk():
-            target = pathlib.PurePosixPath(member.linkname)
-            if target.is_absolute() or ".." in target.parts:
-                raise SystemExit("archive contains an unsafe link")
+            raise SystemExit("archive links are not allowed")
 PY
 }
 
@@ -156,6 +236,10 @@ stack_env="$SUPABASE_STACK_DIR/.env"
     printf '%s\n' "official Supabase Compose checkout is incomplete" >&2
     exit 66
 }
+assert_root_controlled_path "$SUPABASE_STACK_DIR" "Supabase checkout"
+assert_root_controlled_path "$stack_compose" "Supabase Compose file"
+assert_root_controlled_path "$stack_env" "Supabase environment file"
+assert_root_controlled_path "$SUPABASE_OVERRIDE_FILE" "Supabase override file"
 metadata_sha_count=$(grep -Ec '^supabase_upstream_sha=[0-9a-f]{40}$' "$payload/metadata.txt" || true)
 [ "$metadata_sha_count" = 1 ] || {
     printf '%s\n' "backup does not identify one pinned Supabase commit" >&2
@@ -168,12 +252,20 @@ actual_supabase_sha=$(git -C "$SUPABASE_STACK_DIR" rev-parse HEAD 2>/dev/null ||
         printf '%s\n' "restore image checkout differs from the backup Supabase commit" >&2
         exit 65
     }
+supabase_worktree_status=$(git -C "$SUPABASE_STACK_DIR" status \
+    --porcelain --untracked-files=all --ignore-submodules=none)
+[ -z "$supabase_worktree_status" ] || {
+    printf '%s\n' "restore image checkout contains modified or untracked files" >&2
+    exit 77
+}
 for init_file in \
     realtime.sql webhooks.sql roles.sql jwt.sql _supabase.sql logs.sql pooler.sql; do
     [ -f "$SUPABASE_STACK_DIR/volumes/db/$init_file" ] || {
         printf '%s\n' "pinned Supabase DB initialization source is incomplete" >&2
         exit 66
     }
+    assert_root_controlled_path "$SUPABASE_STACK_DIR/volumes/db/$init_file" \
+        "Supabase DB initialization source"
 done
 db_image=$(
     cd "$SUPABASE_STACK_DIR"
@@ -186,6 +278,12 @@ docker image inspect "$db_image" >/dev/null 2>&1 || {
     printf '%s\n' "pinned DB image is not present locally; dry-run will not pull implicitly" >&2
     exit 69
 }
+db_image_id=$(docker image inspect --format '{{.Id}}' "$db_image")
+[ "${#db_image_id}" -eq 71 ] && \
+    printf '%s' "$db_image_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+        printf '%s\n' "pinned DB image did not resolve to an immutable image ID" >&2
+        exit 65
+    }
 
 docker volume create "$volume_name" >/dev/null
 volume_created=true
@@ -194,7 +292,7 @@ config_volume_created=true
 docker run --rm --pull never --network none --entrypoint /bin/sh \
     --volume "$config_volume_name:/target" \
     --volume "$payload/db-config.tar:/backup/db-config.tar:ro" \
-    "$db_image" -c 'tar --extract --file /backup/db-config.tar --directory /target'
+    "$db_image_id" -c 'tar --extract --file /backup/db-config.tar --directory /target'
 docker run --detach --pull never --name "$container_name" \
     --network none \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
@@ -211,7 +309,7 @@ docker run --detach --pull never --name "$container_name" \
     --volume "$SUPABASE_STACK_DIR/volumes/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:ro" \
     --env-file "$restore_stack_env" \
     --env POSTGRES_HOST_AUTH_METHOD=trust \
-    "$db_image" >/dev/null
+    "$db_image_id" >/dev/null
 container_started=true
 
 ready=false
@@ -289,3 +387,5 @@ printf '%s\n' "[RESTORE] Encrypted checksum, decryption and all payload hashes p
 printf '%s\n' "[RESTORE] Both databases restored without replaying duplicate roles in a temporary --network none container."
 printf '%s\n' "[RESTORE] Storage/config archives were read-tested against the same maintenance-window payload."
 printf '%s\n' "[RESTORE] Production data and containers were not modified."
+printf '{"schema":1,"measurement_kind":"database_count","records_expected":2,"records_restored":%s}\n' \
+    "$database_count"

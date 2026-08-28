@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import ipaddress
 import json
@@ -14,6 +15,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -23,6 +27,7 @@ DNS_RE = re.compile(
 )
 UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:+/-]{1,128}$")
+COLLECTOR_KEY_ID_RE = re.compile(r"^deployment-collector-[0-9a-f]{16}$")
 
 LEGACY_SCREENSHOTS = {
     "staging-desktop-redacted.png",
@@ -77,6 +82,13 @@ PRODUCTION_CHECKS = {
     "mobile_browser_smoke": 200,
     "monitoring_smoke": 200,
     "application_opened_after_acceptance": 202,
+}
+PROBE_ROUTE_SPECS = {
+    name: {
+        "method": "GET" if name == "release_metadata" else "POST",
+        "path": f"/api/v9/deployment-evidence/{name}",
+    }
+    for name in {*STAGING_CHECKS, *PRODUCTION_CHECKS}
 }
 
 
@@ -207,7 +219,150 @@ def _artifact_record(path: Path) -> dict[str, object]:
     }
 
 
-def seal_origin_isolation(root: Path) -> None:
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _validate_collector_receipt(
+    manifest: dict[str, object],
+    *,
+    expected_key_id: str | None = None,
+    expected_public_key_sha256: str | None = None,
+) -> None:
+    label = "deployment collector receipt"
+    if expected_key_id is None or expected_public_key_sha256 is None:
+        raise ValueError(f"{label} protected key pin is required")
+    receipt = _require_object(manifest.get("collector_receipt"), label)
+    _require_exact_keys(
+        receipt,
+        {
+            "schema",
+            "key_id",
+            "public_key_base64",
+            "public_key_sha256",
+            "release_commit",
+            "candidate_run_id",
+            "portal_image_digest",
+            "staging_origin",
+            "production_origin",
+            "generated_at_utc",
+            "artifacts",
+            "signature_base64",
+        },
+        label,
+    )
+    if receipt["schema"] != 1:
+        raise ValueError(f"{label} schema is unsupported")
+    for field in (
+        "release_commit",
+        "candidate_run_id",
+        "portal_image_digest",
+        "staging_origin",
+        "production_origin",
+        "generated_at_utc",
+    ):
+        if receipt[field] != manifest.get(field):
+            raise ValueError(f"{label} binding differs: {field}")
+    key_id = receipt["key_id"]
+    if not isinstance(key_id, str) or COLLECTOR_KEY_ID_RE.fullmatch(key_id) is None:
+        raise ValueError(f"{label} key ID is malformed")
+    public_key_sha256 = _require_sha256(
+        receipt["public_key_sha256"], f"{label} public key digest"
+    )
+    if expected_key_id is not None and key_id != expected_key_id:
+        raise ValueError(f"{label} key ID differs from the protected environment")
+    if (
+        expected_public_key_sha256 is not None
+        and public_key_sha256 != _require_sha256(
+            expected_public_key_sha256, "expected collector public key digest"
+        )
+    ):
+        raise ValueError(f"{label} public key differs from the protected environment")
+    if not isinstance(receipt["public_key_base64"], str) or not isinstance(
+        receipt["signature_base64"], str
+    ):
+        raise ValueError(f"{label} key or signature is not canonical base64")
+    try:
+        public_key = base64.b64decode(
+            receipt["public_key_base64"], validate=True
+        )
+        signature = base64.b64decode(
+            receipt["signature_base64"], validate=True
+        )
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{label} key or signature is not canonical base64") from exc
+    if (
+        len(public_key) != 32
+        or len(signature) != 64
+        or base64.b64encode(public_key).decode("ascii")
+        != receipt["public_key_base64"]
+        or base64.b64encode(signature).decode("ascii")
+        != receipt["signature_base64"]
+        or hashlib.sha256(public_key).hexdigest() != public_key_sha256
+        or key_id != f"deployment-collector-{public_key_sha256[:16]}"
+    ):
+        raise ValueError(f"{label} key identity is inconsistent")
+    receipt_artifacts = receipt["artifacts"]
+    if not isinstance(receipt_artifacts, list) or len(receipt_artifacts) != len(
+        CORE_PAYLOAD_FILES
+    ):
+        raise ValueError(f"{label} artifact set is incomplete")
+    receipt_records: dict[str, dict[str, object]] = {}
+    for raw in receipt_artifacts:
+        artifact = _require_object(raw, f"{label} artifact")
+        _require_exact_keys(
+            artifact, {"path", "sha256", "size_bytes"}, f"{label} artifact"
+        )
+        name = artifact["path"]
+        if (
+            not isinstance(name, str)
+            or name not in CORE_PAYLOAD_FILES
+            or name in receipt_records
+        ):
+            raise ValueError(f"{label} artifact path is unknown or duplicated")
+        _require_sha256(artifact["sha256"], f"{label} artifact digest")
+        _require_positive_int(
+            artifact["size_bytes"], f"{label} artifact size", 8 * 1024 * 1024
+        )
+        receipt_records[name] = artifact
+    if set(receipt_records) != CORE_PAYLOAD_FILES:
+        raise ValueError(f"{label} artifact set is incomplete")
+    outer_artifacts = manifest.get("artifacts")
+    if not isinstance(outer_artifacts, list):
+        raise ValueError("Deployment evidence artifact manifest is incomplete")
+    outer_records: dict[str, dict[str, object]] = {}
+    for raw in outer_artifacts:
+        artifact = _require_object(raw, "deployment evidence artifact")
+        name = artifact.get("path")
+        if isinstance(name, str) and name in CORE_PAYLOAD_FILES:
+            outer_records[name] = artifact
+    if outer_records != receipt_records:
+        raise ValueError(f"{label} artifacts differ from the outer manifest")
+    unsigned = dict(receipt)
+    unsigned.pop("signature_base64")
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            signature, _canonical_json_bytes(unsigned)
+        )
+    except (InvalidSignature, ValueError) as exc:
+        raise ValueError(f"{label} signature is invalid") from exc
+
+
+def seal_origin_isolation(
+    root: Path,
+    *,
+    expected_collector_key_id: str | None = None,
+    expected_collector_public_key_sha256: str | None = None,
+) -> None:
     """Bind the current-run external gate to a legacy safe evidence manifest.
 
     Legacy local evidence may have listed three screenshots.  They are never
@@ -241,11 +396,17 @@ def seal_origin_isolation(root: Path) -> None:
             "production_origin",
             "generated_at_utc",
             "artifacts",
+            "collector_receipt",
         },
         "deployment evidence manifest",
     )
     if manifest["schema"] != 2:
         raise ValueError("Only schema 2 local evidence can be sealed")
+    _validate_collector_receipt(
+        manifest,
+        expected_key_id=expected_collector_key_id,
+        expected_public_key_sha256=expected_collector_public_key_sha256,
+    )
     artifacts = manifest["artifacts"]
     if not isinstance(artifacts, list):
         raise ValueError("Deployment evidence artifact manifest is incomplete")
@@ -441,21 +602,22 @@ def _validate_probe(
         if not isinstance(name, str) or name not in expected_checks or name in seen:
             raise ValueError(f"{label} has an unknown or duplicate check")
         seen.add(name)
-        if check["method"] not in {"GET", "POST", "PATCH", "DELETE"}:
-            raise ValueError(f"{label} check method is unsupported: {name}")
+        route = PROBE_ROUTE_SPECS[name]
+        if check["method"] != route["method"]:
+            raise ValueError(f"{label} check method differs from the fixed route: {name}")
         url = check["url"]
         if not isinstance(url, str):
             raise ValueError(f"{label} check URL is malformed: {name}")
         parsed_url = urlsplit(url)
         if (
             f"{parsed_url.scheme}://{parsed_url.netloc}" != origin
-            or not parsed_url.path.startswith("/")
+            or parsed_url.path != route["path"]
             or parsed_url.username is not None
             or parsed_url.password is not None
             or parsed_url.query
             or parsed_url.fragment
         ):
-            raise ValueError(f"{label} check escaped its expected origin: {name}")
+            raise ValueError(f"{label} check escaped its fixed route: {name}")
         if check["status_code"] != expected_checks[name]:
             raise ValueError(f"{label} check returned the wrong status: {name}")
         _require_positive_int(check["elapsed_ms"], f"{label} elapsed time", 120_000)
@@ -481,11 +643,12 @@ def _validate_observations(
 ) -> tuple[datetime, datetime]:
     label = f"{environment} observations"
     records = _load_jsonl(path, label)
-    minimum_records = 25 if environment == "staging" else 100
+    minimum_records = 26 if environment == "staging" else 100
     if len(records) < minimum_records:
         raise ValueError(f"{label} has fewer than {minimum_records} samples")
     times: list[datetime] = []
     latencies: list[int] = []
+    data_devices: set[str] = set()
     server_errors = 0
     for index, record in enumerate(records):
         _require_exact_keys(
@@ -503,6 +666,8 @@ def _validate_observations(
                 "elapsed_ms",
                 "disk_free_percent",
                 "backup_age_hours",
+                "data_device_sha256",
+                "backup_receipt_sha256",
                 "response_sha256",
             },
             f"{label} line {index + 1}",
@@ -536,6 +701,12 @@ def _validate_observations(
             raise ValueError(f"{label} free disk is not above 20 percent")
         if isinstance(backup_age, bool) or not isinstance(backup_age, (int, float)) or not 0 <= backup_age < 26:
             raise ValueError(f"{label} backup is not newer than 26 hours")
+        data_devices.add(
+            _require_sha256(record["data_device_sha256"], f"{label} data device")
+        )
+        _require_sha256(
+            record["backup_receipt_sha256"], f"{label} backup receipt"
+        )
         _require_sha256(record["response_sha256"], f"{label} response digest")
     if times[-1] > generated_at:
         raise ValueError(f"{label} contains future samples")
@@ -544,6 +715,8 @@ def _validate_observations(
             raise ValueError("Staging observation interval is shorter than 24 hours")
         if any(later - earlier > timedelta(minutes=90) for earlier, later in zip(times, times[1:])):
             raise ValueError("Staging observation interval contains a gap longer than 90 minutes")
+    if len(data_devices) != 1:
+        raise ValueError(f"{label} Postgres data device changed during collection")
     if server_errors / len(records) >= 0.01:
         raise ValueError(f"{label} 5xx rate is not below 1 percent")
     p95 = sorted(latencies)[math.ceil(len(latencies) * 0.95) - 1]
@@ -645,6 +818,8 @@ def verify(
     expected_candidate_run_id: int | None = None,
     expected_staging_origin: str | None = None,
     expected_production_origin: str | None = None,
+    expected_collector_key_id: str | None = None,
+    expected_collector_public_key_sha256: str | None = None,
 ) -> None:
     root = root.resolve()
     if SHA_RE.fullmatch(expected_commit) is None or DIGEST_RE.fullmatch(expected_image_digest) is None:
@@ -675,11 +850,17 @@ def verify(
             "production_origin",
             "generated_at_utc",
             "artifacts",
+            "collector_receipt",
         },
         "deployment evidence manifest",
     )
     if manifest["schema"] != 3:
         raise ValueError("Deployment evidence schema is unsupported")
+    _validate_collector_receipt(
+        manifest,
+        expected_key_id=expected_collector_key_id,
+        expected_public_key_sha256=expected_collector_public_key_sha256,
+    )
     if manifest["release_commit"] != expected_commit:
         raise ValueError("Deployment evidence commit mismatch")
     if manifest["portal_image_digest"] != expected_image_digest:
@@ -788,14 +969,27 @@ def main() -> int:
     parser.add_argument("--expected-candidate-run-id", type=int)
     parser.add_argument("--expected-staging-origin")
     parser.add_argument("--expected-production-origin")
+    parser.add_argument("--expected-collector-key-id")
+    parser.add_argument("--expected-collector-public-key-sha256")
     parser.add_argument(
         "--seal-origin-isolation",
         action="store_true",
         help="replace legacy screenshot entries with this run's external origin gate",
     )
     args = parser.parse_args()
+    if (
+        not args.expected_collector_key_id
+        or not args.expected_collector_public_key_sha256
+    ):
+        parser.error(
+            "the protected collector key ID and public-key digest are required"
+        )
     if args.seal_origin_isolation:
-        seal_origin_isolation(args.root)
+        seal_origin_isolation(
+            args.root,
+            expected_collector_key_id=args.expected_collector_key_id,
+            expected_collector_public_key_sha256=args.expected_collector_public_key_sha256,
+        )
     verify(
         args.root,
         expected_commit=args.expected_commit,
@@ -803,6 +997,8 @@ def main() -> int:
         expected_candidate_run_id=args.expected_candidate_run_id,
         expected_staging_origin=args.expected_staging_origin,
         expected_production_origin=args.expected_production_origin,
+        expected_collector_key_id=args.expected_collector_key_id,
+        expected_collector_public_key_sha256=args.expected_collector_public_key_sha256,
     )
     print("deployment-evidence: PASS (schema 3, machine-readable only)")
     return 0

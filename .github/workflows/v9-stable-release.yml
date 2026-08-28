@@ -19,6 +19,10 @@ on:
         description: Exact production OCI sha256 digest
         required: true
         type: string
+      portal_image_run_id:
+        description: Successful protected-main Portal image workflow run ID
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,6 +30,7 @@ permissions:
   id-token: write
   attestations: write
   artifact-metadata: write
+  packages: read
 
 concurrency:
   group: v9-stable-release
@@ -45,9 +50,14 @@ jobs:
       CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
       DEPLOYMENT_EVIDENCE_RUN_ID: ${{ inputs.deployment_evidence_run_id }}
       PORTAL_IMAGE_DIGEST: ${{ inputs.portal_image_digest }}
+      PORTAL_IMAGE_RUN_ID: ${{ inputs.portal_image_run_id }}
       DEFENSE_TRACKER_PUBLISHER: ${{ vars.DEFENSE_TRACKER_PUBLISHER }}
       DEFENSE_TRACKER_SIGNTOOL: ${{ vars.DEFENSE_TRACKER_SIGNTOOL }}
       DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE: ${{ vars.DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE }}
+      DEPLOYMENT_COLLECTOR_KEY_ID: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_KEY_ID }}
+      DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 }}
+      DEPLOYMENT_STAGING_ORIGIN: ${{ vars.DEFENSE_TRACKER_STAGING_ORIGIN }}
+      DEPLOYMENT_PRODUCTION_ORIGIN: ${{ vars.DEFENSE_TRACKER_PRODUCTION_ORIGIN }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -66,8 +76,15 @@ jobs:
           }
           if ($env:RELEASE_SHA -notmatch '^[0-9a-f]{40}$') { throw "Invalid release SHA." }
           if ($env:PORTAL_IMAGE_DIGEST -notmatch '^sha256:[0-9a-f]{64}$') { throw "Invalid image digest." }
+          if ($env:PORTAL_IMAGE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid Portal image run ID." }
           if ($env:CANDIDATE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid candidate run ID." }
           if ($env:DEPLOYMENT_EVIDENCE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid evidence run ID." }
+          if ($env:DEPLOYMENT_COLLECTOR_KEY_ID -notmatch '^deployment-collector-[0-9a-f]{16}$') { throw "Invalid deployment collector key ID." }
+          if ($env:DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 -notmatch '^[0-9a-f]{64}$') { throw "Invalid deployment collector public-key digest." }
+          $originPattern = '^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::443)?$'
+          if ($env:DEPLOYMENT_STAGING_ORIGIN -cnotmatch $originPattern) { throw "Invalid protected staging origin." }
+          if ($env:DEPLOYMENT_PRODUCTION_ORIGIN -cnotmatch $originPattern) { throw "Invalid protected production origin." }
+          if ($env:DEPLOYMENT_STAGING_ORIGIN -ceq $env:DEPLOYMENT_PRODUCTION_ORIGIN) { throw "Protected deployment origins must differ." }
           if ($env:GITHUB_REF -cne 'refs/heads/main' -or $env:GITHUB_SHA -cne $env:RELEASE_SHA) {
             throw "Stable workflow must be dispatched from the exact protected main commit."
           }
@@ -89,9 +106,18 @@ jobs:
           $evidence = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:DEPLOYMENT_EVIDENCE_RUN_ID" | ConvertFrom-Json
           if ($evidence.conclusion -ne 'success' -or
               $evidence.head_sha -ne $env:RELEASE_SHA -or
+              $evidence.head_branch -ne 'main' -or
               $evidence.path -ne '.github/workflows/v9-deployment-evidence.yml' -or
               $evidence.event -ne 'workflow_dispatch') {
             throw "Deployment evidence run is not trusted for this commit."
+          }
+          $portalImage = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:PORTAL_IMAGE_RUN_ID" | ConvertFrom-Json
+          if ($portalImage.conclusion -ne 'success' -or
+              $portalImage.head_sha -ne $env:RELEASE_SHA -or
+              $portalImage.head_branch -ne 'main' -or
+              $portalImage.path -ne '.github/workflows/v9-portal-image.yml' -or
+              $portalImage.event -ne 'workflow_dispatch') {
+            throw "Portal image run is not trusted for this commit."
           }
       - name: Download exact signed candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -109,6 +135,48 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.deployment_evidence_run_id }}
           github-token: ${{ github.token }}
+      - name: Download exact Portal image receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: v9-portal-image-${{ inputs.release_sha }}-${{ inputs.portal_image_run_id }}
+          path: portal-image-receipt
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.portal_image_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify Portal image receipt and OCI provenance
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $receiptFiles = @(Get-ChildItem portal-image-receipt -Recurse -Force)
+          if ($receiptFiles.Count -ne 1 -or $receiptFiles[0].PSIsContainer -or
+              $receiptFiles[0].LinkType -or $receiptFiles[0].Name -cne 'portal-image.json') {
+            throw "Portal image workflow did not publish the one fixed receipt."
+          }
+          $receipt = Get-Content -LiteralPath $receiptFiles[0].FullName -Raw | ConvertFrom-Json
+          $expectedKeys = @('attestation_url', 'base_image', 'generated_at_utc', 'image_digest', 'image_reference', 'release_commit', 'schema', 'workflow_run_id')
+          $actualKeys = @($receipt.PSObject.Properties.Name | Sort-Object)
+          if ((Compare-Object $expectedKeys $actualKeys).Count -ne 0) {
+            throw "Portal image receipt schema differs from the fixed contract."
+          }
+          $owner = $env:GITHUB_REPOSITORY_OWNER.ToLowerInvariant()
+          $expectedReference = "ghcr.io/$owner/defense-tracker-portal@$env:PORTAL_IMAGE_DIGEST"
+          if ($receipt.schema -ne 1 -or
+              $receipt.release_commit -cne $env:RELEASE_SHA -or
+              $receipt.image_digest -cne $env:PORTAL_IMAGE_DIGEST -or
+              $receipt.image_reference -cne $expectedReference -or
+              [string]$receipt.workflow_run_id -cne $env:PORTAL_IMAGE_RUN_ID -or
+              $receipt.attestation_url -cnotmatch '^https://github\.com/[^/]+/[^/]+/attestations/[0-9]+$') {
+            throw "Portal image receipt does not bind the approved run, commit and digest."
+          }
+          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-portal-image.yml"
+          gh attestation verify "oci://$expectedReference" `
+            --repo $env:GITHUB_REPOSITORY `
+            --bundle-from-oci `
+            --signer-workflow $signerWorkflow `
+            --source-ref refs/heads/main `
+            --source-digest $env:RELEASE_SHA `
+            --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) { throw "Portal image provenance verification failed." }
       - name: Reverify hashes, signatures, timestamp and deployment gates
         shell: powershell
         run: |
@@ -118,11 +186,30 @@ jobs:
           python scripts\verify_deployment_evidence.py deployment-evidence `
             --expected-commit $env:RELEASE_SHA `
             --expected-image-digest $env:PORTAL_IMAGE_DIGEST `
-            --expected-candidate-run-id $env:CANDIDATE_RUN_ID
+            --expected-candidate-run-id $env:CANDIDATE_RUN_ID `
+            --expected-collector-key-id $env:DEPLOYMENT_COLLECTOR_KEY_ID `
+            --expected-collector-public-key-sha256 $env:DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 `
+            --expected-staging-origin $env:DEPLOYMENT_STAGING_ORIGIN `
+            --expected-production-origin $env:DEPLOYMENT_PRODUCTION_ORIGIN
           .\scripts\Verify-ReleaseAuthenticode.ps1 `
             -AssetRoot candidate `
             -PublisherName $env:DEFENSE_TRACKER_PUBLISHER `
             -SignToolPath $env:DEFENSE_TRACKER_SIGNTOOL
+      - name: Verify deployment evidence provenance is bound to its workflow, ref and SHA
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-deployment-evidence.yml"
+          Get-ChildItem deployment-evidence -File | ForEach-Object {
+            gh attestation verify $_.FullName `
+              --repo $env:GITHUB_REPOSITORY `
+              --signer-workflow $signerWorkflow `
+              --source-ref refs/heads/main `
+              --source-digest $env:RELEASE_SHA
+            if ($LASTEXITCODE -ne 0) {
+              throw "Deployment evidence provenance verification failed: $($_.Name)"
+            }
+          }
       - name: Verify candidate provenance is bound to exact workflow, ref and SHA
         shell: powershell
         run: |

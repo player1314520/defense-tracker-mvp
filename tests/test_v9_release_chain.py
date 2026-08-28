@@ -28,10 +28,11 @@ from scripts.package_release_assets import package_assets
 from scripts.verify_deployment_evidence import (
     CORE_PAYLOAD_FILES,
     PAYLOAD_FILES,
+    PROBE_ROUTE_SPECS,
     PRODUCTION_CHECKS,
     STAGING_CHECKS,
-    seal_origin_isolation,
-    verify as verify_deployment_evidence,
+    seal_origin_isolation as _seal_origin_isolation,
+    verify as _verify_deployment_evidence,
 )
 from scripts.verify_release_assets import verify as verify_release_assets
 from scripts.verify_release_checks import (
@@ -48,6 +49,36 @@ TREE = "b" * 40
 IMAGE_DIGEST = "sha256:" + "c" * 64
 STAGING_ORIGIN = "https://staging.defense-tracker.example"
 PRODUCTION_ORIGIN = "https://portal.defense-tracker.example"
+DEPLOYMENT_COLLECTOR_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(
+    hashlib.sha256(b"test deployment collector key").digest()
+)
+DEPLOYMENT_COLLECTOR_PUBLIC_KEY = DEPLOYMENT_COLLECTOR_PRIVATE_KEY.public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw,
+)
+DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 = hashlib.sha256(
+    DEPLOYMENT_COLLECTOR_PUBLIC_KEY
+).hexdigest()
+DEPLOYMENT_COLLECTOR_KEY_ID = (
+    f"deployment-collector-{DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256[:16]}"
+)
+
+
+def seal_origin_isolation(root: Path) -> None:
+    _seal_origin_isolation(
+        root,
+        expected_collector_key_id=DEPLOYMENT_COLLECTOR_KEY_ID,
+        expected_collector_public_key_sha256=DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256,
+    )
+
+
+def verify_deployment_evidence(root: Path, **kwargs) -> None:
+    _verify_deployment_evidence(
+        root,
+        expected_collector_key_id=DEPLOYMENT_COLLECTOR_KEY_ID,
+        expected_collector_public_key_sha256=DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256,
+        **kwargs,
+    )
 
 
 def _minimal_unsigned_pe64(*, overlay: bytes = b"review") -> bytes:
@@ -190,8 +221,8 @@ def _probe(
         "checks": [
             {
                 "name": name,
-                "method": "GET",
-                "url": f"{origin}/evidence/{name}",
+                "method": PROBE_ROUTE_SPECS[name]["method"],
+                "url": f"{origin}{PROBE_ROUTE_SPECS[name]['path']}",
                 "status_code": status,
                 "elapsed_ms": 100 + index,
                 "observed_at_utc": _utc(started + timedelta(seconds=index + 1)),
@@ -228,6 +259,10 @@ def _observations(
                     "elapsed_ms": 250 + index,
                     "disk_free_percent": 55.5,
                     "backup_age_hours": 3.5,
+                    "data_device_sha256": _digest(f"{environment}-data-device"),
+                    "backup_receipt_sha256": _digest(
+                        f"{environment}-backup-receipt-{index}"
+                    ),
                     "response_sha256": _digest(f"{environment}-sample-{index}"),
                 },
                 separators=(",", ":"),
@@ -237,6 +272,42 @@ def _observations(
 
 
 def _refresh_evidence_manifest(root: Path, generated: datetime) -> None:
+    core_artifacts = [
+        {
+            "path": name,
+            "sha256": hashlib.sha256((root / name).read_bytes()).hexdigest(),
+            "size_bytes": (root / name).stat().st_size,
+        }
+        for name in sorted(CORE_PAYLOAD_FILES)
+    ]
+    public_key = DEPLOYMENT_COLLECTOR_PUBLIC_KEY
+    public_key_sha256 = DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256
+    receipt = {
+        "schema": 1,
+        "key_id": f"deployment-collector-{public_key_sha256[:16]}",
+        "public_key_base64": base64.b64encode(public_key).decode("ascii"),
+        "public_key_sha256": public_key_sha256,
+        "release_commit": COMMIT,
+        "candidate_run_id": 123,
+        "portal_image_digest": IMAGE_DIGEST,
+        "staging_origin": STAGING_ORIGIN,
+        "production_origin": PRODUCTION_ORIGIN,
+        "generated_at_utc": _utc(generated),
+        "artifacts": core_artifacts,
+    }
+    signature = DEPLOYMENT_COLLECTOR_PRIVATE_KEY.sign(
+        (
+            json.dumps(
+                receipt,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+    receipt["signature_base64"] = base64.b64encode(signature).decode("ascii")
     manifest = {
         "schema": 3,
         "release_commit": COMMIT,
@@ -253,6 +324,7 @@ def _refresh_evidence_manifest(root: Path, generated: datetime) -> None:
             }
             for name in sorted(PAYLOAD_FILES)
         ],
+        "collector_receipt": receipt,
     }
     (root / "deployment-evidence.json").write_text(
         json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
@@ -319,8 +391,8 @@ def _write_schema_3_evidence(root: Path, *, staging_hours: float = 24) -> dateti
             origin=STAGING_ORIGIN,
             certificate_sha256=staging_certificate,
             started=generated - timedelta(hours=staging_hours + 1),
-            count=25,
-            spacing=timedelta(hours=staging_hours / 24),
+            count=26,
+            spacing=timedelta(hours=staging_hours / 25),
         ),
         encoding="utf-8",
     )
@@ -833,6 +905,7 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
     assert "dist/releases/v9.0.0/" not in candidate
     assert "v9-trusted-signing" in candidate
     assert "v9-deployment-evidence.yml" in release
+    assert "portal_image_run_id:" in release
     assert "immutable-releases" in release
     assert "actions/attest@" in release
     assert "defense-v9-candidate-ephemeral" in candidate
@@ -891,6 +964,46 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
     assert "DEFENSE_TRACKER_PRODUCTION_ORIGIN_TARGET: ${{ secrets." in deployment
     assert "DEFENSE_TRACKER_ORIGIN_EVIDENCE_HMAC_KEY: ${{ secrets." in deployment
     assert "--seal-origin-isolation" in deployment
+    collect_job = deployment.split("  collect-live-evidence:", 1)[1].split(
+        "  seal-live-evidence:", 1
+    )[0]
+    seal_job = deployment.split("  seal-live-evidence:", 1)[1]
+    assert "runs-on: [self-hosted, Linux, X64, defense-deploy-auditor]" in collect_job
+    assert "COLLECTOR_KEY_ID" not in collect_job
+    assert "COLLECTOR_PUBLIC_KEY_SHA256" not in collect_job
+    assert "id-token: write" not in collect_job
+    assert "runs-on: ubuntu-24.04" in seal_job
+    assert "--expected-collector-key-id" in seal_job
+    assert "--expected-collector-public-key-sha256" in seal_job
+    assert "actions/attest@" in seal_job
+    assert "--require-hashes" in seal_job
+    assert "requirements.deployment-evidence.lock" in seal_job
+    assert seal_job.index("--seal-origin-isolation") < seal_job.index("actions/attest@")
+    assert seal_job.index("actions/attest@") < seal_job.index(
+        "name: v9-deployment-evidence-${{ inputs.release_sha }}"
+    )
+    assert "DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_KEY_ID" in release
+    assert "DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256" in release
+    assert "DEFENSE_TRACKER_STAGING_ORIGIN" in release
+    assert "DEFENSE_TRACKER_PRODUCTION_ORIGIN" in release
+    assert "PORTAL_IMAGE_RUN_ID" in release
+    assert "--expected-collector-key-id" in release
+    assert "--expected-collector-public-key-sha256" in release
+    assert "--expected-staging-origin $env:DEPLOYMENT_STAGING_ORIGIN" in release
+    assert "--expected-production-origin $env:DEPLOYMENT_PRODUCTION_ORIGIN" in release
+    assert "$portalImage.path -ne '.github/workflows/v9-portal-image.yml'" in release
+    assert "v9-portal-image-${{ inputs.release_sha }}-${{ inputs.portal_image_run_id }}" in release
+    assert "Portal image receipt does not bind the approved run, commit and digest" in release
+    assert 'gh attestation verify "oci://$expectedReference"' in release
+    assert ".github/workflows/v9-portal-image.yml" in release
+    assert "--bundle-from-oci" in release
+    assert "--deny-self-hosted-runners" in release
+    assert "packages: read" in release
+    assert (
+        '$signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-deployment-evidence.yml"'
+        in release
+    )
+    assert release.count("gh attestation verify $_.FullName") >= 3
     assert "--expected-staging-origin \"${STAGING_ORIGIN}\"" in deployment
     assert "--expected-production-origin \"${PRODUCTION_ORIGIN}\"" in deployment
     for evidence_file in PAYLOAD_FILES | {"deployment-evidence.json"}:
@@ -924,6 +1037,7 @@ def test_hash_locks_and_installers_require_hashes():
         "requirements.runtime.lock",
         "requirements.build.lock",
         "requirements.bootstrap.lock",
+        "requirements.deployment-evidence.lock",
         "deploy/requirements.cloud.txt",
     ):
         source = (ROOT / relative).read_text(encoding="utf-8")
@@ -945,6 +1059,19 @@ def test_hash_locks_and_installers_require_hashes():
     ):
         assert variable in (prepare + gate + (ROOT / ".github/workflows/v9-signed-candidate.yml").read_text())
     assert "--require-hashes" in (ROOT / "deploy/mvp/portal.Dockerfile").read_text()
+
+
+def test_deployment_evidence_lock_uses_audited_cryptography_release():
+    lock = (ROOT / "requirements.deployment-evidence.lock").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/v9-deployment-evidence.yml").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(r"(?m)^cryptography==50\.0\.1 \\$", lock)
+    assert "cryptography==46.0.5" not in lock
+    assert "ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef" in lock
+    assert 'importlib.metadata.version("cryptography")' in workflow
+    assert '= "50.0.1"' in workflow
+    assert "python -m pip check" in workflow
 
 
 def test_required_check_gate_rejects_any_non_success():
@@ -1053,6 +1180,106 @@ def test_deployment_evidence_seals_legacy_manifest_without_publishing_screenshot
         expected_image_digest=IMAGE_DIGEST,
         expected_candidate_run_id=123,
     )
+
+
+def test_deployment_evidence_requires_pin_and_rejects_self_signed_schema2(tmp_path):
+    _write_schema_3_evidence(tmp_path)
+    with pytest.raises(ValueError, match="protected key pin is required"):
+        _verify_deployment_evidence(
+            tmp_path,
+            expected_commit=COMMIT,
+            expected_image_digest=IMAGE_DIGEST,
+            expected_candidate_run_id=123,
+        )
+
+    manifest_path = tmp_path / "deployment-evidence.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema"] = 2
+    manifest["artifacts"] = [
+        {
+            "path": name,
+            "sha256": hashlib.sha256((tmp_path / name).read_bytes()).hexdigest(),
+            "size_bytes": (tmp_path / name).stat().st_size,
+        }
+        for name in sorted(CORE_PAYLOAD_FILES)
+    ]
+    attacker = Ed25519PrivateKey.generate()
+    attacker_public = attacker.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    receipt = manifest["collector_receipt"]
+    attacker_digest = hashlib.sha256(attacker_public).hexdigest()
+    receipt["key_id"] = f"deployment-collector-{attacker_digest[:16]}"
+    receipt["public_key_base64"] = base64.b64encode(attacker_public).decode("ascii")
+    receipt["public_key_sha256"] = attacker_digest
+    receipt.pop("signature_base64")
+    receipt["signature_base64"] = base64.b64encode(
+        attacker.sign(
+            (
+                json.dumps(
+                    receipt,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+    ).decode("ascii")
+    manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+    with pytest.raises(ValueError, match="protected environment"):
+        _seal_origin_isolation(
+            tmp_path,
+            expected_collector_key_id=DEPLOYMENT_COLLECTOR_KEY_ID,
+            expected_collector_public_key_sha256=DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256,
+        )
+
+
+def test_deployment_evidence_schema2_payload_change_is_rejected_before_seal(tmp_path):
+    _write_schema_3_evidence(tmp_path)
+    manifest_path = tmp_path / "deployment-evidence.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema"] = 2
+    manifest["artifacts"] = [
+        {
+            "path": name,
+            "sha256": hashlib.sha256((tmp_path / name).read_bytes()).hexdigest(),
+            "size_bytes": (tmp_path / name).stat().st_size,
+        }
+        for name in sorted(CORE_PAYLOAD_FILES)
+    ]
+    manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+    with (tmp_path / "staging-probe.json").open("ab") as stream:
+        stream.write(b"x")
+    with pytest.raises(ValueError, match="changed before sealing"):
+        _seal_origin_isolation(
+            tmp_path,
+            expected_collector_key_id=DEPLOYMENT_COLLECTOR_KEY_ID,
+            expected_collector_public_key_sha256=DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256,
+        )
+
+
+def test_deployment_evidence_rejects_wrong_collector_signature(tmp_path):
+    _write_schema_3_evidence(tmp_path)
+    manifest_path = tmp_path / "deployment-evidence.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    signature = bytearray(
+        base64.b64decode(manifest["collector_receipt"]["signature_base64"])
+    )
+    signature[0] ^= 0x01
+    manifest["collector_receipt"]["signature_base64"] = base64.b64encode(
+        signature
+    ).decode("ascii")
+    manifest_path.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+    with pytest.raises(ValueError, match="signature is invalid"):
+        verify_deployment_evidence(
+            tmp_path,
+            expected_commit=COMMIT,
+            expected_image_digest=IMAGE_DIGEST,
+            expected_candidate_run_id=123,
+        )
 
 
 def test_deployment_evidence_rejects_self_asserted_or_stale_origin_isolation(tmp_path):
