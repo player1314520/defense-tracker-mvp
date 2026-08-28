@@ -1,0 +1,23 @@
+[Unit]
+Description=DefenseTracker bounded access-data retention purge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=MVP_PRODUCTION_ENV=/etc/defense-tracker/production.env
+ExecStart=/bin/sh /opt/defense-tracker/current/deploy/mvp/bin/purge-access-applications.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

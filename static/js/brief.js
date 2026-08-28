@@ -126,7 +126,7 @@ function briefRenderCandidates() {
         <button class="brief-feedback-btn ok" onclick="briefFeedback(${i}, 'accepted')" title="标记为高价值样本">采纳</button>
         <button class="brief-feedback-btn" onclick="briefFeedback(${i}, 'skipped')" title="暂不采用但保留样本">跳过</button>
         <button class="brief-feedback-btn bad" onclick="briefFeedback(${i}, 'rejected')" title="标记为不符合要求">不符合</button>
-        <a class="brief-link-btn" href="${escHtml(a.link)}" target="_blank" rel="noopener">原文</a>
+        <a class="brief-link-btn" href="${escHtml(safeExternalUrl(a.link))}" target="_blank" rel="noopener noreferrer">原文</a>
       </div>
     </div>`;
   }).join('');
@@ -305,7 +305,7 @@ function briefAddResult(brief, article, sourceEvidence) {
       source: article.source_cn || article.source,
       source_en: article.source,
       region: article.region,
-      link: article.link,
+      link: safeExternalUrl(article.link),
       date: article.date,
       summary: article.summary,
       publication_date_verified: article.publication_date_verified !== false,
@@ -375,7 +375,7 @@ function briefRenderResults() {
       </div>
       ${bodyHtml}
       <div class="brief-result-foot">
-        <a href="${escHtml(r.article.link)}" target="_blank" rel="noopener" class="brief-result-link">原文</a>
+        <a href="${escHtml(safeExternalUrl(r.article.link))}" target="_blank" rel="noopener noreferrer" class="brief-result-link">原文</a>
         <span class="brief-result-src">${escHtml(r.article.source)} · ${escHtml(r.article.region||'')}</span>
       </div>
     </div>`;

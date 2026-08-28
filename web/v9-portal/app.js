@@ -1269,7 +1269,10 @@ async function initialize() {
   const config = await fetch("./config.json", { cache: "no-store" }).then(
     (response) => response.json(),
   );
-  if (!config.configured) throw new Error("移动门户尚未配置 Supabase Staging");
+  if (!config.configured) throw new Error("移动门户尚未配置生产协作服务");
+  if (typeof config.display_version === "string") {
+    byId("product-version").textContent = config.display_version;
+  }
   state.accessApplicationsEnabled = config.access_applications_enabled === true;
   // v9.1 and earlier persisted the full Supabase session.  Keep only the
   // one-time PKCE verifier required across the emailed callback navigation.

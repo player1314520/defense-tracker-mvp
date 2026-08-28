@@ -16,7 +16,7 @@ require_command() {
     }
 }
 
-for command_name in docker python3 curl age rclone flock tar sha256sum grep git stat sed; do
+for command_name in docker python3 curl age rclone flock tar sha256sum grep git stat sed systemctl; do
     require_command "$command_name"
 done
 docker compose version >/dev/null 2>&1 || {
@@ -37,7 +37,7 @@ if parts(sys.argv[1]) < (2, 24, 4):
     raise SystemExit("Docker Compose >= 2.24.4 is required for !override")
 PY
 
-required_names='PORTAL_DOMAIN API_DOMAIN ACME_EMAIL PORTAL_IMAGE CADDY_IMAGE MVP_SECRETS_DIR MVP_RELEASE_STATE_DIR SUPABASE_STACK_DIR SUPABASE_UPSTREAM_SHA SUPABASE_OVERRIDE_FILE SUPABASE_FUNCTIONS_DEPLOY_DIR SUPABASE_POSTGRES_DATA_DIR SUPABASE_STORAGE_DATA_DIR SUPABASE_CONFIG_DIR MVP_CONFIG_DIR BACKUP_STAGING_DIR BACKUP_REMOTE AGE_RECIPIENT_FILE RCLONE_CONFIG V9_AUTH_HOOK_ENABLED'
+required_names='PORTAL_DOMAIN API_DOMAIN ACME_EMAIL PORTAL_IMAGE CADDY_IMAGE MVP_SECRETS_DIR MVP_RELEASE_STATE_DIR SUPABASE_STACK_DIR SUPABASE_UPSTREAM_SHA SUPABASE_OVERRIDE_FILE SUPABASE_FUNCTIONS_DEPLOY_DIR SUPABASE_POSTGRES_DATA_DIR SUPABASE_STORAGE_DATA_DIR SUPABASE_CONFIG_DIR MVP_CONFIG_DIR BACKUP_STAGING_DIR BACKUP_REMOTE AGE_RECIPIENT_FILE RCLONE_CONFIG V9_AUTH_HOOK_ENABLED ACCESS_APPLICATIONS_ENABLED MVP_EXTERNAL_WAF_ENABLED MVP_WAF_REALTIME_WEBSOCKET_ALLOWED WAF_TRUSTED_PROXY_CIDRS'
 for variable_name in $required_names; do
     eval "variable_value=\${$variable_name:-}"
     [ -n "$variable_value" ] || {
@@ -46,7 +46,31 @@ for variable_name in $required_names; do
     }
 done
 
-python3 - "$PORTAL_DOMAIN" "$API_DOMAIN" <<'PY'
+[ "$MVP_EXTERNAL_WAF_ENABLED" = true ] || {
+    printf '%s\n' "production configuration must require upstream connection and burst protection" >&2
+    exit 64
+}
+[ "$MVP_WAF_REALTIME_WEBSOCKET_ALLOWED" = true ] || {
+    printf '%s\n' "production WAF must allow the Realtime WebSocket route" >&2
+    exit 64
+}
+for timer_name in defense-tracker-backup.timer defense-tracker-retention.timer; do
+    systemctl is-enabled --quiet "$timer_name" || {
+        printf '%s\n' "required systemd timer is not enabled: $timer_name" >&2
+        exit 65
+    }
+    systemctl is-active --quiet "$timer_name" || {
+        printf '%s\n' "required systemd timer is not active: $timer_name" >&2
+        exit 65
+    }
+done
+case "$ACCESS_APPLICATIONS_ENABLED" in
+    true|false) ;;
+    *) printf '%s\n' "ACCESS_APPLICATIONS_ENABLED must be true or false" >&2; exit 64 ;;
+esac
+
+python3 - "$PORTAL_DOMAIN" "$API_DOMAIN" "$WAF_TRUSTED_PROXY_CIDRS" <<'PY'
+import ipaddress
 import re
 import sys
 
@@ -54,7 +78,7 @@ domain_pattern = re.compile(
     r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 )
-portal, api = sys.argv[1:]
+portal, api, raw_waf_cidrs = sys.argv[1:]
 for label, value in (("PORTAL_DOMAIN", portal), ("API_DOMAIN", api)):
     if (
         not value.isascii()
@@ -65,6 +89,23 @@ for label, value in (("PORTAL_DOMAIN", portal), ("API_DOMAIN", api)):
         raise SystemExit(f"{label} is not one exact lowercase production hostname")
 if portal == api:
     raise SystemExit("portal and API domains must differ")
+waf_cidrs = raw_waf_cidrs.split()
+if not waf_cidrs:
+    raise SystemExit("WAF_TRUSTED_PROXY_CIDRS requires reviewed public CIDRs")
+for raw_cidr in waf_cidrs:
+    try:
+        network = ipaddress.ip_network(raw_cidr, strict=True)
+    except ValueError as exc:
+        raise SystemExit("WAF_TRUSTED_PROXY_CIDRS contains an invalid CIDR") from exc
+    if (
+        network.is_private
+        or network.is_loopback
+        or network.is_link_local
+        or network.is_multicast
+        or network.is_reserved
+        or network.is_unspecified
+    ):
+        raise SystemExit("WAF_TRUSTED_PROXY_CIDRS must contain public provider ranges only")
 PY
 
 printf '%s' "$PORTAL_IMAGE" | grep -Eq '^[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$' || {
@@ -229,6 +270,17 @@ if auth_env.get("API_EXTERNAL_URL") != expected_api:
     raise SystemExit("API_EXTERNAL_URL must be the exact public /auth/v1 URL")
 if str(auth_env.get("GOTRUE_DISABLE_SIGNUP", "")).lower() != "true":
     raise SystemExit("public Auth signup must remain disabled")
+expected_redirects = ["https://" + os.environ["PORTAL_DOMAIN"] + "/portal/"] + [
+    f"http://127.0.0.1:{port}/api/v9/auth/callback"
+    for port in range(49231, 49236)
+]
+actual_redirects = [
+    item.strip()
+    for item in exact_dotenv_value("ADDITIONAL_REDIRECT_URLS").split(",")
+    if item.strip()
+]
+if actual_redirects != expected_redirects:
+    raise SystemExit("Auth redirect allowlist must contain only Portal and five desktop PKCE callbacks")
 if str(auth_env.get("GOTRUE_HOOK_BEFORE_USER_CREATED_ENABLED", "")).lower() != os.environ["V9_AUTH_HOOK_ENABLED"].lower():
     raise SystemExit("Auth hook phase differs from production configuration")
 
@@ -244,6 +296,8 @@ if not official_service_role or not hmac.compare_digest(runtime_service_role, of
 origin = "https://" + os.environ["PORTAL_DOMAIN"]
 if function_env.get("V9_ALLOWED_ORIGINS") != origin:
     raise SystemExit("Edge Function origin must be the exact Portal origin")
+if str(function_env.get("V9_ACCESS_APPLICATIONS_ENABLED", "")).lower() != os.environ["ACCESS_APPLICATIONS_ENABLED"].lower():
+    raise SystemExit("Portal and Edge Function application gates differ")
 if function_env.get("V9_INVITE_REDIRECT_URL") != origin + "/portal/":
     raise SystemExit("invite redirect must be the exact Portal URL")
 
@@ -316,4 +370,6 @@ else
 fi
 
 printf '%s\n' "[PREFLIGHT] Static Compose, host-path and secret-permission checks passed."
+printf '%s\n' "[PREFLIGHT] WAF flags and CIDRs are configuration only; this host cannot prove origin isolation."
+printf '%s\n' "[PREFLIGHT] Stable release still requires the external v9 deployment evidence origin-isolation gates."
 printf '%s\n' "[PREFLIGHT] Runtime TLS, email, Auth hooks, backups and user flows still require live verification."

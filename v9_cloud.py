@@ -22,10 +22,21 @@ from urllib.parse import urlsplit, urlunsplit
 
 from flask import Flask, jsonify, redirect, request, send_from_directory
 
+from feishu_webhook_security import (
+    WebhookMisconfigured,
+    WebhookRejected,
+    acquire_event_lease,
+    decrypt_event_payload,
+    validate_event_identity,
+    verify_signed_request,
+)
+from product_version import PRODUCT_VERSION, current_build_commit
 from v9.cloud import validate_ciphertext_event
 
 
 _TASK_ID = re.compile(r"^[A-Z][A-Z0-9_-]{5,63}$")
+_FULL_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+_WIRE_COMPATIBILITY = "mvp-wire-v1"
 _TASK_ACTIONS = {"claim", "approve", "status"}
 _TASK_STATUSES = {
     "queued",
@@ -40,6 +51,26 @@ _TASK_STATUSES = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_build_commit(explicit: str | None = None) -> str:
+    """Resolve the immutable source revision without exposing local paths."""
+    if explicit is None:
+        return current_build_commit()
+    candidate = explicit.strip()
+    if _FULL_GIT_SHA.fullmatch(candidate) is None:
+        raise ValueError("build_commit must be a full lowercase Git SHA")
+    return candidate
+
+
+def _release_metadata(build_commit: str) -> dict[str, str]:
+    return {
+        "version": PRODUCT_VERSION.semantic_version,
+        "display_version": PRODUCT_VERSION.display_version,
+        "release_tag": PRODUCT_VERSION.release_tag,
+        "build_commit": build_commit,
+        "wire_compatibility": _WIRE_COMPATIBILITY,
+    }
 
 
 def _strict_bool_setting(
@@ -248,13 +279,17 @@ def create_app(
     database_path: Path | str | None = None,
     coordinator_token: str | None = None,
     legacy_coordinator_enabled: bool | None = None,
+    feishu_app_id: str | None = None,
     feishu_verify_token: str | None = None,
+    feishu_encrypt_key: str | None = None,
+    feishu_tenant_key: str | None = None,
     allowed_origins: set[str] | None = None,
     supabase_url: str | None = None,
     supabase_publishable_key: str | None = None,
     invited_signup_enabled: bool | None = None,
     access_applications_enabled: bool | None = None,
     production_mode: bool | None = None,
+    build_commit: str | None = None,
     readiness_probe=None,
 ) -> Flask:
     application = Flask(__name__)
@@ -276,11 +311,26 @@ def create_app(
             or os.getenv("V9_LEGACY_COORDINATOR_ENABLED", "").strip().lower()
             in {"1", "true", "yes"}
         )
+    feishu_app_id = (
+        feishu_app_id
+        if feishu_app_id is not None
+        else os.getenv("FEISHU_APP_ID", "")
+    ).strip()
     verify_token = (
         feishu_verify_token
         if feishu_verify_token is not None
         else os.getenv("FEISHU_VERIFY_TOKEN", "")
-    )
+    ).strip()
+    encrypt_key = (
+        feishu_encrypt_key
+        if feishu_encrypt_key is not None
+        else os.getenv("FEISHU_ENCRYPT_KEY", "")
+    ).strip()
+    tenant_key = (
+        feishu_tenant_key
+        if feishu_tenant_key is not None
+        else os.getenv("FEISHU_TENANT_KEY", "")
+    ).strip()
     supabase_url = (
         supabase_url
         if supabase_url is not None
@@ -308,6 +358,12 @@ def create_app(
         "V9_PRODUCTION_MODE",
         setting_name="production_mode",
     )
+    build_commit = _resolve_build_commit(build_commit)
+    if production_mode and build_commit == "development":
+        raise ValueError(
+            "DEFENSE_TRACKER_BUILD_COMMIT must be a full lowercase Git SHA"
+        )
+    release_metadata = _release_metadata(build_commit)
     if allowed_origins is None:
         allowed_origins = {
             item.strip()
@@ -404,6 +460,7 @@ def create_app(
             "sync_backend": (
                 "legacy-local" if legacy_coordinator_enabled else "supabase"
             ),
+            **release_metadata,
         })
 
     @application.get("/ready")
@@ -419,7 +476,19 @@ def create_app(
         return jsonify({
             "status": "ready" if dependency_ready else "not_ready",
             "mode": "ciphertext-only",
+            **release_metadata,
         }), 200 if dependency_ready else 503
+
+    @application.get("/api/status")
+    def api_status():
+        return jsonify({
+            "status": "ok",
+            "mode": "ciphertext-only",
+            "sync_backend": (
+                "legacy-local" if legacy_coordinator_enabled else "supabase"
+            ),
+            **release_metadata,
+        })
 
     @application.get("/")
     def root():
@@ -441,7 +510,9 @@ def create_app(
             "invited_signup_enabled": False,
             "access_applications_enabled": access_applications_enabled,
             "account_limit": 100,
+            "daily_event_limit": 1000,
             "deployment_mode": "mvp",
+            **release_metadata,
         })
 
     @application.get("/favicon.ico")
@@ -512,49 +583,98 @@ def create_app(
 
     @application.post("/api/feishu/webhook")
     def feishu_webhook():
+        if not all((feishu_app_id, verify_token, encrypt_key, tenant_key)):
+            return jsonify({"error": "webhook security not configured"}), 503
+        if request.content_length is not None and request.content_length > 256 * 1024:
+            return jsonify({"error": "webhook body too large"}), 413
         raw = request.get_data(cache=True)
-        timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
-        nonce = request.headers.get("X-Lark-Request-Nonce", "")
-        supplied = request.headers.get("X-Lark-Signature", "")
-        expected = hashlib.sha256(
-            (timestamp + nonce + verify_token).encode() + raw
-        ).hexdigest()
-        if (
-            not verify_token
-            or not timestamp
-            or not nonce
-            or not hmac.compare_digest(supplied, expected)
-        ):
-            return jsonify({"error": "invalid signature"}), 401
-        data = request.get_json(silent=True) or {}
+        if len(raw) > 256 * 1024:
+            return jsonify({"error": "webhook body too large"}), 413
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "invalid webhook payload"}), 400
+        try:
+            verify_signed_request(
+                request.headers,
+                raw,
+                signing_key=encrypt_key,
+                allow_token_only=False,
+            )
+            data = decrypt_event_payload(data, encrypt_key=encrypt_key)
+        except WebhookRejected:
+            return jsonify({"error": "invalid webhook signature"}), 403
+        except WebhookMisconfigured:
+            return jsonify({"error": "webhook security unavailable"}), 503
+
         if data.get("type") == "url_verification":
-            if data.get("token") != verify_token:
-                return jsonify({"error": "invalid verification token"}), 401
-            return jsonify({"challenge": str(data.get("challenge") or "")})
-        header = data.get("header") or {}
-        message = (data.get("event") or {}).get("message") or {}
-        event_id = str(header.get("event_id") or message.get("message_id") or "")
+            incoming_token = str(data.get("token") or "")
+            if not hmac.compare_digest(incoming_token, verify_token):
+                return jsonify({"error": "invalid verification token"}), 403
+            challenge = data.get("challenge", "")
+            if not isinstance(challenge, str) or len(challenge) > 1024:
+                return jsonify({"error": "invalid challenge"}), 400
+            return jsonify({"challenge": challenge})
+
+        header = data.get("header")
+        if not isinstance(header, dict):
+            return jsonify({"error": "invalid webhook event"}), 400
+        incoming_token = str(header.get("token") or "")
+        if not hmac.compare_digest(incoming_token, verify_token):
+            return jsonify({"error": "invalid verification token"}), 403
+        try:
+            validate_event_identity(
+                data,
+                expected_app_id=feishu_app_id,
+                expected_tenant_key=tenant_key,
+                allow_legacy=False,
+            )
+        except WebhookRejected:
+            return jsonify({"error": "invalid webhook identity"}), 403
+        except WebhookMisconfigured:
+            return jsonify({"error": "webhook identity unavailable"}), 503
+
+        event = data.get("event")
+        if not isinstance(event, dict):
+            return jsonify({"error": "invalid webhook event"}), 400
+        if header.get("event_type") != "im.message.receive_v1":
+            return jsonify({"accepted": False})
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return jsonify({"error": "invalid webhook event"}), 400
+        event_id = str(header.get("event_id") or "")
         chat_id = str(message.get("chat_id") or "")
         try:
-            content = json.loads(str(message.get("content") or "{}"))
-        except json.JSONDecodeError:
-            content = {}
-        command = str(content.get("text") or "").strip()
-        parts = command.split()
-        if (
-            len(parts) != 2
-            or parts[0].lower() not in _TASK_ACTIONS
-            or not _TASK_ID.fullmatch(parts[1])
-            or not event_id
-            or not chat_id
-        ):
+            event_lease = acquire_event_lease(data, allow_legacy=False)
+        except WebhookRejected:
+            return jsonify({"error": "invalid webhook event"}), 403
+        except WebhookMisconfigured:
+            return jsonify({"error": "webhook deduplication unavailable"}), 503
+        if event_lease is None:
             return jsonify({"accepted": False})
-        action, task_id = parts[0].lower(), parts[1]
-        actor_hash = hashlib.sha256(chat_id.encode()).hexdigest()
-        store.record_command(event_id, action, task_id, actor_hash)
-        return jsonify(
-            {"accepted": True, "action": action, "task_id": task_id}
-        )
+
+        with event_lease:
+            if message.get("message_type") != "text":
+                return jsonify({"accepted": False})
+            try:
+                content = json.loads(str(message.get("content") or "{}"))
+            except json.JSONDecodeError:
+                content = {}
+            command = str(content.get("text") or "").strip()
+            parts = command.split()
+            if (
+                len(parts) != 2
+                or parts[0].lower() not in _TASK_ACTIONS
+                or not _TASK_ID.fullmatch(parts[1])
+                or not chat_id
+            ):
+                return jsonify({"accepted": False})
+            action, task_id = parts[0].lower(), parts[1]
+            actor_hash = hashlib.sha256(chat_id.encode()).hexdigest()
+            event_hash = hashlib.sha256(event_id.encode()).hexdigest()
+            store.record_command(event_hash, action, task_id, actor_hash)
+            return jsonify(
+                {"accepted": True, "action": action, "task_id": task_id}
+            )
 
     return application
 

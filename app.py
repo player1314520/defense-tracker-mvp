@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Defense Data Tracker v8.0 - Priority Scoring Edition
+DefenseTracker V9 - legacy scoring schema + authenticated workspace
 实时抓取防务数据 · 写作要点优先评分(0-10★) · 3D地球仪热点 · AI在线分析 · PLA专项追踪 · 要讯自动写作
 """
 import re, sys, json, os, sqlite3, hashlib, hmac, feedparser, requests, smtplib, mimetypes, zipfile, time
@@ -38,6 +38,8 @@ import consulting_agent
 import report_agent
 import search_adapters
 import auth_devices
+import document_safety
+from product_version import PRODUCT_VERSION, current_build_commit
 from v9.ai_providers import (
     UnsupportedAiProvider,
     provider_catalog,
@@ -114,9 +116,17 @@ import secrets, ipaddress, time, socket
 from functools import wraps
 from urllib.parse import urlparse, urljoin
 
-# 访问令牌：Alpha1.0 工作台默认取消登录令牌；如需恢复，可设置 ACCESS_TOKEN_REQUIRED=1
+# 访问令牌：默认强制启用。仅本地开发/测试可显式设置
+# ACCESS_TOKEN_REQUIRED=0；回环网络是共享传输边界，不等于身份认证。
 _TOKEN_FILE = os.path.join(CONFIG_DIR, ".access_token")
-AUTH_REQUIRED = os.environ.get("ACCESS_TOKEN_REQUIRED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_access_token_required(value) -> bool:
+    """安全默认：未设置或拼写错误时仍要求鉴权。"""
+    return str(value or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+AUTH_REQUIRED = _parse_access_token_required(os.environ.get("ACCESS_TOKEN_REQUIRED"))
 
 def _load_access_token() -> tuple[str, str]:
     if not AUTH_REQUIRED:
@@ -169,11 +179,25 @@ if AUTH_REQUIRED:
         ACCESS_TOKEN_SOURCE,
     )
 else:
-    logger.info("访问令牌登录已关闭（设置 ACCESS_TOKEN_REQUIRED=1 可恢复）")
+    logger.warning("访问令牌鉴权已被显式关闭（仅限本地开发/测试）")
 
-AUTH_COOKIE = "access_token"
+AUTH_COOKIE = "defense_tracker_session"
 CSRF_COOKIE = "csrf_token"
 CSRF_HEADER = "X-CSRF-Token"
+AUTH_SESSION_TTL_SECONDS = 30 * 60
+AUTH_SESSION_MAX_ACTIVE = 1024
+_AUTH_SESSIONS: dict[bytes, float] = {}
+_AUTH_SESSION_LOCK = threading.Lock()
+_DESKTOP_BOOTSTRAP_ENABLED = (
+    AUTH_REQUIRED
+    and os.environ.get("DEFENSE_TRACKER_DESKTOP_BOOTSTRAP", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+_DESKTOP_BOOTSTRAP_TOKEN = (
+    secrets.token_urlsafe(32) if _DESKTOP_BOOTSTRAP_ENABLED else ""
+)
+_DESKTOP_BOOTSTRAP_USED = False
+_DESKTOP_BOOTSTRAP_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 5
 AUTH_RATE_LIMIT = 120
@@ -204,19 +228,120 @@ def _get_ip() -> str:
 def _is_api_request() -> bool:
     return request.path.startswith("/api/")
 
-def _request_auth_token() -> str:
-    return (request.cookies.get(AUTH_COOKIE) or request.headers.get("X-Access-Token", "")).strip()
+
+def _auth_session_now() -> float:
+    return time.monotonic()
+
+
+def _auth_session_digest(token: str) -> bytes:
+    return hashlib.sha256(token.encode("utf-8")).digest()
+
+
+def _purge_expired_auth_sessions_locked(now: float) -> None:
+    expired = [
+        digest
+        for digest, expires_at in _AUTH_SESSIONS.items()
+        if expires_at <= now
+    ]
+    for digest in expired:
+        _AUTH_SESSIONS.pop(digest, None)
+
+
+def _matching_auth_session_digest_locked(candidate_digest: bytes) -> bytes | None:
+    """Find a session without retaining or directly comparing plaintext tokens."""
+    matched = None
+    for stored_digest in _AUTH_SESSIONS:
+        if secrets.compare_digest(candidate_digest, stored_digest):
+            matched = stored_digest
+    return matched
+
+
+def _issue_auth_session() -> str:
+    """Issue a bounded, process-local session capability with an absolute TTL."""
+    now = _auth_session_now()
+    with _AUTH_SESSION_LOCK:
+        _purge_expired_auth_sessions_locked(now)
+        if len(_AUTH_SESSIONS) >= AUTH_SESSION_MAX_ACTIVE:
+            return ""
+        for _ in range(3):
+            token = secrets.token_urlsafe(32)
+            digest = _auth_session_digest(token)
+            if _matching_auth_session_digest_locked(digest) is None:
+                _AUTH_SESSIONS[digest] = now + AUTH_SESSION_TTL_SECONDS
+                return token
+    return ""
+
+
+def _verify_auth_session(candidate: str) -> bool:
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return False
+    now = _auth_session_now()
+    candidate_digest = _auth_session_digest(candidate)
+    with _AUTH_SESSION_LOCK:
+        _purge_expired_auth_sessions_locked(now)
+        return _matching_auth_session_digest_locked(candidate_digest) is not None
+
+
+def _revoke_auth_session(candidate: str) -> bool:
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return False
+    now = _auth_session_now()
+    candidate_digest = _auth_session_digest(candidate)
+    with _AUTH_SESSION_LOCK:
+        _purge_expired_auth_sessions_locked(now)
+        matched = _matching_auth_session_digest_locked(candidate_digest)
+        if matched is None:
+            return False
+        _AUTH_SESSIONS.pop(matched, None)
+        return True
+
+
+def _is_raw_auth_token_valid(token: str) -> bool:
+    """Validate an explicitly presented master/device credential."""
+    token = (token or "").strip()
+    if not token:
+        return False
+    if secrets.compare_digest(token, ACCESS_TOKEN):
+        return True
+    return auth_devices.verify_device_token(token)
 
 def _is_authenticated() -> bool:
     if not AUTH_REQUIRED:
         return True
-    token = _request_auth_token()
-    if not token:
-        return False
-    # master token 或任一未吊销的设备 token（单用户多设备）
-    if secrets.compare_digest(token, ACCESS_TOKEN):
+    # 浏览器 cookie 只接受短期进程内 session；长期 master/device token
+    # 只能由登录表单交换或由非浏览器客户端显式放在请求头中。
+    cookie_session = (request.cookies.get(AUTH_COOKIE) or "").strip()
+    if _verify_auth_session(cookie_session):
         return True
-    return auth_devices.verify_device_token(token)
+    header_token = (request.headers.get("X-Access-Token") or "").strip()
+    return _is_raw_auth_token_valid(header_token)
+
+
+def get_desktop_bootstrap_token() -> str:
+    """仅供同进程 launcher 读取一次性引导能力，不返回长期令牌。"""
+    if not _DESKTOP_BOOTSTRAP_ENABLED:
+        return ""
+    with _DESKTOP_BOOTSTRAP_LOCK:
+        if _DESKTOP_BOOTSTRAP_USED:
+            return ""
+        return _DESKTOP_BOOTSTRAP_TOKEN
+
+
+def _consume_desktop_bootstrap_token(candidate: str) -> bool:
+    """原子消费桌面引导能力；无论成功与否都不将值写日志。"""
+    global _DESKTOP_BOOTSTRAP_TOKEN, _DESKTOP_BOOTSTRAP_USED
+    if not _DESKTOP_BOOTSTRAP_ENABLED or not candidate:
+        return False
+    with _DESKTOP_BOOTSTRAP_LOCK:
+        if _DESKTOP_BOOTSTRAP_USED or not _DESKTOP_BOOTSTRAP_TOKEN:
+            return False
+        valid = secrets.compare_digest(candidate, _DESKTOP_BOOTSTRAP_TOKEN)
+        if valid:
+            _DESKTOP_BOOTSTRAP_USED = True
+            _DESKTOP_BOOTSTRAP_TOKEN = ""
+        return valid
 
 def _csrf_is_valid() -> bool:
     if request.method in ("GET", "HEAD", "OPTIONS"):
@@ -226,9 +351,9 @@ def _csrf_is_valid() -> bool:
     # Header-token API clients are not vulnerable to browser CSRF when they do
     # not use the auth cookie.
     header_auth = (request.headers.get("X-Access-Token") or "").strip()
-    if AUTH_REQUIRED and header_auth and not request.cookies.get(AUTH_COOKIE):
-        return (secrets.compare_digest(header_auth, ACCESS_TOKEN)
-                or auth_devices.verify_device_token(header_auth))
+    cookie_session = (request.cookies.get(AUTH_COOKIE) or "").strip()
+    if AUTH_REQUIRED and header_auth and not _verify_auth_session(cookie_session):
+        return _is_raw_auth_token_valid(header_auth)
     return bool(header_token and cookie_token) and secrets.compare_digest(header_token, cookie_token)
 
 def csrf_error_response():
@@ -237,18 +362,31 @@ def csrf_error_response():
 def validate_csrf_request() -> bool:
     return _csrf_is_valid()
 
+
+def _workspace_auth_error_response():
+    """Return the shared auth/rate/CSRF rejection, or None when allowed."""
+    if not _is_authenticated():
+        if _is_api_request():
+            return jsonify({"error": "未授权"}), 401
+        return redirect(url_for("login"))
+    if not _check_rate(
+        "auth:" + _get_ip(),
+        limit=AUTH_RATE_LIMIT,
+        window=AUTH_RATE_WINDOW,
+    ):
+        return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
+    if not _csrf_is_valid():
+        return csrf_error_response()
+    return None
+
+
 def require_auth(f):
-    """工作台访问守卫；默认免令牌，浏览器POST仍要求CSRF token。"""
+    """工作台访问守卫；生产默认强制令牌，浏览器写操作叠加 CSRF。"""
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if not _is_authenticated():
-            if _is_api_request():
-                return jsonify({"error": "未授权"}), 401
-            return redirect(url_for("login"))
-        if not _check_rate("auth:" + _get_ip(), limit=AUTH_RATE_LIMIT, window=AUTH_RATE_WINDOW):
-            return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
-        if not _csrf_is_valid():
-            return csrf_error_response()
+        rejection = _workspace_auth_error_response()
+        if rejection is not None:
+            return rejection
         return f(*args, **kwargs)
     return wrapper
 
@@ -930,7 +1068,7 @@ RSS_FEEDS = [
     {"name": "Hudson Institute",     "name_cn": "哈德逊研究所",      "url": "https://www.hudson.org/rss.xml",                              "region": "🇺🇸 美国",   "region_en": "USA",      "color": "#EF4444", "tier": 1, "focus": "china"},
     {"name": "China Brief Jamestown","name_cn": "詹姆斯敦中国简报2", "url": "https://jamestown.org/programs/cb/feed/",                       "region": "🇺🇸 美国",   "region_en": "USA",      "color": "#B91C1C", "tier": 0, "focus": "china"},
     {"name": "SCMP Military",        "name_cn": "南早军事",          "url": "https://www.scmp.com/rss/4/feed",                               "region": "🇭🇰 香港",   "region_en": "HK",       "color": "#F87171", "tier": 1, "focus": "china"},
-    # ── 🇯🇵 日本军事专项（v8.0 精准子频道）──────────────────────────
+    # ── 🇯🇵 日本军事专项（legacy scoring schema 精准子频道）──────────────────
     {"name": "NHK World Security",   "name_cn": "NHK国际安全",       "url": "https://www3.nhk.or.jp/rss/news/cat6.xml",                     "region": "🇯🇵 日本",   "region_en": "Japan",    "color": "#E11D48", "tier": 1, "focus": "japan"},
     {"name": "Japan Times Defense",  "name_cn": "日本时报防务",      "url": "https://www.japantimes.co.jp/feed/",                           "region": "🇯🇵 日本",   "region_en": "Japan",    "color": "#FB7185", "tier": 1, "focus": "japan"},
     {"name": "The Record Cyber",    "name_cn": "Recorded Future情报","url": "https://therecord.media/feed",                                 "region": "🇺🇸 美国",   "region_en": "USA",      "color": "#F43F5E", "tier": 1, "focus": "cyber"},
@@ -1058,7 +1196,7 @@ def calculate_priority(title: str, summary: str, source_info: dict,
     """
     写作要点优先级评分（0-10★）
     返回 {"stars": int, "score_raw": float, "dim": {"source":x,"topic":x,"quality":x}}
-    ── 评分校准 v8.0 ──
+    ── 历史评分模型（legacy scoring schema）──
     维度1 信源权威 0-3: tier0=3, tier1=2, tier2=1, +focus加成
     维度2 选题契合 0-4: 最高PLA备战=4, 叠加多规则累积
     维度3 质量信号 0-3: 关键词+标签丰富+时效+来源多引用
@@ -1427,6 +1565,23 @@ def _fetch_with_retry(url: str, timeout: int, retries: int = 2) -> requests.Resp
     if last_exc: raise last_exc
     raise requests.RequestException(f"Failed to fetch {url}")
 
+def _public_http_url(value: str) -> str:
+    """将上游链接限制为可导航的绝对 HTTP(S) URL。"""
+    candidate = str(value or "").strip()
+    try:
+        parsed = urlparse(candidate)
+    except (TypeError, ValueError):
+        return ""
+    if (
+        parsed.scheme.lower() not in ("http", "https")
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return ""
+    return parsed._replace(fragment="").geturl()
+
+
 def fetch_feed(fi: dict) -> list:
     arts = []
     name = fi["name"]
@@ -1444,7 +1599,7 @@ def fetch_feed(fi: dict) -> list:
         cutoff  = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS)
         for e in parsed.entries[:MAX_PER]:
             title   = getattr(e, "title",   "").strip()
-            link    = getattr(e, "link",    "").strip()
+            link    = _public_http_url(getattr(e, "link", ""))
             summary = re.sub(r"<[^>]+>", "", getattr(e, "summary", ""))[:500]
             if not title or not link: continue
             pub, publication_date_verified = _parse_dt(e)
@@ -1574,7 +1729,7 @@ def refresh_news():
         cache["fetch_errors"] = errors
         cache["fetch_stats"]  = stats
         cache["dup_removed"]  = dup_count
-    logger.info("Refreshed v8: %d articles (deduped %d from %d raw), failed: %s",
+    logger.info("Refreshed legacy scoring schema: %d articles (deduped %d from %d raw), failed: %s",
                 len(all_arts), dup_count, before, errors)
 
 # ══════════════════════════════════════════════════════════════
@@ -1587,28 +1742,57 @@ def login():
         return redirect(url_for("index"))
     if request.method == "POST":
         token = (request.form.get("token") or "").strip()
+        desktop_bootstrap = (request.form.get("desktop_bootstrap") or "").strip()
         ip = _get_ip()
         # 登录速率限制：5次/分钟
         if not _check_rate("login:" + ip, limit=5, window=60):
             return "<h3>尝试次数过多，请1分钟后再试</h3>", 429
-        if secrets.compare_digest(token, ACCESS_TOKEN) or auth_devices.verify_device_token(token):
+        authenticated = False
+        if desktop_bootstrap and _consume_desktop_bootstrap_token(desktop_bootstrap):
+            # 一次性能力仅用于让受信桌面壳建立 HttpOnly 会话；
+            # 长期 master token 不进入 fragment、DOM 或 JavaScript。
+            authenticated = True
+        elif _is_raw_auth_token_valid(token):
+            authenticated = True
+        if authenticated:
+            session_token = _issue_auth_session()
+            if not session_token:
+                return "<h3>安全会话容量已满，请稍后重试</h3>", 503
             resp = make_response(redirect(url_for("index")))
             _is_https = request.headers.get("X-Forwarded-Proto", "http") == "https"
             csrf_token = secrets.token_urlsafe(32)
-            # cookie 存呈现的 token（master 或设备 token 均可，逐请求校验）
-            resp.set_cookie(AUTH_COOKIE, token,
-                            httponly=True, samesite="Strict", max_age=86400 * 7,
+            # cookie 仅存短期随机 session capability；即使回环地址上的其它
+            # 端口收到该 host cookie，也不会获得长期 master/device credential。
+            resp.set_cookie(AUTH_COOKIE, session_token,
+                            httponly=True, samesite="Strict",
+                            max_age=AUTH_SESSION_TTL_SECONDS,
                             secure=_is_https)
             resp.set_cookie(CSRF_COOKIE, csrf_token,
-                            httponly=False, samesite="Strict", max_age=86400 * 7,
+                            httponly=False, samesite="Strict",
+                            max_age=AUTH_SESSION_TTL_SECONDS,
                             secure=_is_https)
             return resp
-        return render_template("login.html", error="令牌错误，请重新输入")
-    return render_template("login.html", error=None)
+        return render_template(
+            "login.html",
+            error="令牌错误，请重新输入",
+            desktop_bootstrap_enabled=_DESKTOP_BOOTSTRAP_ENABLED,
+        )
+    return render_template(
+        "login.html",
+        error=None,
+        desktop_bootstrap_enabled=_DESKTOP_BOOTSTRAP_ENABLED,
+    )
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """Avoid a noisy browser 404 without exposing an unauthenticated asset."""
+    return Response(status=204)
 
 @app.route("/logout")
 def logout():
     _clear_active_cloud_ai_credentials()
+    _revoke_auth_session(request.cookies.get(AUTH_COOKIE) or "")
     resp = make_response(redirect(url_for("login" if AUTH_REQUIRED else "index")))
     resp.delete_cookie(AUTH_COOKIE)
     resp.delete_cookie(CSRF_COOKIE)
@@ -1638,7 +1822,12 @@ def api_auth_devices_revoke(dev_id):
 
 @app.route("/")
 @require_auth
-def index(): return render_template("index.html")
+def index():
+    return render_template(
+        "index.html",
+        product_version=PRODUCT_VERSION.semantic_version,
+        display_version=PRODUCT_VERSION.display_version,
+    )
 
 @app.route("/api/news")
 @require_auth
@@ -1697,7 +1886,13 @@ def api_thinktanks(): return jsonify({"data": THINK_TANK_DIRECTORY})
 @require_auth
 def api_status():
     with cache_lock:
-        return jsonify({"status": "online", "version": "8.0",
+        return jsonify({"status": "online",
+                        "version": PRODUCT_VERSION.semantic_version,
+                        "display_version": PRODUCT_VERSION.display_version,
+                        "release_tag": PRODUCT_VERSION.release_tag,
+                        "release_baseline": PRODUCT_VERSION.release_baseline,
+                        "build_commit": current_build_commit(),
+                        "wire_compatibility": "mvp-wire-v1",
                         "cached_articles": len(cache["news"]),
                         "last_update": cache["last_update"],
                         "feeds_configured": len(RSS_FEEDS),
@@ -4754,7 +4949,7 @@ def _build_consult_source_pack_zip(session: dict, content: str) -> tuple[BytesIO
         zf.writestr(pdf_name, pdf_buf.getvalue())
         for idx, asset in enumerate(assets, 1):
             payload = asset.get("payload") or {}
-            manifest_assets.append({
+            manifest_asset = {
                 "asset_id": asset.get("asset_id"),
                 "evidence_id": asset.get("evidence_id"),
                 "title": payload.get("title") or "",
@@ -4765,33 +4960,37 @@ def _build_consult_source_pack_zip(session: dict, content: str) -> tuple[BytesIO
                 "word_count": asset.get("word_count"),
                 "checksum": asset.get("checksum"),
                 "failure_reason": asset.get("failure_reason"),
-                "local_path": asset.get("local_path"),
-                "text_path": asset.get("text_path"),
-            })
+                "archive_members": {},
+            }
             if asset.get("status") != "archived":
+                manifest_assets.append(manifest_asset)
                 continue
             text_path = asset.get("text_path") or ""
             if text_path and os.path.exists(text_path):
                 safe_title = _safe_filename(payload.get("title") or asset.get("evidence_id") or f"source_{idx}", 46)
+                text_member = f"sources/{idx:03d}_{safe_title}.txt"
                 try:
-                    zf.write(text_path, f"sources/{idx:03d}_{safe_title}.txt")
+                    zf.write(text_path, text_member)
+                    manifest_asset["archive_members"]["text"] = text_member
                 except Exception:
                     pass
             local_path = asset.get("local_path") or ""
             if local_path and os.path.exists(local_path):
                 safe_title = _safe_filename(payload.get("title") or asset.get("evidence_id") or f"source_{idx}", 38)
                 ext = os.path.splitext(local_path)[1] or ".bin"
+                original_member = f"sources/originals/{idx:03d}_{safe_title}{ext}"
                 try:
-                    zf.write(local_path, f"sources/originals/{idx:03d}_{safe_title}{ext}")
+                    zf.write(local_path, original_member)
+                    manifest_asset["archive_members"]["original"] = original_member
                 except Exception:
                     pass
+            manifest_assets.append(manifest_asset)
         manifest = {
             "session_id": session.get("session_id"),
             "instruction": session.get("instruction"),
             "topic": session.get("topic"),
             "target_source_count": session.get("target_source_count"),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "source_archive_path": consulting_agent.source_archive_root(session.get("session_id")) if session.get("session_id") else "",
             "assets": manifest_assets,
         }
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -6493,22 +6692,29 @@ def _extract_file_text(file_storage) -> dict:
                 text = raw.decode("utf-8", errors="replace")
         return {"title": os.path.splitext(file_storage.filename)[0], "body": text.strip()[:8000]}
     elif filename.endswith(".docx"):
-        from docx import Document as DocxDocument
-        doc = DocxDocument(file_storage)
-        text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        file_storage.seek(0)
+        raw = file_storage.read()
+        try:
+            text = document_safety.extract_docx_text_safe(
+                raw,
+                max_chars=8000,
+                include_tables=True,
+            )
+        except document_safety.DocumentSafetyError as exc:
+            raise ValueError(f"文件未通过安全检查：{exc.code}") from None
         title = text.split("\n")[0][:100] if text else file_storage.filename
         return {"title": title, "body": text.strip()[:8000]}
     elif filename.endswith(".pdf"):
-        import pdfplumber
         file_storage.seek(0)
-        buf = BytesIO(file_storage.read())
-        text_parts = []
-        with pdfplumber.open(buf) as pdf:
-            for page in pdf.pages[:20]:  # 限制20页
-                page_text = page.extract_text()
-                if page_text:
-                    text_parts.append(page_text)
-        text = "\n".join(text_parts)
+        raw = file_storage.read()
+        try:
+            text = document_safety.extract_pdf_text_isolated(
+                raw,
+                max_pages=20,
+                max_chars=8000,
+            )
+        except document_safety.DocumentSafetyError as exc:
+            raise ValueError(f"文件未通过安全检查：{exc.code}") from None
         title = text.split("\n")[0][:100] if text else file_storage.filename
         return {"title": title, "body": text.strip()[:8000]}
     else:
@@ -6776,7 +6982,10 @@ if __name__ == "__main__":
     _start_scheduler_once(force=True)
     total_sites = sum(len(c["sites"]) for c in THINK_TANK_DIRECTORY)
     print("\n" + "="*60)
-    print("  [OK]  Defense Tracker v8.0 Priority Scoring Edition")
+    print(
+        f"  [OK]  Defense Tracker {PRODUCT_VERSION.display_version} "
+        f"{PRODUCT_VERSION.semantic_version} · legacy scoring schema"
+    )
     print("  [>>]  http://%s:5000" % BIND_HOST)
     print("  [DB]  %d sites · %d categories" % (total_sites, len(THINK_TANK_DIRECTORY)))
     print("  [RSS] %d feeds · %d-day window" % (len(RSS_FEEDS), NEWS_DAYS))

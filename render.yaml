@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r deploy/requirements.cloud.txt
-    startCommand: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 30 v9_cloud:app
+    startCommand: DEFENSE_TRACKER_BUILD_COMMIT=$RENDER_GIT_COMMIT gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 30 v9_cloud:app
     healthCheckPath: /ready
     envVars:
       - key: V9_PRODUCTION_MODE
@@ -13,8 +13,16 @@ services:
         sync: false
       - key: V9_SUPABASE_PUBLISHABLE_KEY
         sync: false
+      - key: FEISHU_APP_ID
+        sync: false
       - key: FEISHU_VERIFY_TOKEN
         sync: false
+      - key: FEISHU_ENCRYPT_KEY
+        sync: false
+      - key: FEISHU_TENANT_KEY
+        sync: false
+      - key: FEISHU_DEDUPE_DB
+        value: /data/feishu-event-dedupe.sqlite3
       - key: V9_COORDINATOR_TOKEN
         sync: false
       - key: V9_ALLOWED_ORIGINS

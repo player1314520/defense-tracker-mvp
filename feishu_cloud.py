@@ -11,7 +11,11 @@
   AI_API_KEY             AI 服务 API Key
 
 环境变量（选填）：
-  FEISHU_VERIFY_TOKEN    飞书事件验证 Token（推荐配置，防伪造）
+  FEISHU_VERIFY_TOKEN    飞书事件 Verification Token（webhook 必填）
+  FEISHU_ENCRYPT_KEY     飞书事件 Encrypt Key（生产签名必填）
+  FEISHU_TENANT_KEY      允许的租户 Key（生产身份绑定必填）
+  FEISHU_EVENT_LEASE_SECONDS  后台任务租约秒数（默认 900，范围 30-3600）
+  FEISHU_WEBHOOK_ALLOW_TOKEN_ONLY=1  仅本地开发兼容旧 token-only 回调
   AI_BASE_URL            AI 服务地址（默认 https://api.deepseek.com）
   AI_MODEL               模型名称（默认 deepseek-chat）
   PORT                   监听端口（默认 5000）
@@ -24,7 +28,17 @@ RSS 自动推送（选填）：
 ═══════════════════════════════════════════════════════
 """
 
-import base64, hashlib, hmac, ipaddress, json, logging, os, re, socket, sys, threading, time
+import base64
+import hmac
+import ipaddress
+import json
+import logging
+import os
+import re
+import socket
+import sys
+import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
@@ -44,18 +58,24 @@ from feishu_common import (
     ascii_fallback_name as _ascii_fallback_name,
     sanitize_feishu_filename as _sanitize_feishu_filename,
 )
+from document_safety import DocumentSafetyError, extract_docx_text_safe, extract_pdf_text_isolated
+from feishu_webhook_security import (
+    WebhookMisconfigured,
+    WebhookRejected,
+    MAX_WEBHOOK_BODY_BYTES,
+    acquire_event_lease,
+    decrypt_event_payload,
+    submit_leased_event,
+    token_only_development_enabled,
+    validate_event_identity,
+    verify_signed_request,
+)
 
 try:
     import trafilatura
     _HAS_TRAFILATURA = True
 except ImportError:
     _HAS_TRAFILATURA = False
-
-try:
-    import pdfplumber
-    _HAS_PDFPLUMBER = True
-except ImportError:
-    _HAS_PDFPLUMBER = False
 
 # ════════════════════════════════════════════════════════════
 # 日志 & Flask
@@ -64,6 +84,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("feishu_cloud")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_WEBHOOK_BODY_BYTES
 
 # ════════════════════════════════════════════════════════════
 # 配置
@@ -72,6 +93,8 @@ FEISHU_CONFIG = {
     "app_id":       os.environ.get("FEISHU_APP_ID", ""),
     "app_secret":   os.environ.get("FEISHU_APP_SECRET", ""),
     "verify_token": os.environ.get("FEISHU_VERIFY_TOKEN", ""),
+    "encrypt_key":  os.environ.get("FEISHU_ENCRYPT_KEY", ""),
+    "tenant_key":   os.environ.get("FEISHU_TENANT_KEY", ""),
 }
 
 AI_CONFIG = {
@@ -88,6 +111,20 @@ FEISHU_API = "https://open.feishu.cn/open-apis"
 # 全局线程池（替代无限 daemon thread，防止线程爆炸）
 # ════════════════════════════════════════════════════════════
 _worker_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="feishu_worker")
+
+
+def _queue_webhook_job(event_lease, function, *args) -> bool:
+    try:
+        submit_leased_event(_worker_pool, event_lease, function, *args)
+        return True
+    except WebhookMisconfigured as exc:
+        logger.error("webhook dispatch unavailable (%s)", exc.code)
+        return False
+
+
+def _ack_webhook_event(event_lease):
+    event_lease.complete()
+    return jsonify({"code": 0})
 
 # ════════════════════════════════════════════════════════════
 # RSS 自动推送配置
@@ -278,37 +315,6 @@ _BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
 }
-
-# ════════════════════════════════════════════════════════════
-# 消息去重 & 签名校验
-# ════════════════════════════════════════════════════════════
-_seen_msg_ids: OrderedDict = OrderedDict()  # msg_id → timestamp，有序淘汰
-_seen_lock = threading.Lock()
-_MAX_SEEN = 500
-
-
-def _is_new_message(msg_id: str) -> bool:
-    if not msg_id:
-        return True
-    with _seen_lock:
-        if msg_id in _seen_msg_ids:
-            return False
-        _seen_msg_ids[msg_id] = time.time()
-        # 淘汰最旧的条目（FIFO，OrderedDict 保证插入顺序）
-        while len(_seen_msg_ids) > _MAX_SEEN:
-            _seen_msg_ids.popitem(last=False)
-    return True
-
-
-def _verify_signature(timestamp: str, nonce: str, body: bytes) -> bool:
-    token = str(FEISHU_CONFIG.get("verify_token") or "").strip()
-    incoming = request.headers.get("X-Lark-Signature", "")
-    if not all((token, timestamp, nonce, incoming)):
-        return False
-    key = (timestamp + nonce + token).encode("utf-8") + body
-    sig = hashlib.sha256(key).hexdigest()
-    return hmac.compare_digest(sig, incoming)
-
 
 # ════════════════════════════════════════════════════════════
 # SSRF 防护
@@ -752,25 +758,23 @@ def _download_feishu_file(message_id: str, file_key: str) -> bytes:
 
 
 def _extract_pdf_text(pdf_bytes: bytes) -> str:
-    """从 PDF 二进制数据提取文本"""
-    if not _HAS_PDFPLUMBER:
-        return ""
-    text_parts = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages[:20]:
-            page_text = page.extract_text()
-            if page_text:
-                text_parts.append(page_text)
-    text = "\n".join(text_parts)
-    return text[:8000] if text else ""
+    """在可终止的受限子进程中提取 PDF 文本。"""
+    return extract_pdf_text_isolated(
+        pdf_bytes,
+        max_pages=20,
+        max_chars=8000,
+        max_input_bytes=MAX_FEISHU_DOWNLOAD_BYTES,
+    )
 
 
 def _extract_docx_text(docx_bytes: bytes) -> str:
-    """从 DOCX 二进制数据提取文本（python-docx）"""
-    doc = DocxDocument(BytesIO(docx_bytes))
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    text = "\n".join(paragraphs)
-    return text[:8000] if text else ""
+    """先检查 ZIP 展开边界，再交给 python-docx。"""
+    return extract_docx_text_safe(
+        docx_bytes,
+        max_chars=8000,
+        include_tables=False,
+        max_input_bytes=MAX_FEISHU_DOWNLOAD_BYTES,
+    )
 
 
 def _extract_text_file(file_bytes: bytes) -> str:
@@ -1897,8 +1901,8 @@ def _process_async(chat_id: str, text: str):
             file_key = upload_file(file_name, docx_bytes)
             send_file(chat_id, file_key)
         except Exception as docx_err:
-            logger.error("DOCX生成/发送失败: %s", docx_err, exc_info=True)
-            send_text(chat_id, f"要讯文本已生成，但DOCX发送失败：{str(docx_err)[:100]}")
+            logger.error("DOCX generation or upload failed (%s)", type(docx_err).__name__)
+            send_text(chat_id, "要讯文本已生成，但DOCX发送失败")
 
         # 写入缓存 + 历史
         if url:
@@ -1906,9 +1910,9 @@ def _process_async(chat_id: str, text: str):
         _history_add(source_info.get("title", ""), source_info.get("source", ""),
                      source_info.get("url", ""), result)
 
-    except Exception as e:
-        logger.error("处理消息异常: %s", e, exc_info=True)
-        send_card(chat_id, _build_error_card(f"处理异常：{str(e)[:120]}"))
+    except Exception as exc:
+        logger.error("message processing failed (%s)", type(exc).__name__)
+        send_card(chat_id, _build_error_card("处理失败"))
 
 
 def _process_image_async(chat_id: str, image_key: str):
@@ -1960,24 +1964,21 @@ def _process_image_async(chat_id: str, image_key: str):
             ],
         })
         _history_add("图片识别", "图片导入", "", result)
-    except Exception as e:
-        logger.error("图片处理异常: %s", e, exc_info=True)
-        send_card(chat_id, _build_error_card(f"图片处理失败：{str(e)[:120]}"))
+    except Exception as exc:
+        logger.error("image processing failed (%s)", type(exc).__name__)
+        send_card(chat_id, _build_error_card("图片处理失败"))
 
 
 def _process_file_async(chat_id: str, message_id: str, file_key: str, file_name: str):
     """处理文件消息：下载文件 → 提取文字 → 生成要讯。
-    支持：PDF、DOCX、DOC、TXT、MD、Markdown"""
+    支持：PDF、DOCX、TXT、MD、Markdown。旧二进制 DOC 不进入 OOXML 解析器。"""
     try:
         lower = file_name.lower()
         _PDF_EXTS = (".pdf",)
-        _DOCX_EXTS = (".docx", ".doc")
+        _DOCX_EXTS = (".docx",)
         _TEXT_EXTS = (".txt", ".md", ".markdown")
 
         if lower.endswith(_PDF_EXTS):
-            if not _HAS_PDFPLUMBER:
-                send_text(chat_id, "PDF 解析库未安装，请联系管理员安装 pdfplumber")
-                return
             send_text(chat_id, f"正在解析 PDF：{file_name}…")
             file_bytes = _download_feishu_file(message_id, file_key)
             text = _extract_pdf_text(file_bytes)
@@ -1997,7 +1998,7 @@ def _process_file_async(chat_id: str, message_id: str, file_key: str, file_name:
             send_text(
                 chat_id,
                 f"不支持的文件格式（.{ext}），收到：{file_name}\n"
-                "支持格式：PDF、DOCX、DOC、TXT、MD"
+                "支持格式：PDF、DOCX、TXT、MD"
             )
             return
 
@@ -2033,9 +2034,15 @@ def _process_file_async(chat_id: str, message_id: str, file_key: str, file_name:
             ],
         })
         _history_add(file_name, source_type, "", result)
-    except Exception as e:
-        logger.error("文件处理异常: %s", e, exc_info=True)
-        send_card(chat_id, _build_error_card(f"文件处理失败：{str(e)[:120]}"))
+    except DocumentSafetyError as exc:
+        logger.warning("untrusted document rejected (%s)", exc.code)
+        send_card(chat_id, _build_error_card(f"文件被安全策略拒绝（{exc.code}）"))
+    except requests.RequestException:
+        logger.warning("feishu file download or upstream request failed")
+        send_card(chat_id, _build_error_card("文件下载或上游服务请求失败"))
+    except Exception as exc:
+        logger.error("file processing failed (%s)", type(exc).__name__)
+        send_card(chat_id, _build_error_card("文件处理失败"))
 
 
 _RENAME_INTENT_RE = re.compile(
@@ -2081,9 +2088,9 @@ def _refine_async(chat_id: str, instruction: str):
         session["messages"] = messages + [{"role": "assistant", "content": result}]
         _session_set(chat_id, session)
         send_card(chat_id, _build_brief_card(result, session["source_info"], evidence))
-    except Exception as e:
-        logger.error("细化要讯异常: %s", e, exc_info=True)
-        send_card(chat_id, _build_error_card(f"调整失败：{str(e)[:120]}"))
+    except Exception as exc:
+        logger.error("brief refinement failed (%s)", type(exc).__name__)
+        send_card(chat_id, _build_error_card("调整失败"))
 
 
 def _export_docx_async(chat_id: str):
@@ -2110,9 +2117,9 @@ def _export_docx_async(chat_id: str):
             file_name = f"要讯_{title_short}_{ts}.docx"
         file_key = upload_file(file_name, docx_bytes)
         send_file(chat_id, file_key)
-    except Exception as e:
-        logger.error("DOCX导出失败: %s", e, exc_info=True)
-        send_text(chat_id, f"DOCX导出失败：{str(e)[:100]}")
+    except Exception as exc:
+        logger.error("DOCX export failed (%s)", type(exc).__name__)
+        send_text(chat_id, "DOCX导出失败")
 
 
 def _regenerate_async(chat_id: str):
@@ -2153,9 +2160,9 @@ def _regenerate_async(chat_id: str):
                 {"role": "assistant", "content": result},
             ],
         })
-    except Exception as e:
-        logger.error("重新生成异常: %s", e, exc_info=True)
-        send_card(chat_id, _build_error_card(f"重新生成失败：{str(e)[:120]}"))
+    except Exception as exc:
+        logger.error("brief regeneration failed (%s)", type(exc).__name__)
+        send_card(chat_id, _build_error_card("重新生成失败"))
 
 
 # ════════════════════════════════════════════════════════════
@@ -2407,12 +2414,35 @@ def api_cache_stats():
 @app.route("/api/feishu/webhook", methods=["POST"])
 def feishu_webhook():
     """飞书事件订阅回调入口"""
+    if request.content_length is not None and request.content_length > MAX_WEBHOOK_BODY_BYTES:
+        return jsonify({"code": 1, "msg": "webhook body too large"}), 413
     raw_body = request.get_data()
+    if len(raw_body) > MAX_WEBHOOK_BODY_BYTES:
+        return jsonify({"code": 1, "msg": "webhook body too large"}), 413
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook payload"}), 400
     verify_token = str(FEISHU_CONFIG.get("verify_token") or "").strip()
     if not verify_token:
         logger.error("webhook verification token is not configured")
         return jsonify({"code": 1, "msg": "webhook verification not configured"}), 503
+
+    allow_legacy = token_only_development_enabled()
+    signing_key = str(FEISHU_CONFIG.get("encrypt_key") or "").strip()
+    try:
+        verify_signed_request(
+            request.headers,
+            raw_body,
+            signing_key=signing_key,
+            allow_token_only=allow_legacy,
+        )
+        data = decrypt_event_payload(data, encrypt_key=signing_key)
+    except WebhookRejected as exc:
+        logger.warning("webhook signature rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "invalid webhook signature"}), 403
+    except WebhookMisconfigured as exc:
+        logger.error("webhook security unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook security not configured"}), 503
 
     # URL 验证（首次注册 webhook 时飞书发来）
     if data.get("type") == "url_verification":
@@ -2420,34 +2450,47 @@ def feishu_webhook():
         if not hmac.compare_digest(verify_token, incoming_token):
             logger.warning("URL verification token invalid")
             return jsonify({"code": 1, "msg": "invalid token"}), 403
+        challenge = data.get("challenge", "")
+        if not isinstance(challenge, str) or len(challenge) > 1024:
+            return jsonify({"code": 1, "msg": "invalid challenge"}), 400
         logger.info("URL verification OK")
-        return jsonify({"challenge": data.get("challenge", "")})
-
-    # 签名校验：仅当飞书启用加密/签名、发来 X-Lark-Signature 时强制（默认 token 模式无此头，
-    # 走下面的明文 verify_token 校验，行为不变）。此前 _verify_signature 定义却从未接线，
-    # 等于签名防伪形同虚设；此处按"有签名才校验"接线，签名模式下生效、token 模式零影响。
-    if request.headers.get("X-Lark-Signature"):
-        timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
-        nonce = request.headers.get("X-Lark-Request-Nonce", "")
-        if not _verify_signature(timestamp, nonce, raw_body):
-            logger.warning("X-Lark-Signature 校验失败，请求被拒绝")
-            return jsonify({"code": 1, "msg": "invalid signature"}), 403
+        return jsonify({"challenge": challenge})
 
     # 事件处理（schema 2.0）
-    header = data.get("header", {})
-    event_type = header.get("event_type", "")
+    header = data.get("header")
+    if not isinstance(header, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 400
 
     # Verification Token 校验（飞书在 header.token 中传入）
     incoming_token = str(header.get("token") or "")
     if not hmac.compare_digest(verify_token, incoming_token):
         logger.warning("Verification Token 校验失败，请求被拒绝")
         return jsonify({"code": 1, "msg": "invalid token"}), 403
-    event = data.get("event", {})
+    try:
+        validate_event_identity(
+            data,
+            expected_app_id=str(FEISHU_CONFIG.get("app_id") or "").strip(),
+            expected_tenant_key=str(FEISHU_CONFIG.get("tenant_key") or "").strip(),
+            allow_legacy=allow_legacy,
+        )
+    except WebhookRejected as exc:
+        logger.warning("webhook identity rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "invalid webhook identity"}), 403
+    except WebhookMisconfigured as exc:
+        logger.error("webhook identity unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook identity not configured"}), 503
+
+    event_type = header.get("event_type", "")
+    event = data.get("event")
+    if not isinstance(event, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 400
 
     if event_type != "im.message.receive_v1":
         return jsonify({"code": 0})
 
-    message = event.get("message", {})
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 400
     msg_type = message.get("message_type", "")
     chat_id = message.get("chat_id", "")
     msg_id = message.get("message_id", "")
@@ -2455,9 +2498,17 @@ def feishu_webhook():
     if not chat_id:
         return jsonify({"code": 0})
 
-    # 去重
-    if not _is_new_message(msg_id):
-        logger.info("重复消息 %s，跳过", msg_id)
+    # 持久租约：处理中/已完成事件去重，崩溃后由过期租约接管。
+    try:
+        event_lease = acquire_event_lease(data, allow_legacy=allow_legacy)
+    except WebhookRejected as exc:
+        logger.warning("webhook event rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 403
+    except WebhookMisconfigured as exc:
+        logger.error("webhook deduplication unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook deduplication unavailable"}), 503
+    if event_lease is None:
+        logger.info("in-flight or completed webhook event skipped")
         return jsonify({"code": 0})
 
     # ── 图片消息处理 ─────────────────────────────────
@@ -2465,10 +2516,13 @@ def feishu_webhook():
         try:
             content = json.loads(message.get("content", "{}"))
             image_key = content.get("image_key", "")
-            if image_key:
-                _worker_pool.submit(_process_image_async, chat_id, image_key)
         except Exception:
-            logger.warning("图片消息解析失败: msg_id=%s", msg_id)
+            logger.warning("图片消息解析失败")
+            return _ack_webhook_event(event_lease)
+        if not image_key:
+            return _ack_webhook_event(event_lease)
+        if not _queue_webhook_job(event_lease, _process_image_async, chat_id, image_key):
+            return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
         return jsonify({"code": 0})
 
     # ── 文件消息处理（PDF）─────────────────────────────
@@ -2477,21 +2531,26 @@ def feishu_webhook():
             content = json.loads(message.get("content", "{}"))
             file_key = content.get("file_key", "")
             file_name = content.get("file_name", "")
-            if file_key:
-                _worker_pool.submit(_process_file_async, chat_id, msg_id, file_key, file_name)
         except Exception:
-            logger.warning("文件消息解析失败: msg_id=%s", msg_id)
+            logger.warning("文件消息解析失败")
+            return _ack_webhook_event(event_lease)
+        if not file_key:
+            return _ack_webhook_event(event_lease)
+        if not _queue_webhook_job(
+            event_lease, _process_file_async, chat_id, msg_id, file_key, file_name,
+        ):
+            return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
         return jsonify({"code": 0})
 
     if msg_type != "text":
         send_text(chat_id, "支持：文字/链接/图片/PDF文件。发送「帮助」查看说明。")
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     try:
         content = json.loads(message.get("content", "{}"))
         text = content.get("text", "").strip()
     except Exception:
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     # ── @机器人 群聊支持：剥离 @mention 占位符 ──────────
     mentions = content.get("mentions") if isinstance(content, dict) else None
@@ -2504,14 +2563,14 @@ def feishu_webhook():
     # 群聊中如果没有 @机器人，则不处理（避免干扰正常聊天）
     chat_type = message.get("chat_type", "")
     if chat_type == "group" and not mentions:
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     if not text:
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     if text in ["帮助", "help", "?", "？", "/help"]:
         send_text(chat_id, HELP_TEXT)
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     # ── RSS 推送控制指令 ────────────────────────────
     if text in ["订阅", "subscribe"]:
@@ -2522,17 +2581,18 @@ def feishu_webhook():
                   f"模式：{PUSH_CONFIG['mode']}　间隔：{PUSH_CONFIG['interval_min']}分钟\n"
                   f"每轮最多推送 {PUSH_CONFIG['max_articles']} 篇\n\n"
                   f"发送「扫描」立即执行一次")
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     if text in ["取消订阅", "unsubscribe"]:
         PUSH_CONFIG["chat_id"] = ""
         send_text(chat_id, "已关闭自动情报推送")
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     if text in ["扫描", "scan"]:
         send_text(chat_id, "正在扫描 15 个核心 RSS 源...")
         PUSH_CONFIG["chat_id"] = chat_id
-        _worker_pool.submit(_rss_push_job)
+        if not _queue_webhook_job(event_lease, _rss_push_job):
+            return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
         return jsonify({"code": 0})
 
     if text in ["状态", "status"]:
@@ -2547,18 +2607,18 @@ def feishu_webhook():
                   f"  历史记录：{len(_history)} 条\n"
                   f"  AI模型：{AI_CONFIG['model']}\n"
                   f"  trafilatura：{'可用' if _HAS_TRAFILATURA else '未安装'}\n"
-                  f"  PDF解析：{'可用' if _HAS_PDFPLUMBER else '未安装'}")
-        return jsonify({"code": 0})
+                  "  PDF解析：受限子进程（解析器缺失时安全拒绝）")
+        return _ack_webhook_event(event_lease)
 
     if text in ["brief模式", "brief"]:
         PUSH_CONFIG["mode"] = "brief"
         send_text(chat_id, "已切换为 brief 模式（AI生成完整要讯，消耗token）")
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     if text in ["headlines模式", "headlines"]:
         PUSH_CONFIG["mode"] = "headlines"
         send_text(chat_id, "已切换为 headlines 模式（仅推送标题摘要，免费）")
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     # ── 文件名重命名意图（无论有无会话都可识别）────────────
     rename_to = _try_extract_rename(text)
@@ -2582,7 +2642,7 @@ def feishu_webhook():
                 f"已记录文件名「{sanitized}」（目前没有进行中的会话）。\n"
                 "请接着发送文章链接或正文，生成的要讯会自动使用该文件名导出。"
             )
-        return jsonify({"code": 0})
+        return _ack_webhook_event(event_lease)
 
     # ── 交互会话路由（在其他命令之后、文章生成之前检查）──────
     session = _session_get(chat_id)
@@ -2594,32 +2654,36 @@ def feishu_webhook():
         elif text in ["完成", "done", "结束", "exit", "退出", "取消", "cancel"]:
             _session_clear(chat_id)
             send_text(chat_id, "已退出要讯优化会话。如需生成新要讯，请发送文章或链接。")
-            return jsonify({"code": 0})
+            return _ack_webhook_event(event_lease)
         elif text in ["导出", "export", "发docx", "DOCX", "docx", "发DOCX"]:
-            _worker_pool.submit(_export_docx_async, chat_id)
+            if not _queue_webhook_job(event_lease, _export_docx_async, chat_id):
+                return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
             return jsonify({"code": 0})
         elif text in ["查看", "预览", "show", "preview"]:
             evidence = session.get("evidence")
             if not evidence:
                 send_text(chat_id, "当前会话缺少原始素材证据，已阻止预览；请重新生成要讯。")
-                return jsonify({"code": 0})
+                return _ack_webhook_event(event_lease)
             if not _validate_brief_before_send(chat_id, session["current_draft"], evidence):
-                return jsonify({"code": 0})
+                return _ack_webhook_event(event_lease)
             send_card(
                 chat_id,
                 _build_brief_card(session["current_draft"], session["source_info"], evidence),
             )
-            return jsonify({"code": 0})
+            return _ack_webhook_event(event_lease)
         elif text in ["重新生成", "重写", "重来", "regenerate", "重置"]:
-            _worker_pool.submit(_regenerate_async, chat_id)
+            if not _queue_webhook_job(event_lease, _regenerate_async, chat_id):
+                return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
             return jsonify({"code": 0})
         else:
             # 任意其他文字 → 视为细化指令
-            _worker_pool.submit(_refine_async, chat_id, text)
+            if not _queue_webhook_job(event_lease, _refine_async, chat_id, text):
+                return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
             return jsonify({"code": 0})
 
     # ── 文章生成（异步线程池，立即返回 200）────────────────
-    _worker_pool.submit(_process_async, chat_id, text)
+    if not _queue_webhook_job(event_lease, _process_async, chat_id, text):
+        return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
     return jsonify({"code": 0})
 
 

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Defense Command Hub · 防务数据追踪系统 V9</title>
+  <title>Defense Command Hub · 防务数据追踪系统 {{ display_version }}</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='18' fill='%230b0f14'/><text x='50' y='60' text-anchor='middle' font-size='42' fill='%23d9e2ec' font-family='Arial'>DI</text></svg>">
   <!-- Marked.js (Markdown渲染，用于AI输出，已本地化避免 jsdelivr GFW 单点) -->
   <script nonce="{{ g.csp_nonce }}" src="/static/js/marked.min.js"></script>
@@ -43,7 +43,7 @@
     <div class="ed-mark"><span>追</span></div>
     <div class="ed-title-wrap">
       <span class="logo"><span data-cn="防务数据追踪系统" data-en="Defense Command Hub">防务数据追踪系统</span></span>
-      <span class="tagline">DEFENSE COMMAND HUB · V9 · 闭环</span>
+      <span class="tagline">DEFENSE COMMAND HUB · {{ display_version }} · 闭环</span>
     </div>
   </div>
   <div class="topbar-right">
@@ -1208,7 +1208,7 @@
 
 <footer class="footer">
   <span>
-    防务数据追踪系统 V9 · 情报流入 → 研判建档 → 智能成稿 → 签发交付 · 仅供学习研究
+    防务数据追踪系统 {{ display_version }} · 情报流入 → 研判建档 → 智能成稿 → 签发交付 · 仅供学习研究
   </span>
 </footer>
 

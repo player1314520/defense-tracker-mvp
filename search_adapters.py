@@ -9,31 +9,21 @@ from __future__ import annotations
 import os
 import re
 import ipaddress
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from io import BytesIO
 from typing import Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
+from document_safety import extract_docx_text_safe, extract_pdf_text_isolated
 
 try:
     import trafilatura
 except ImportError:  # pragma: no cover - dependency is optional at runtime
     trafilatura = None
-
-try:
-    import pdfplumber
-except ImportError:  # pragma: no cover - dependency is optional at runtime
-    pdfplumber = None
-
-try:
-    from docx import Document as DocxDocument
-except ImportError:  # pragma: no cover - dependency is optional at runtime
-    DocxDocument = None
-
 
 PROVIDER_PUBLIC_WEB = "public_web"
 PROVIDER_TAVILY = "tavily"
@@ -48,6 +38,54 @@ TAVILY_ENDPOINT = "https://api.tavily.com/search"
 BRAVE_WEB_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 BRAVE_NEWS_ENDPOINT = "https://api.search.brave.com/res/v1/news/search"
 SERPAPI_ENDPOINT = "https://serpapi.com/search.json"
+
+
+class _ApiKeyQueryRedactionFilter(logging.Filter):
+    """Remove query-string credentials from urllib3 diagnostic records."""
+
+    _PATTERN = re.compile(r"(?i)(api_key=)[^&\s\"']+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        rendered = record.getMessage()
+        redacted = self._PATTERN.sub(r"\1[REDACTED]", rendered)
+        if redacted != rendered:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+_urllib3_logger = logging.getLogger("urllib3.connectionpool")
+if not any(isinstance(item, _ApiKeyQueryRedactionFilter) for item in _urllib3_logger.filters):
+    _urllib3_logger.addFilter(_ApiKeyQueryRedactionFilter())
+
+
+class ProviderRequestError(RuntimeError):
+    """Stable provider error that never embeds request URLs or credentials."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def _provider_error_code(exc: BaseException) -> str:
+    if isinstance(exc, ProviderRequestError):
+        return exc.code
+    if isinstance(exc, requests.Timeout):
+        return "UPSTREAM_TIMEOUT"
+    if isinstance(exc, requests.HTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in {401, 403}:
+            return "UPSTREAM_AUTH"
+        if status == 429:
+            return "UPSTREAM_RATE_LIMIT"
+        if isinstance(status, int) and 400 <= status < 500:
+            return "UPSTREAM_REJECTED"
+        return "UPSTREAM_UNAVAILABLE"
+    if isinstance(exc, requests.RequestException):
+        return "UPSTREAM_UNAVAILABLE"
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return "UPSTREAM_INVALID_RESPONSE"
+    return "PROVIDER_FAILURE"
 
 _PROVIDER_ROLES = {
     PROVIDER_PUBLIC_WEB: "基础联网搜索",
@@ -549,15 +587,21 @@ def search_web_multi(
         on_search_calls(len(search_tasks))
 
     def _run(provider: str, query: str):
-        rows = searchers[provider](
-            query,
-            limit=per_call_limit,
-            api_key=keys.get(provider),
-            include_news=include_news,
-            include_raw_content=kwargs.get("include_raw_content", False),
-            search_depth=kwargs.get("search_depth") or "advanced",
-            timeout=kwargs.get("timeout") or (5 if provider == PROVIDER_PUBLIC_WEB else 10),
-        )
+        try:
+            rows = searchers[provider](
+                query,
+                limit=per_call_limit,
+                api_key=keys.get(provider),
+                include_news=include_news,
+                include_raw_content=kwargs.get("include_raw_content", False),
+                search_depth=kwargs.get("search_depth") or "advanced",
+                timeout=kwargs.get("timeout") or (5 if provider == PROVIDER_PUBLIC_WEB else 10),
+            )
+        except Exception as exc:
+            # requests.HTTPError may include the fully prepared URL.  SerpAPI
+            # carries its key in that URL, so only a fixed code may cross this
+            # boundary into API responses, persistence, or logs.
+            raise ProviderRequestError(_provider_error_code(exc)) from None
         return provider, query, rows
 
     workers = max(1, min(int(kwargs.get("search_workers") or 6), len(search_tasks), 10))
@@ -571,7 +615,7 @@ def search_web_multi(
                 for idx, row in enumerate(rows, 1):
                     raw_rows.append(_normalize_result(row, provider, query, idx))
             except Exception as exc:
-                provider_errors[provider] = str(exc)[:240]
+                provider_errors[provider] = _provider_error_code(exc)
 
     seen = set()
     deduped = []
@@ -780,9 +824,31 @@ def _search_serpapi(query: str, limit: int = 10, **kwargs) -> list[dict]:
         "api_key": api_key,
         "num": max(1, min(int(limit or 10), 100)),
     }
-    resp = requests.get(SERPAPI_ENDPOINT, params=params, timeout=int(kwargs.get("timeout") or 20))
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.get(SERPAPI_ENDPOINT, params=params, timeout=int(kwargs.get("timeout") or 20))
+    except Exception as exc:
+        raise ProviderRequestError(_provider_error_code(exc)) from None
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status in {401, 403}:
+        resp.close()
+        raise ProviderRequestError("UPSTREAM_AUTH")
+    if status == 429:
+        resp.close()
+        raise ProviderRequestError("UPSTREAM_RATE_LIMIT")
+    if 400 <= status < 500:
+        resp.close()
+        raise ProviderRequestError("UPSTREAM_REJECTED")
+    if status >= 500:
+        resp.close()
+        raise ProviderRequestError("UPSTREAM_UNAVAILABLE")
+    try:
+        data = resp.json()
+    except Exception:
+        resp.close()
+        raise ProviderRequestError("UPSTREAM_INVALID_RESPONSE") from None
+    resp.close()
+    if not isinstance(data, dict):
+        raise ProviderRequestError("UPSTREAM_INVALID_RESPONSE")
     rows = []
     for item in data.get("organic_results") or []:
         rows.append({
@@ -842,13 +908,12 @@ def extract_html_document(url: str, html: str, max_chars: int = 60000) -> dict:
 
 
 def extract_pdf_document(url: str, content: bytes, max_pages: int = 30, max_chars: int = 60000) -> dict:
-    if not pdfplumber:
-        raise RuntimeError("pdfplumber 未安装，无法提取PDF正文")
-    parts = []
-    with pdfplumber.open(BytesIO(content)) as pdf:
-        for page in pdf.pages[: max(1, int(max_pages or 30))]:
-            parts.append(page.extract_text() or "")
-    text = re.sub(r"\n{3,}", "\n\n", "\n".join(parts)).strip()[:max_chars]
+    extracted = extract_pdf_text_isolated(
+        content,
+        max_pages=max(1, int(max_pages or 30)),
+        max_chars=max_chars,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", extracted).strip()[:max_chars]
     title = os.path.basename(urlparse(url).path) or "PDF文档"
     return {
         "title": title,
@@ -863,21 +928,8 @@ def extract_pdf_document(url: str, content: bytes, max_pages: int = 30, max_char
 
 
 def extract_docx_document(url: str, content: bytes, max_chars: int = 60000) -> dict:
-    if not DocxDocument:
-        raise RuntimeError("python-docx 未安装，无法提取DOCX正文")
-    docx = DocxDocument(BytesIO(content))
-    parts = []
-    for para in docx.paragraphs:
-        text = (para.text or "").strip()
-        if text:
-            parts.append(text)
-    for table in docx.tables:
-        for row in table.rows:
-            cells = [(cell.text or "").strip() for cell in row.cells]
-            line = " | ".join(cell for cell in cells if cell)
-            if line:
-                parts.append(line)
-    text = re.sub(r"\n{3,}", "\n\n", "\n".join(parts)).strip()[:max_chars]
+    extracted = extract_docx_text_safe(content, max_chars=max_chars, include_tables=True)
+    text = re.sub(r"\n{3,}", "\n\n", extracted).strip()[:max_chars]
     title = os.path.basename(urlparse(url).path) or "DOCX文档"
     return {
         "title": title,

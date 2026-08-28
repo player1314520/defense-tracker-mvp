@@ -2,7 +2,9 @@ import pytest
 import requests
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
+from werkzeug.datastructures import FileStorage
 
 import app as tracker
 
@@ -30,10 +32,236 @@ def _csrf_cookie(client, csrf="csrf-test-token"):
     return csrf
 
 
-def test_api_is_open_without_access_token(client):
+def _auth_cookie_value(response):
+    header = next(
+        value for value in response.headers.getlist("Set-Cookie")
+        if value.startswith(f"{tracker.AUTH_COOKIE}=")
+    )
+    return header, header.split(";", 1)[0].split("=", 1)[1]
+
+
+def _clear_auth_sessions():
+    with tracker._AUTH_SESSION_LOCK:
+        tracker._AUTH_SESSIONS.clear()
+
+
+def test_explicit_test_mode_opens_api_without_access_token(client):
     resp = client.get("/api/status")
     assert resp.status_code == 200
-    assert "cached_articles" in resp.get_json()
+    payload = resp.get_json()
+    assert "cached_articles" in payload
+    assert payload["version"] == tracker.PRODUCT_VERSION.semantic_version
+    assert payload["display_version"] == tracker.PRODUCT_VERSION.display_version
+    assert payload["release_tag"] == tracker.PRODUCT_VERSION.release_tag
+    assert payload["release_baseline"] == tracker.PRODUCT_VERSION.release_baseline
+    assert payload["wire_compatibility"] == "mvp-wire-v1"
+    assert payload["build_commit"] == tracker.current_build_commit()
+
+
+def test_access_token_authentication_is_fail_closed_by_default():
+    assert tracker._parse_access_token_required(None) is True
+    assert tracker._parse_access_token_required("") is True
+    assert tracker._parse_access_token_required("typo") is True
+    assert tracker._parse_access_token_required("1") is True
+    assert tracker._parse_access_token_required("0") is False
+
+
+@pytest.mark.parametrize("unsafe", (
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "file:///C:/secret.txt",
+    "https://user:password@example.test/report",
+    "/relative/source",
+    "",
+))
+def test_public_source_url_rejects_non_http_schemes(unsafe):
+    assert tracker._public_http_url(unsafe) == ""
+
+
+def test_public_source_url_accepts_absolute_http_and_drops_fragment():
+    assert (
+        tracker._public_http_url(" https://example.test/report?q=1#section ")
+        == "https://example.test/report?q=1"
+    )
+
+
+def test_uploaded_pdf_uses_bounded_isolated_document_parser(monkeypatch):
+    payload = b"%PDF-1.7\n1 0 obj <<>> endobj\n%%EOF"
+    captured = {}
+
+    def extract(content, **kwargs):
+        captured["content"] = content
+        captured["kwargs"] = kwargs
+        return "受控PDF标题\n受控PDF正文"
+
+    monkeypatch.setattr(
+        tracker.document_safety,
+        "extract_pdf_text_isolated",
+        extract,
+    )
+    upload = FileStorage(stream=BytesIO(payload), filename="report.pdf")
+
+    result = tracker._extract_file_text(upload)
+
+    assert captured == {
+        "content": payload,
+        "kwargs": {"max_pages": 20, "max_chars": 8000},
+    }
+    assert result == {"title": "受控PDF标题", "body": "受控PDF标题\n受控PDF正文"}
+    assert "import pdfplumber" not in (PROJECT_ROOT / "app.py").read_text(encoding="utf-8")
+
+
+def test_uploaded_docx_uses_validated_bounded_document_parser(monkeypatch):
+    payload = b"PK\x03\x04bounded-test-container"
+    captured = {}
+
+    def extract(content, **kwargs):
+        captured["content"] = content
+        captured["kwargs"] = kwargs
+        return "受控DOCX标题\n表格内容"
+
+    monkeypatch.setattr(
+        tracker.document_safety,
+        "extract_docx_text_safe",
+        extract,
+    )
+    upload = FileStorage(stream=BytesIO(payload), filename="report.docx")
+
+    result = tracker._extract_file_text(upload)
+
+    assert captured == {
+        "content": payload,
+        "kwargs": {"max_chars": 8000, "include_tables": True},
+    }
+    assert result == {"title": "受控DOCX标题", "body": "受控DOCX标题\n表格内容"}
+
+
+@pytest.mark.parametrize(
+    ("filename", "extractor_name", "code"),
+    (
+        ("active.pdf", "extract_pdf_text_isolated", "PDF_ACTIVE_CONTENT"),
+        ("bomb.docx", "extract_docx_text_safe", "DOCX_COMPRESSION_RATIO"),
+    ),
+)
+def test_unsafe_uploaded_documents_fail_with_stable_error(
+    monkeypatch,
+    filename,
+    extractor_name,
+    code,
+):
+    def reject(*_args, **_kwargs):
+        raise tracker.document_safety.DocumentSafetyError(code)
+
+    monkeypatch.setattr(tracker.document_safety, extractor_name, reject)
+    upload = FileStorage(stream=BytesIO(b"unsafe"), filename=filename)
+
+    with pytest.raises(ValueError, match=rf"安全检查：{code}$"):
+        tracker._extract_file_text(upload)
+
+
+def test_bare_loopback_client_cannot_reach_sensitive_api(monkeypatch):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-master-token")
+    protected = tracker.app.test_client()
+
+    response = protected.get("/api/status")
+
+    assert response.status_code == 401
+    assert response.get_json()["error"] == "未授权"
+
+
+def test_favicon_is_empty_and_public_without_console_noise():
+    response = tracker.app.test_client().get("/favicon.ico")
+
+    assert response.status_code == 204
+    assert response.data == b""
+
+
+def test_desktop_bootstrap_is_single_use_and_sets_httponly_session(monkeypatch):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-master-token")
+    monkeypatch.setattr(tracker, "_DESKTOP_BOOTSTRAP_ENABLED", True)
+    monkeypatch.setattr(tracker, "_DESKTOP_BOOTSTRAP_TOKEN", "B" * 43)
+    monkeypatch.setattr(tracker, "_DESKTOP_BOOTSTRAP_USED", False)
+    _clear_auth_sessions()
+    desktop = tracker.app.test_client()
+
+    login = desktop.post("/login", data={"desktop_bootstrap": "B" * 43})
+
+    assert login.status_code == 302
+    auth_cookie, session_token = _auth_cookie_value(login)
+    assert "HttpOnly" in auth_cookie
+    assert f"Max-Age={tracker.AUTH_SESSION_TTL_SECONDS}" in auth_cookie
+    assert session_token != tracker.ACCESS_TOKEN
+    assert tracker.ACCESS_TOKEN not in auth_cookie
+    assert desktop.get("/api/status").status_code == 200
+
+    # A loopback peer may receive host cookies because cookies are not
+    # port-scoped. The leaked opaque session must never double as a long-term
+    # master/device token in the explicit header-auth channel.
+    peer = tracker.app.test_client()
+    assert peer.get(
+        "/api/status",
+        headers={"X-Access-Token": session_token},
+    ).status_code == 401
+
+    replay = tracker.app.test_client().post(
+        "/login",
+        data={"desktop_bootstrap": "B" * 43},
+    )
+    assert replay.status_code == 200
+    assert "令牌错误" in replay.get_data(as_text=True)
+
+
+def test_manual_master_login_exchanges_credential_for_opaque_session(monkeypatch):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "manual-master-token")
+    _clear_auth_sessions()
+    browser = tracker.app.test_client()
+
+    login = browser.post("/login", data={"token": "manual-master-token"})
+
+    assert login.status_code == 302
+    auth_cookie, session_token = _auth_cookie_value(login)
+    assert session_token != "manual-master-token"
+    assert "manual-master-token" not in auth_cookie
+    assert browser.get("/api/status").status_code == 200
+
+    # Raw credentials remain supported only through the explicit header path;
+    # a pre-v9 raw master cookie is deliberately rejected.
+    api_client = tracker.app.test_client()
+    assert api_client.get(
+        "/api/status",
+        headers={"X-Access-Token": "manual-master-token"},
+    ).status_code == 200
+    legacy_cookie = tracker.app.test_client()
+    legacy_cookie.set_cookie(tracker.AUTH_COOKIE, "manual-master-token")
+    assert legacy_cookie.get("/api/status").status_code == 401
+
+
+def test_auth_session_expires_and_logout_revokes_it(monkeypatch):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-master-token")
+    now = [1000.0]
+    monkeypatch.setattr(tracker, "_auth_session_now", lambda: now[0])
+    _clear_auth_sessions()
+    browser = tracker.app.test_client()
+
+    login = browser.post("/login", data={"token": "test-master-token"})
+    _, first_session = _auth_cookie_value(login)
+    assert browser.get("/api/status").status_code == 200
+
+    browser.get("/logout")
+    replay = tracker.app.test_client()
+    replay.set_cookie(tracker.AUTH_COOKIE, first_session)
+    assert replay.get("/api/status").status_code == 401
+
+    second_login = browser.post("/login", data={"token": "test-master-token"})
+    _, second_session = _auth_cookie_value(second_login)
+    now[0] += tracker.AUTH_SESSION_TTL_SECONDS + 1
+    expired = tracker.app.test_client()
+    expired.set_cookie(tracker.AUTH_COOKIE, second_session)
+    assert expired.get("/api/status").status_code == 401
 
 
 def test_static_mjs_uses_javascript_mime_type(client):

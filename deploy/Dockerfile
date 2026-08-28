@@ -8,11 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 仅安装服务器端依赖（去掉 pywebview / pyinstaller）
-COPY requirements.server.txt .
+COPY deploy/requirements.server.txt ./requirements.server.txt
 RUN pip install --no-cache-dir -r requirements.server.txt
 
 # 复制项目文件（app.py 顶层 import 了下列本地模块，必须一并拷入，否则 gunicorn 加载即 ModuleNotFoundError）
-COPY app.py state.py quality.py tracking.py feishu_bot.py feishu_common.py consulting_agent.py report_agent.py search_adapters.py ./
+COPY app.py state.py quality.py tracking.py auth_devices.py feishu_bot.py feishu_common.py consulting_agent.py report_agent.py search_adapters.py product_version.py document_safety.py feishu_webhook_security.py version.json ./
+COPY v9/ v9/
 COPY templates/ templates/
 COPY static/ static/
 

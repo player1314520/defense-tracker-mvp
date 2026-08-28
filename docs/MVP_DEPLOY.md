@@ -82,24 +82,50 @@ query 或 fragment。`preflight.sh` 会从 Compose 的最终展开配置中校�
 并直接读取官方 `.env`，用恒定时间比较仓库外 key 文件、官方单值/JSON map、Kong
 与 Functions 的 `SUPABASE_PUBLISHABLE_KEY`；它不会打印 key。
 
+Auth 的公开 signup 永久保持关闭。允许的重定向地址只能是 Portal 的
+`https://<Portal域名>/portal/`，以及桌面 PKCE 使用的以下五个精确回调；不接受
+通配端口、`localhost` 别名或其他路径：
+
+```text
+http://127.0.0.1:49231/api/v9/auth/callback
+http://127.0.0.1:49232/api/v9/auth/callback
+http://127.0.0.1:49233/api/v9/auth/callback
+http://127.0.0.1:49234/api/v9/auth/callback
+http://127.0.0.1:49235/api/v9/auth/callback
+```
+
 Compose 只把获准的单个 key 文件挂到 Portal 的 `/run/secrets`。Docker 官方文档
 指出 Compose secrets 以逐服务文件挂载方式提供；`portal-entrypoint.sh` 只读取
 固定文件，不枚举或打印秘密。Portal 不接收 service-role、数据库或解密密钥。
 
-MVP 硬上限已固化为 100 个活跃账号、20 个并发请求、每用户每日 1,000 次事件、
-同步单页 500 条。`INVITED_SIGNUP_ENABLED` 在以下门禁全部通过前保持 `false`：
+MVP 硬上限已固化为 100 个活跃账号（active 与有效邀请共同占用席位）、20 个并发请求、
+每用户每个 UTC 日 1,000 个新同步事件、同步单页 500 条。席位由数据库事务内的
+容量账本执行，邀请转为成员沿用同一个 reservation；事件计数由
+`sync_events` 的数据库触发器执行，正式 `push_record_event` 对同一 `event_id` 的
+重试在计数前幂等返回。并发第 101 个席位或第 1,001 个新事件都会 fail-closed，
+不能靠 Portal 按钮禁用替代。`INVITED_SIGNUP_ENABLED` 永久保持 `false`；
+`ACCESS_APPLICATIONS_ENABLED` 在 production 烟雾测试期间也保持 `false`，只有以下
+门禁全部通过后才在公开发布时改为 `true`：
 
 - 自定义 SMTP、SPF/DKIM/DMARC 与退信监控可用；
 - Before User Created Hook 和公共 signup 关闭状态得到核验；
 - 两名真实用户完成邮件、PKCE、设备审批、撤销和跨角色 RLS E2E；
-- 管理员申请审批与 100 人硬上限验证通过。
+- 管理员人工申请审批、邀请链路与 100 席位硬上限验证通过。
+
+匿名申请只进入人工审核队列，不调用 Auth signup，不自动建号，也不自动批准。
+审核通过后仍由固定服务端回调的邀请流程建号；申请、审批和邀请不能绕开角色与
+设备会话校验。
 
 ## 3. 构建、预检与上线
 
 Portal 构建上下文必须由 `scripts/prepare_mvp_portal_context.py` 从干净的 `HEAD`
-生成。它只允许 `v9_cloud.py`、`v9/`、`web/v9-portal/`、Portal Dockerfile、入口
+生成。它只允许 `version.json`、`product_version.py`、`v9_cloud.py`、`v9/`、
+`web/v9-portal/`、Portal Dockerfile、入口
 脚本和最小依赖清单进入 `build/mvp-portal-context`；本地配置、素材、测试、旧
 Flask 工作台和未提交内容不能进入上下文。
+Portal 镜像只允许从已提交的哈希锁文件安装依赖，并使用
+`pip install --require-hashes --only-binary=:all:`；任一传递依赖、平台 wheel 或
+哈希不匹配都必须在镜像构建阶段失败，不能回退为运行时联网解析。
 
 `deploy/mvp/bin/build-portal-image.sh` 要求基础 Python 镜像带完整 SHA-256 摘要，
 并将 Portal 标记为 `<repository>:<40位Git SHA>`。构建前工作树必须完全干净；镜像
@@ -130,7 +156,8 @@ VPS 上线前依次执行：
    digest 与官方 Supabase SHA，并在主机 `MVP_RELEASE_STATE_DIR/backend.*` 留下同值
    状态。已登记迁移发生内容漂移、release 元数据不一致或上次尝试状态不明时会
    fail-closed，不能静默重跑。API 域名只放行 Auth、REST、
-   GraphQL、Realtime、Storage 及两个指定函数路径，其他路径统一 404；默认
+   GraphQL、Realtime、Storage 及两个指定函数路径，其他路径统一 404；Realtime
+   WebSocket 使用单独的 Caddy matcher，供上游 WAF 明确放行 Upgrade；默认
    `hello`、Studio 和管理路由不进入公网。Portal 域名也只放行 `/portal/*`、
    `/health`、`/ready`、根跳转和 favicon。
 3. 运行 `deploy/mvp/bin/preflight.sh /etc/defense-tracker/production.env`。该脚本
@@ -216,26 +243,51 @@ verifier 会核验这些 ACL。这个需要真实登录 session 的成功响应�
    仍与 active backend 完全相同时恢复 current，且从不 image prune。
    `/ready` 需要 Portal 容器访问精确 Supabase HTTPS origin，因此 Portal 同时加入
    一个不承载其他服务的 egress bridge；原有 `portal-internal` 仍为 internal。
-5. 外部再用两名真实账号走一次申请、邮件、登录、设备批准、密文同步、编辑提交、审批签发和
-   撤销流程；观察 15 分钟 5xx、P95、内存、磁盘、邮件失败与同步滞后。
+5. 保持 `ACCESS_APPLICATIONS_ENABLED=false`，先用两名已邀请的真实账号走一次邮件、
+   登录、设备批准、密文同步、编辑提交、审批签发和撤销流程；观察 15 分钟 5xx、
+   P95、内存、磁盘、邮件失败与同步滞后。全部通过后，公开发布时才把申请入口改为
+   `true` 并重启 Portal，再做一次匿名申请到人工邀请的完整验证。
 
 上传限制按层明确：Portal 请求上限 256 KiB；V9 record ciphertext 是
 `16 MiB + 16 byte` AES-GCM tag，Storage 同样限制为 16 MiB 加 tag；同步事件的
 编码 JSON 上限 24 MiB；Caddy API 传输上限 32 MiB 只用于容纳 JSON/base64 与协议
 开销。Caddy 的 32 MiB 不是业务对象可以达到 32 MiB 的承诺。
 
-匿名申请的来源契约固定在最外层 Caddy：它删除客户端提供的 `X-Real-IP`、
+匿名申请的来源契约固定在最外层 Caddy：`WAF_TRUSTED_PROXY_CIDRS` 必须逐项填写
+供应商公开且已复核的出口 CIDR，Caddy 使用 `trusted_proxies_strict` 从最右侧可信
+代理链解析 `{client_ip}`。它删除客户端提供的 `X-Real-IP`、
 `X-Forwarded-For`、`CF-Connecting-IP` 与 `X-V9-Client-IP`，再用 TCP 对端
-`{remote_host}` 生成单值
+`{client_ip}` 生成单值
 `X-V9-Client-IP` 和 `X-Forwarded-For`。Functions 只把该受信单值用于 source
 bucket；缺失或非法时进入 global bucket，不能由客户端选择 bucket；Kong 只绑定
 回环地址，公网不能绕过 Caddy 直接调用 Functions。标准 Caddy 镜像没有内置的
 per-source/global request-rate 模块；`unhealthy_request_count` 是反向代理的被动
 健康信号，**不是请求限流器**，因此本配置不伪装成网关限流。函数仍执行
 email/source/global 三层业务限流，但上线前必须由 VPS 防火墙或 CDN/WAF 提供连接数、
-请求速率和 DDoS 限制。若在 Caddy 前加入 CDN/WAF，必须先固定其出口 CIDR、在最外层
-清洗来访转发头并重新审阅 Caddy `trusted_proxies`；未完成前不得直接信任 CDN
-传来的来源头。
+请求速率、短时突发和 DDoS 限制。数据库业务限额至少保持 20/IP/小时、3/邮箱/天、
+200/全局/小时；WAF 不替代这些事务内计数。Realtime WebSocket 必须独立允许 Upgrade，
+不能套用匿名申请的 HTTP 业务桶。源站防火墙还必须限制 80/443 只接受所选 WAF
+出口和经审阅的证书验证路径；否则攻击者可绕过 WAF 直接到达 Caddy。未完成 CIDR
+核验、源站限制和真实来源负面测试前，不得宣称 WAF 门禁已通过。
+
+`preflight.sh` 对 `MVP_EXTERNAL_WAF_ENABLED`、Realtime 放行标记和可信 CIDR 的检查
+只证明配置形状，不证明源站从公网不可达。最终门禁由
+`.github/workflows/v9-deployment-evidence.yml` 中独立的 GitHub-hosted Linux runner
+执行：它从受保护 environment secrets 读取 staging、production 的源站 IP/hostname
+和证据 HMAC key，分别尝试直连 TCP 80、TCP 443，以及以公开域名作为 SNI 的 TLS
+443；同时要求两个公开 WAF origin 的 `/health` 经可信 TLS 可达，避免把 runner 断网
+误判为源站隔离成功。任何源站连接成功或公开正向探测失败都 fail-closed；缺少目标、目标解析到非公网地址、目标与 WAF 公网
+地址重合或网络探测无法完成也不会生成成功证据。源站目标不进入命令行、日志或产物；
+Actions 证据只保存固定 gate 名、`pass` 状态、带密钥的目标 HMAC-SHA-256 和 UTC
+时间。部署证据验证器还要求两套目标摘要不同、八项 gate 齐全且在 30 分钟内采集。
+`v9-production-evidence` environment 必须在 GitHub 设置中只允许 protected `main`
+部署；job 还会核对本次 workflow ref 和远端 `main` 的精确 SHA，再执行仓库内 probe。
+
+浏览器桌面/移动端截图仍可保存在运营方受保护的本地证据目录供人工复核，但在没有
+可靠 OCR、二维码与 PII 检测闭环时，不能上传到公共仓库或 Actions artifact。公开
+部署证据固定只包含 JSON/JSONL 机器结果；workflow 不复制 PNG，验证器拒绝任意 PNG、
+符号链接、未声明文件或清单外文件。桌面和移动端线上验收由脱敏 browser probe 的
+状态码、响应摘要、时间与性能观测闭环，截图不是 stable Release 的自动门禁输入。
 
 回滚触发条件：任一核心流程失败、5xx 持续超过 1%、P95 API 持续超过 2 秒、
 出现跨用户/跨角色数据、备份超过 26 小时或磁盘剩余低于 20%。执行 `rollback.sh`
@@ -249,6 +301,31 @@ expand-contract/前向兼容，数据库恢复不能由 Portal 镜像回滚替�
 backend 协作，再移除旧 wire；不要修改 token 后强行绕过门禁。
 
 ## 4. 备份、恢复与桌面发布
+
+上线预检前先安装脚本与 timer（目标路径均位于本项目约定的
+`/opt/defense-tracker/current`，不要复制到其他隐式位置）：
+
+```sh
+install -o root -g root -m 0444 deploy/mvp/systemd/defense-tracker-*.service \
+  deploy/mvp/systemd/defense-tracker-*.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now defense-tracker-backup.timer \
+  defense-tracker-retention.timer
+```
+
+`preflight.sh` 会 fail-closed 检查两个 timer 均为 enabled 且 active；它不以“文件
+已经复制”替代实际调度状态。
+
+安装 `defense-tracker-retention.service/.timer` 后，systemd 每天 03:05
+（Asia/Shanghai，不设置随机延迟）以 root 读取仓库外 Supabase secret key，
+只调用 service-role 专用的
+`purge_expired_access_application_data()`，且日志只写聚合计数。策略固定为：pending
+申请在第 29 天起进入删除条件，确保正常运行的每日任务下不超过 30 天；已处理记录
+在下一次每日运行清除邮箱密文、邮箱/IP/UA 摘要和邀请关联，最迟不超过 24 小时；终态
+邀请的邮箱摘要也在下一次运行清除；审计在第 179 天起进入删除条件，确保正常运行
+的每日任务下不超过 180 天。
+过期 invited membership 会被撤销，每日事件计数只保留完成限额核对所需的最近
+7 天。定时器成功并不证明数据库备份成功，二者必须分别监控。
 
 安装 `defense-tracker-backup.service/.timer` 后，systemd 每晚 02:15
 （Asia/Shanghai，最多随机延迟 15 分钟）进入停写维护窗口。`backup.sh` 先取得与
@@ -276,11 +353,15 @@ backend 协作，再移除旧 wire；不要修改 token 后强行绕过门禁。
 
 桌面正式发布仍从 `scripts/Build-AndShip.ps1` 进入，但必须增加
 `-RequireSignedInstaller`，并通过环境变量或参数提供预置的 `ISCC.exe`、
-`signtool.exe`、CurrentUser 证书 thumbprint、HTTPS RFC 3161 时间戳 URL 与
-Publisher。门禁不会安装工具、读取 PFX 或密码。它在 staging 中先签 EXE，使用
-`/fd SHA256 /tr <URL> /td SHA256`，再由 Inno Setup 生成安装包并签名；两者都必须
-同时通过 SignTool 和 `Get-AuthenticodeSignature`，且存在时间戳证书。上一版保留
-在 `dist/DefenseTracker.previous`，安装包按完整 Git SHA 存入不可变目录。
+`signtool.exe`、7-Zip、Defender 及其预期 SHA-256，并配置 Microsoft Artifact
+Signing（GitHub OIDC）或 DigiCert KeyLocker、HTTPS RFC 3161 时间戳 URL 与经法律
+确认的 Publisher。门禁不会安装工具、使用自签名证书或从仓库读取签名秘密。它在
+staging 中先签 EXE，使用 `/fd SHA256 /tr <URL> /td SHA256`，再由 Inno Setup
+生成安装包并签名；两者都必须通过 SignTool、`Get-AuthenticodeSignature`、签名链、
+代码签名 EKU、Publisher 和时间戳证书检查。资产归档到
+`dist/releases/v9.0.0/<完整Git SHA>/`；旧活动目录先枚举后移入 `dist/archive/`。
+没有可信 manifest 的旧版必须显式提供经审计的归档 ID（本机既有旧版为
+`88d507f-20260725`），脚本不会猜测身份或删除旧文件。
 
 ## 5. 诚实边界
 
@@ -298,10 +379,22 @@ Publisher。门禁不会安装工具、读取 PFX 或密码。它在 staging 中
 6. `repository@sha256` 固定的是已核准镜像字节，消除了可变 tag 选择风险，但目前
    没有镜像签名、keyless signature 或 provenance attestation；digest 本身不能证明
    构建者身份、源码来源或 CI 未被接管。
-7. Portal Python 依赖目前只有版本 pin，没有完整传递依赖锁与 `--require-hashes`；
-   因此相同 Git SHA 的重新构建不能称为可复现构建。上线使用已核准 digest，后续仍需
-   补齐 wheel/hash lock、SBOM 与构建 provenance。
+7. Portal 与桌面 Python 安装已经使用传递依赖 hash lock，候选构建也绑定工具链哈希
+   与 provenance；但最终 onedir、安装器、容器原生库的许可证归属仍未完成独立复核，
+   当前生成的 SPDX 含 `NOASSERTION`。该状态必须阻断 stable Release，不能仅凭 lockfile
+   宣称 SBOM 或许可证闭环。签名工作流会在首次签名之前要求 Ed25519 审核者签名且
+   SHA-256 固定的 compliance evidence；审核者公钥必须先通过独立治理变更登记到源码
+   registry。证据绑定提交、source tree、Publisher、两个 lock、实际安装包清单、
+   THIRD_PARTY_NOTICES，以及预签名 onedir 中每个 EXE/DLL/原生库/资源的路径、字节数、
+   SHA-256、SPDX 许可证与版权文字。打包后 SBOM 再绑定最终签名安装器、portable ZIP
+   和 portable 内每个文件的最终哈希。当前 reviewer registry 明确为 inactive，因此
+   signed candidate 和 stable Release 都会在首次签名前 fail-closed；法律主体、审核者
+   公钥与完整组件复核完成后才能生成不含 `NOASSERTION` 的私有候选。
 8. `current/previous` 的 image、SHA、wire、manifest 仍是多个文件分别原子 `mv`，不是单一 generation 的事务提交。
    进程或宿主在中间崩溃会留下混合状态；后续 release/
    rollback 会 fail-closed，但需要运营方按镜像 digest、backend 账本和备份手工复核
    修复，不能宣称该状态更新对断电完全原子。
+9. 外部 origin-isolation probe 能证明执行当时 GitHub-hosted runner 无法直连所登记的
+   两个源站目标，但不能证明随后防火墙规则没有漂移、其他未登记地址不存在，也不能
+   代替持续外部监控。证据中的目标是带密钥摘要，不能供公众反推出或独立核对真实 IP；
+   原始目标仍必须由受信运营人员在受保护 environment 中复核。

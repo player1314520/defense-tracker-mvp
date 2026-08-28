@@ -35,6 +35,18 @@ function safeUrl(u) {
   const s = String(u || '').trim();
   return /^(https?:|mailto:|\/|#|\.)/i.test(s) ? s : '#';
 }
+// RSS/搜索/证据“外部原文”不允许 mailto 或相对路径，仅放行绝对 HTTP(S)。
+function safeExternalUrl(u) {
+  const s = String(u || '').trim();
+  try {
+    const parsed = new URL(s);
+    return ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password
+      ? parsed.href
+      : '#';
+  } catch (_) {
+    return '#';
+  }
+}
 function getCookie(name) {
   const prefix = encodeURIComponent(name) + '=';
   return document.cookie.split(';').map(v => v.trim()).find(v => v.startsWith(prefix))?.slice(prefix.length) || '';
@@ -214,7 +226,7 @@ function filenameFromContentDisposition(disposition, fallback, ext = '.docx') {
 // 仅在 Node（tests/js/util.test.cjs）通过 require() 加载时导出纯函数供单测。
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    fmtDate, escHtml, escJsArg, escAttrJs, safeUrl,
+    fmtDate, escHtml, escJsArg, escAttrJs, safeUrl, safeExternalUrl,
     getCookie, apiFetch, ensureFileExt, filenameFromContentDisposition,
     isV9BusinessRequest, v9BusinessRequestInit,
   };

@@ -40,6 +40,15 @@ const context = {
   URL,
   Blob,
   TextDecoder,
+  safeExternalUrl(value) {
+    try {
+      const parsed = new URL(String(value || ''));
+      return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+        && !parsed.username && !parsed.password ? parsed.href : '#';
+    } catch (_error) {
+      return '#';
+    }
+  },
 };
 vm.createContext(context);
 vm.runInContext(source, context, {filename: 'brief.js'});
@@ -136,6 +145,19 @@ vm.runInContext(source, context, {filename: 'brief.js'});
   assert.equal(downloadClicks, 0, 'TXT export must reject a result-set change during validation');
 
   context.apiFetch = async () => ({});
+  vm.runInContext(`
+    briefResults = [];
+    briefAddResult('draft', {
+      title: 'unsafe source', source: 'Test', region: 'US',
+      link: 'javascript:alert(document.domain)', summary: ''
+    }, {payload: {origin: 'rss_cache'}});
+  `, context);
+  assert.equal(
+    vm.runInContext(`briefResults[0].article.link`, context),
+    '#',
+    'stored source URLs must reject executable schemes',
+  );
+
   vm.runInContext(`
     briefResults = [{
       id: 'positive', brief: 'validated snapshot',

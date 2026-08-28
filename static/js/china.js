@@ -61,7 +61,7 @@ function chinaCompactCardHtml(item, idx) {
         <span>${escHtml(fmtDate(item.date))}</span>
         ${isEliteSource(item) ? '<span class="china-elite-chip">顶尖源</span>' : ''}
       </div>
-      <a class="china-intel-title" href="${escHtml(safeUrl(item.link || '#'))}" target="_blank" rel="noopener"
+      <a class="china-intel-title" href="${escHtml(safeExternalUrl(item.link))}" target="_blank" rel="noopener noreferrer"
          onclick="markRead('${linkArg}')">${escHtml(item.title || '未命名情报')}</a>
       ${summary ? `<p>${escHtml(summary)}${(item.summary || '').length > 150 ? '…' : ''}</p>` : ''}
       <div class="china-intel-foot">
@@ -162,7 +162,7 @@ function renderChinaThinktanks() {
   const cat = thinktankData.find(c => c.id === 'china_zone');
   if (!cat) return;
   el.innerHTML = cat.sites.slice(0, 14).map(site => `
-    <a class="china-tt-link" href="${escHtml(site.url)}" target="_blank" rel="noopener">
+    <a class="china-tt-link" href="${escHtml(safeExternalUrl(site.url))}" target="_blank" rel="noopener noreferrer">
       <strong>${escHtml(site.name_cn || site.name)}</strong>
       <span>${escHtml(site.url.replace(/^https?:\/\//,'').replace(/\/$/,''))}</span>
     </a>`).join('');

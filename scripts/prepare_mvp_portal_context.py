@@ -21,7 +21,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BUILD_ROOT = PROJECT_ROOT / "build"
 CONTEXT_ROOT = BUILD_ROOT / "mvp-portal-context"
 EXACT_FILES = {
+    "product_version.py",
+    "version.json",
     "v9_cloud.py",
+    "feishu_webhook_security.py",
     "deploy/requirements.cloud.txt",
     "deploy/mvp/portal.Dockerfile",
     "deploy/mvp/portal-entrypoint.sh",
@@ -71,6 +74,9 @@ def _tracked_files() -> list[str]:
             "HEAD",
             "--",
             "v9_cloud.py",
+            "feishu_webhook_security.py",
+            "product_version.py",
+            "version.json",
             "v9",
             "web/v9-portal",
             "deploy/requirements.cloud.txt",
@@ -132,14 +138,19 @@ def prepare(*, check_only: bool) -> dict[str, object]:
         raise SystemExit("unable to resolve a full Git commit SHA")
     files = _tracked_files()
     _assert_clean(files)
+    source_tree = str(_git("rev-parse", f"{commit}^{{tree}}"))
+    commit_epoch = int(str(_git("show", "-s", "--format=%ct", commit)))
     metadata: dict[str, object] = {
-        "schema": 1,
-        "git_sha": commit,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "files": [],
+        "schema": 2,
+        "commit": commit,
+        "source_tree": source_tree,
+        "source_date_epoch_utc": datetime.fromtimestamp(commit_epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "context_files": [],
     }
     if check_only:
-        return metadata | {"files": files}
+        return metadata | {"context_files": files}
 
     _safe_reset_context()
     file_entries: list[dict[str, object]] = []
@@ -157,7 +168,7 @@ def prepare(*, check_only: bool) -> dict[str, object]:
                 "sha256": hashlib.sha256(payload).hexdigest(),
             }
         )
-    metadata["files"] = file_entries
+    metadata["context_files"] = file_entries
     (CONTEXT_ROOT / "build-metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

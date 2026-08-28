@@ -182,6 +182,7 @@ for signature in \
     'public.submit_access_application(text,text,text,integer,text,text,text)' \
     'public.list_access_applications(text,uuid,integer)' \
     'public.decide_access_application(uuid,text,text,text,text)' \
+    'public.purge_expired_access_application_data()' \
     'public.hook_v9_before_user_created(jsonb)'; do
     exists=$(psql_db --tuples-only --no-align --set "signature=$signature" --command \
         "select (to_regprocedure(:'signature') is not null)::text;")
@@ -207,6 +208,20 @@ register_device_acl=$(psql_db --tuples-only --no-align --command \
     "select (has_function_privilege('authenticated','public.register_device(uuid,uuid,text,text,text,text,text)','EXECUTE') and not has_function_privilege('anon','public.register_device(uuid,uuid,text,text,text,text,text)','EXECUTE') and not has_function_privilege('service_role','public.register_device(uuid,uuid,text,text,text,text,text)','EXECUTE') and not exists (select 1 from pg_proc p cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a where p.oid = to_regprocedure('public.register_device(uuid,uuid,text,text,text,text,text)') and a.grantee = 0 and a.privilege_type = 'EXECUTE'))::text;")
 [ "$register_device_acl" = true ] || {
     printf '%s\n' "device registration RPC grants are not authenticated-only" >&2
+    exit 65
+}
+
+capacity_contract=$(psql_db --tuples-only --no-align --command \
+    "select (to_regclass('private.organization_seat_usage') is not null and to_regclass('private.organization_seat_reservations') is not null and to_regclass('private.sync_event_daily_usage') is not null and exists (select 1 from pg_trigger where tgname = 'member_invitation_capacity_guard' and not tgisinternal) and exists (select 1 from pg_trigger where tgname = 'memberships_capacity_guard' and not tgisinternal) and exists (select 1 from pg_trigger where tgname = 'sync_events_daily_quota_guard' and not tgisinternal) and not has_table_privilege('authenticated','private.organization_seat_usage','SELECT') and not has_table_privilege('authenticated','private.sync_event_daily_usage','SELECT') and not exists (select 1 from private.organization_seat_usage where used_seats > 100))::text;")
+[ "$capacity_contract" = true ] || {
+    printf '%s\n' "database capacity or daily-event quota contract is missing" >&2
+    exit 65
+}
+
+retention_acl=$(psql_db --tuples-only --no-align --command \
+    "select (has_function_privilege('service_role','public.purge_expired_access_application_data()','EXECUTE') and not has_function_privilege('authenticated','public.purge_expired_access_application_data()','EXECUTE') and not has_function_privilege('anon','public.purge_expired_access_application_data()','EXECUTE') and not exists (select 1 from pg_proc p cross join lateral aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a where p.oid = to_regprocedure('public.purge_expired_access_application_data()') and a.grantee = 0 and a.privilege_type = 'EXECUTE'))::text;")
+[ "$retention_acl" = true ] || {
+    printf '%s\n' "access retention RPC grants are not service-role-only" >&2
     exit 65
 }
 

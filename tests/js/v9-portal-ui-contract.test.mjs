@@ -22,6 +22,10 @@ test("匿名区仅提供申请和登录且业务仪表盘默认隐藏", () => {
     source,
     /config\.access_applications_enabled\s*===\s*true/,
   );
+  assert.match(html, /id="product-version"/);
+  assert.doesNotMatch(html, /Supabase Staging/);
+  assert.doesNotMatch(source, /Supabase Staging/);
+  assert.match(source, /config\.display_version/);
 });
 
 

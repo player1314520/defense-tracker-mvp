@@ -7,11 +7,20 @@
 环境变量配置：
   FEISHU_APP_ID            飞书应用 App ID
   FEISHU_APP_SECRET        飞书应用 App Secret
-  FEISHU_VERIFY_TOKEN      飞书事件订阅验证 Token（用于签名校验）
+  FEISHU_VERIFY_TOKEN      飞书事件订阅 Verification Token（负载字段校验）
+  FEISHU_ENCRYPT_KEY       飞书事件订阅 Encrypt Key（生产签名必填）
+  FEISHU_TENANT_KEY        允许的租户 Key（生产事件身份绑定必填）
+  FEISHU_EVENT_LEASE_SECONDS  后台任务租约秒数（默认 900，范围 30-3600）
+  FEISHU_WEBHOOK_ALLOW_TOKEN_ONLY=1  仅本地开发兼容旧 token-only 回调
 ────────────────────────────────────────────────────
 """
-import hashlib, hmac, json, os, re, time, logging, threading
-from collections import OrderedDict
+import hmac
+import json
+import logging
+import os
+import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import requests
@@ -23,6 +32,17 @@ from docx.oxml.ns import qn
 from feishu_common import (
     ascii_fallback_name as _ascii_fallback_name,
     sanitize_feishu_filename as _sanitize_feishu_filename,
+)
+from feishu_webhook_security import (
+    WebhookMisconfigured,
+    WebhookRejected,
+    MAX_WEBHOOK_BODY_BYTES,
+    acquire_event_lease,
+    decrypt_event_payload,
+    submit_leased_event,
+    token_only_development_enabled,
+    validate_event_identity,
+    verify_signed_request,
 )
 from state import CONFIG_DIR
 
@@ -40,6 +60,8 @@ def _load_feishu_config() -> dict:
         "app_id":       os.environ.get("FEISHU_APP_ID", ""),
         "app_secret":   os.environ.get("FEISHU_APP_SECRET", ""),
         "verify_token": os.environ.get("FEISHU_VERIFY_TOKEN", ""),
+        "encrypt_key":  os.environ.get("FEISHU_ENCRYPT_KEY", ""),
+        "tenant_key":   os.environ.get("FEISHU_TENANT_KEY", ""),
     }
     if os.path.exists(_FEISHU_CONFIG_FILE):
         try:
@@ -64,39 +86,6 @@ FEISHU_API = "https://open.feishu.cn/open-apis"
 # ── Token 缓存 ────────────────────────────────────────────────
 _token_lock  = threading.Lock()
 _token_cache = {"token": "", "expire": 0}
-
-# ── 已处理消息 ID（防飞书重试导致重复生成）─────────────────────
-_seen_msg_ids: OrderedDict = OrderedDict()  # msg_id → timestamp，有序淘汰
-_seen_lock = threading.Lock()
-_MAX_SEEN = 500   # 最多记录500条，防内存无限增长
-
-
-def _is_new_message(msg_id: str) -> bool:
-    """True = 新消息，False = 已处理过（重复）"""
-    if not msg_id:
-        return True
-    with _seen_lock:
-        if msg_id in _seen_msg_ids:
-            return False
-        _seen_msg_ids[msg_id] = time.time()
-        while len(_seen_msg_ids) > _MAX_SEEN:
-            _seen_msg_ids.popitem(last=False)
-    return True
-
-
-def _verify_feishu_signature(token: str, timestamp: str, nonce: str, body: bytes) -> bool:
-    """
-    验证飞书事件订阅签名（X-Lark-Signature）。
-    算法：sha256(timestamp + nonce + token + body_str)
-    token 为飞书开放平台 → 事件订阅 → 验证令牌（Verification Token）。
-    """
-    incoming = request.headers.get("X-Lark-Signature", "")
-    if not all((token, timestamp, nonce, incoming)):
-        return False
-    key = (timestamp + nonce + token).encode("utf-8") + body
-    sig = hashlib.sha256(key).hexdigest()
-    return hmac.compare_digest(sig, incoming)
-
 
 # ════════════════════════════════════════════════════════════
 # 飞书 API 工具函数
@@ -570,12 +559,12 @@ def _process_async(chat_id: str, text: str):
             file_key = upload_file(file_name, docx_bytes)
             send_file(chat_id, file_key)
         except Exception as docx_err:
-            logger.error("DOCX生成/发送失败: %s", docx_err, exc_info=True)
-            send_text(chat_id, f"⚠️ 要讯文本已生成，但DOCX文件发送失败：{str(docx_err)[:100]}")
+            logger.error("DOCX generation or upload failed (%s)", type(docx_err).__name__)
+            send_text(chat_id, "⚠️ 要讯文本已生成，但DOCX文件发送失败")
 
-    except Exception as e:
-        logger.error("feishu_bot process error: %s", e, exc_info=True)
-        send_card(chat_id, _build_error_card(f"处理异常：{str(e)[:120]}"))
+    except Exception as exc:
+        logger.error("feishu_bot processing failed (%s)", type(exc).__name__)
+        send_card(chat_id, _build_error_card("处理失败"))
 
 
 # ════════════════════════════════════════════════════════════
@@ -596,12 +585,35 @@ HELP_TEXT = (
 @feishu_bp.route("/api/feishu/webhook", methods=["POST"])
 def feishu_webhook():
     """飞书事件订阅回调入口（需在飞书开放平台注册为事件订阅URL）"""
+    if request.content_length is not None and request.content_length > MAX_WEBHOOK_BODY_BYTES:
+        return jsonify({"code": 1, "msg": "webhook body too large"}), 413
     raw_body = request.get_data()
+    if len(raw_body) > MAX_WEBHOOK_BODY_BYTES:
+        return jsonify({"code": 1, "msg": "webhook body too large"}), 413
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook payload"}), 400
     verify_token = str(FEISHU_CONFIG.get("verify_token") or "").strip()
     if not verify_token:
         logger.error("feishu_bot: webhook verification token is not configured")
         return jsonify({"code": 1, "msg": "webhook verification not configured"}), 503
+
+    allow_legacy = token_only_development_enabled()
+    signing_key = str(FEISHU_CONFIG.get("encrypt_key") or "").strip()
+    try:
+        verify_signed_request(
+            request.headers,
+            raw_body,
+            signing_key=signing_key,
+            allow_token_only=allow_legacy,
+        )
+        data = decrypt_event_payload(data, encrypt_key=signing_key)
+    except WebhookRejected as exc:
+        logger.warning("feishu_bot: webhook signature rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "invalid webhook signature"}), 403
+    except WebhookMisconfigured as exc:
+        logger.error("feishu_bot: webhook security unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook security not configured"}), 503
 
     # ── URL 验证（首次注册 webhook 时飞书发来）──────────────
     if data.get("type") == "url_verification":
@@ -610,63 +622,93 @@ def feishu_webhook():
             logger.warning("feishu_bot: URL verification token invalid")
             return jsonify({"code": 1, "msg": "invalid token"}), 403
         challenge = data.get("challenge", "")
+        if not isinstance(challenge, str) or len(challenge) > 1024:
+            return jsonify({"code": 1, "msg": "invalid challenge"}), 400
         logger.info("feishu_bot: URL verification OK")
         return jsonify({"challenge": challenge})
 
     # ── 事件处理（schema 2.0）────────────────────────────────
-    header     = data.get("header", {})
-    event_type = header.get("event_type", "")
-    event      = data.get("event", {})
+    header = data.get("header")
+    if not isinstance(header, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 400
     incoming_token = str(header.get("token") or "")
     if not hmac.compare_digest(verify_token, incoming_token):
         logger.warning("feishu_bot: Verification Token invalid")
         return jsonify({"code": 1, "msg": "invalid token"}), 403
 
-    # 签名头出现时必须完整、正确；无签名头时仍由 header.token 鉴权。
-    if request.headers.get("X-Lark-Signature"):
-        ts = request.headers.get("X-Lark-Request-Timestamp", "")
-        nonce = request.headers.get("X-Lark-Request-Nonce", "")
-        if not _verify_feishu_signature(verify_token, ts, nonce, raw_body):
-            logger.warning("feishu_bot: 签名校验失败，请求被拒绝")
-            return jsonify({"code": 1, "msg": "invalid signature"}), 403
+    try:
+        validate_event_identity(
+            data,
+            expected_app_id=str(FEISHU_CONFIG.get("app_id") or "").strip(),
+            expected_tenant_key=str(FEISHU_CONFIG.get("tenant_key") or "").strip(),
+            allow_legacy=allow_legacy,
+        )
+    except WebhookRejected as exc:
+        logger.warning("feishu_bot: webhook identity rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "invalid webhook identity"}), 403
+    except WebhookMisconfigured as exc:
+        logger.error("feishu_bot: webhook identity unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook identity not configured"}), 503
+
+    event_type = header.get("event_type", "")
+    event = data.get("event")
+    if not isinstance(event, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 400
 
     if event_type != "im.message.receive_v1":
         return jsonify({"code": 0})
 
-    message  = event.get("message", {})
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 400
     msg_type = message.get("message_type", "")
     chat_id  = message.get("chat_id", "")
-    msg_id   = message.get("message_id", "")
 
     if not chat_id:
         return jsonify({"code": 0})
 
-    # ── 去重：防飞书重试导致重复处理 ─────────────────────────
-    if not _is_new_message(msg_id):
-        logger.info("feishu_bot: 重复消息 %s，跳过", msg_id)
+    # ── 持久租约：仅在线程完成后确认，崩溃后允许重试接管 ────────
+    try:
+        event_lease = acquire_event_lease(data, allow_legacy=allow_legacy)
+    except WebhookRejected as exc:
+        logger.warning("feishu_bot: webhook event rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "invalid webhook event"}), 403
+    except WebhookMisconfigured as exc:
+        logger.error("feishu_bot: webhook deduplication unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook deduplication unavailable"}), 503
+    if event_lease is None:
+        logger.info("feishu_bot: in-flight or completed event skipped")
         return jsonify({"code": 0})
 
     # 只处理文本消息
     if msg_type != "text":
         send_text(chat_id,
             "💡 目前支持文字消息（链接 或 正文）。\n发送「帮助」查看使用说明。")
+        event_lease.complete()
         return jsonify({"code": 0})
 
     try:
         text = json.loads(message.get("content", "{}")).get("text", "").strip()
     except Exception:
+        event_lease.complete()
         return jsonify({"code": 0})
 
     if not text:
+        event_lease.complete()
         return jsonify({"code": 0})
 
     # 帮助指令
     if text in ["帮助", "help", "?", "？", "/help"]:
         send_text(chat_id, HELP_TEXT)
+        event_lease.complete()
         return jsonify({"code": 0})
 
     # 异步线程池生成（立即返回 200，避免飞书重试）
-    _worker_pool.submit(_process_async, chat_id, text)
+    try:
+        submit_leased_event(_worker_pool, event_lease, _process_async, chat_id, text)
+    except WebhookMisconfigured as exc:
+        logger.error("feishu_bot: webhook dispatch unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
 
     return jsonify({"code": 0})
 
@@ -674,17 +716,13 @@ def feishu_webhook():
 @feishu_bp.route("/api/feishu/config", methods=["GET", "POST"])
 def feishu_config():
     """读写飞书机器人配置（供前端设置页调用，需登录）"""
-    from app import require_auth as _require_auth
-    # 手动调用认证检查（Blueprint 内无法直接用装饰器引用 app 的 require_auth）
-    token = (request.cookies.get("access_token") or
-             request.headers.get("X-Access-Token", ""))
-    import secrets as _sec
-    from app import ACCESS_TOKEN as _AT, validate_csrf_request, csrf_error_response
-    if not token or not _sec.compare_digest(token, _AT):
-        return jsonify({"error": "未授权"}), 401
+    # Blueprint 为避免循环 import 在请求期复用主应用的统一鉴权；浏览器
+    # cookie 是短期进程内 session，长期 master/device token 不进入 cookie。
+    from app import _workspace_auth_error_response
+    rejection = _workspace_auth_error_response()
+    if rejection is not None:
+        return rejection
     if request.method == "POST":
-        if not validate_csrf_request():
-            return csrf_error_response()
         data = request.get_json() or {}
         if data.get("app_id"):
             FEISHU_CONFIG["app_id"] = data["app_id"]
@@ -692,16 +730,24 @@ def feishu_config():
             FEISHU_CONFIG["app_secret"] = data["app_secret"]
         if data.get("verify_token"):
             FEISHU_CONFIG["verify_token"] = data["verify_token"]
+        if data.get("encrypt_key"):
+            FEISHU_CONFIG["encrypt_key"] = data["encrypt_key"]
+        if data.get("tenant_key"):
+            FEISHU_CONFIG["tenant_key"] = data["tenant_key"]
         # 清除 token 缓存，让下次请求重新获取
         with _token_lock:
             _token_cache["expire"] = 0
         _save_feishu_config()
         return jsonify({"ok": True,
                         "app_id": FEISHU_CONFIG["app_id"],
-                        "configured": bool(FEISHU_CONFIG["app_id"])})
+                        "configured": bool(FEISHU_CONFIG["app_id"]),
+                        "signature_configured": bool(FEISHU_CONFIG.get("encrypt_key")),
+                        "tenant_configured": bool(FEISHU_CONFIG.get("tenant_key"))})
     return jsonify({
         "app_id":     FEISHU_CONFIG["app_id"],
         "configured": bool(FEISHU_CONFIG["app_id"] and FEISHU_CONFIG["app_secret"]),
+        "signature_configured": bool(FEISHU_CONFIG.get("encrypt_key")),
+        "tenant_configured": bool(FEISHU_CONFIG.get("tenant_key")),
         "webhook_url": "/api/feishu/webhook  （需配合 ngrok 或公网域名使用）",
     })
 
@@ -709,14 +755,10 @@ def feishu_config():
 @feishu_bp.route("/api/feishu/test", methods=["POST"])
 def feishu_test():
     """向指定 chat_id 发送一条测试消息，验证机器人配置是否正确（需登录）"""
-    import secrets as _sec
-    from app import ACCESS_TOKEN as _AT, validate_csrf_request, csrf_error_response
-    token = (request.cookies.get("access_token") or
-             request.headers.get("X-Access-Token", ""))
-    if not token or not _sec.compare_digest(token, _AT):
-        return jsonify({"error": "未授权"}), 401
-    if not validate_csrf_request():
-        return csrf_error_response()
+    from app import _workspace_auth_error_response
+    rejection = _workspace_auth_error_response()
+    if rejection is not None:
+        return rejection
     data = request.get_json() or {}
     chat_id = data.get("chat_id", "")
     if not chat_id:
@@ -724,5 +766,6 @@ def feishu_test():
     try:
         send_text(chat_id, "✅ 防务要讯机器人连接正常！发送文章链接即可生成要讯。")
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception as exc:
+        logger.warning("feishu connection test failed (%s)", type(exc).__name__)
+        return jsonify({"error": "飞书连接测试失败", "code": "FEISHU_UPSTREAM_FAILED"}), 502

@@ -381,7 +381,7 @@ function newsCardHtml(item, idx) {
                 onclick="toggleBookmark('${escAttrJs(item.link)}', this)"
                 title="${isBookmarked?'已收藏':'收藏'}">${isBookmarked?'★':'☆'}</button>
       </div>
-      <a class="news-title-link ed-title-link" href="${escHtml(safeUrl(item.link))}" target="_blank" rel="noopener"
+      <a class="news-title-link ed-title-link" href="${escHtml(safeExternalUrl(item.link))}" target="_blank" rel="noopener noreferrer"
          onclick="markRead('${escAttrJs(item.link)}')">
         <span class="news-title ed-title">${escHtml(item.title)}</span>
       </a>

@@ -1,4 +1,11 @@
+import os
+
 import pytest
+
+# 生产默认为强制鉴权。测试套件显式进入本地开发模式，避免
+# 大量与鉴权无关的旧路由因会话守卫而失真。鉴权本身有独立负面测试。
+os.environ["ACCESS_TOKEN_REQUIRED"] = "0"
+os.environ.pop("DEFENSE_TRACKER_DESKTOP_BOOTSTRAP", None)
 
 from state import _rate_lock, _rate_store
 
