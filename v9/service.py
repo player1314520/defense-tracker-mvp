@@ -2176,6 +2176,9 @@ class V9Service:
         self, context: dict, record_id: str, output_format: str
     ) -> tuple[bytes, str]:
         document = self._record_with_hash(context, record_id, "document")
+        validation = validate_document(document["content"])
+        if not validation.get("ready"):
+            raise ValueError("稿件校验未通过，禁止导出")
         source_index = self._source_index(context, document["content"])
         output_format = str(output_format or "").lower()
         if output_format == "docx":

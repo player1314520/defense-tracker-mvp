@@ -291,7 +291,12 @@ def test_extract_url_rechecks_each_redirect_hop_for_ssrf(monkeypatch):
             return _Resp(302, {"Location": "http://169.254.169.254/latest/meta-data/"})
         return _Resp(200)
 
-    monkeypatch.setattr(search_adapters.requests, "get", fake_get)
+    monkeypatch.setattr(
+        search_adapters,
+        "_ssrf_http_session",
+        lambda: type("FakeSession", (), {"get": lambda self, url, **kwargs: fake_get(url, **kwargs)})(),
+    )
+    monkeypatch.setattr(search_adapters, "_validate_connected_peer", lambda _response: None)
 
     def ssrf_check(u):
         if "169.254" in u or "127.0.0.1" in u or "localhost" in u:
@@ -304,3 +309,90 @@ def test_extract_url_rechecks_each_redirect_hop_for_ssrf(monkeypatch):
     assert "不安全" in str(exc.value)
     # 重定向目标在发起连接前即被拦下，fake_get 不会以 169.254 地址被二次调用
     assert seen == ["http://public.test/start"]
+
+
+def test_extract_url_rejects_private_or_unverifiable_connected_peer(monkeypatch):
+    class _Resp:
+        status_code = 200
+        headers = {}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        search_adapters,
+        "_ssrf_http_session",
+        lambda: type("FakeSession", (), {"get": lambda self, *args, **kwargs: _Resp()})(),
+    )
+    check = lambda _url: (True, "")
+
+    monkeypatch.setattr(search_adapters, "_connected_peer_ip", lambda _response: "10.0.0.9")
+    with pytest.raises(RuntimeError, match="重绑定到私有地址"):
+        search_adapters._safe_stream_get(
+            "https://public.test/report", {}, 1, check,
+        )
+
+    monkeypatch.setattr(
+        search_adapters,
+        "_connected_peer_ip",
+        lambda _response: (_ for _ in ()).throw(RuntimeError("无法核验远端连接地址")),
+    )
+    with pytest.raises(RuntimeError, match="无法核验远端连接地址"):
+        search_adapters._safe_stream_get(
+            "https://public.test/report", {}, 1, check,
+        )
+
+
+def test_extract_url_accepts_public_peer_and_validates_every_redirect_hop(monkeypatch):
+    seen_urls = []
+    validated_responses = []
+
+    class _Resp:
+        def __init__(self, status, location=""):
+            self.status_code = status
+            self.headers = {"Location": location} if location else {}
+
+        def close(self):
+            pass
+
+    responses = iter([
+        _Resp(302, "/second"),
+        _Resp(302, "https://cdn.public.test/final"),
+        _Resp(200),
+    ])
+
+    def fake_get(url, **kwargs):
+        seen_urls.append(url)
+        assert kwargs["allow_redirects"] is False
+        return next(responses)
+
+    monkeypatch.setattr(
+        search_adapters,
+        "_ssrf_http_session",
+        lambda: type("FakeSession", (), {"get": lambda self, url, **kwargs: fake_get(url, **kwargs)})(),
+    )
+
+    def public_peer(response):
+        validated_responses.append(response)
+        return "93.184.216.34"
+
+    monkeypatch.setattr(search_adapters, "_connected_peer_ip", public_peer)
+    response = search_adapters._safe_stream_get(
+        "https://public.test/start", {}, 1, lambda _url: (True, ""),
+    )
+
+    assert response.status_code == 200
+    assert seen_urls == [
+        "https://public.test/start",
+        "https://public.test/second",
+        "https://cdn.public.test/final",
+    ]
+    assert len(validated_responses) == 3
+
+
+def test_extract_transport_is_proxy_free_and_render_fallback_is_disabled(monkeypatch):
+    monkeypatch.setattr(search_adapters._SSRF_HTTP_LOCAL, "session", None, raising=False)
+
+    assert search_adapters._ssrf_http_session().trust_env is False
+    with pytest.raises(RuntimeError, match="浏览器渲染兜底已禁用"):
+        search_adapters.extract_url_rendered("https://example.test/report")

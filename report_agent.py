@@ -15,12 +15,13 @@ import uuid
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse
 
 from state import DATA_DIR
 
 try:
     from docx import Document
-    from docx.shared import Pt, Cm, RGBColor
+    from docx.shared import Pt, Cm, RGBColor, Twips
     from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
     from docx.oxml import OxmlElement
@@ -32,6 +33,7 @@ except ImportError:
     Pt = None
     Cm = None
     RGBColor = None
+    Twips = None
     WD_TABLE_ALIGNMENT = None
     WD_CELL_VERTICAL_ALIGNMENT = None
     WD_ALIGN_PARAGRAPH = None
@@ -55,6 +57,7 @@ REPORT_TYPE_DEFAULTS = {
     "daily": {"target_count": 5, "time_window_days": 1, "label": "每日简报"},
     "weekly": {"target_count": 8, "time_window_days": 7, "label": "周报汇编"},
     "short_topic": {"target_count": 5, "time_window_days": 2, "label": "专题短报"},
+    "institution_pack": {"target_count": 8, "time_window_days": 30, "label": "机构开源情报整编包"},
 }
 
 DEFAULT_AGENT_VOICE = "strategic_analysis"
@@ -77,6 +80,17 @@ DEFENSE_TOPIC_MARKERS = {
     "nuclear": ("核", "核力量", "nuclear", "warhead", "deterrence"),
     "uav": ("无人机", "无人系统", "uav", "drone", "unmanned"),
 }
+
+INSTITUTION_PACK_MIN_EVIDENCE = 7
+
+INSTITUTION_PACK_MAX_EVIDENCE = 10
+
+INSTITUTION_PACK_BLOCKED_DOMAINS = (
+    "zhihu.com",
+    "weixin.qq.com",
+    "baike.baidu.com",
+    "zhidao.baidu.com",
+)
 
 _SOD_WRITING_FALLBACK = """DefenseTracker SOD/SOP写作要求（内置摘要）：
 1. 先将客户命题解构为可回答的研究问题，归一到技术—能力—规则三维分析框架。
@@ -171,7 +185,387 @@ def report_quality_payload(content: str, target_word_count: int | None = None) -
     }
 
 
-def assert_report_exportable(draft: dict, project: dict | None = None):
+def _preflight_check(check_id: str, ok: bool, label: str, detail: str) -> dict:
+    """Build one UI/API-compatible delivery check without hiding its cause."""
+    return {
+        "id": check_id,
+        "ok": bool(ok),
+        "label": label,
+        "detail": detail,
+        # Compatibility aliases for older/non-UI consumers.
+        "name": check_id,
+        "message": detail,
+    }
+
+def _evidence_payload_layers(evidence: dict) -> list[dict]:
+    layers = [evidence] if isinstance(evidence, dict) else []
+    payload = evidence.get("payload") if isinstance(evidence, dict) else None
+    if isinstance(payload, dict):
+        layers.append(payload)
+        nested = payload.get("payload")
+        if isinstance(nested, dict):
+            layers.append(nested)
+    return layers
+
+def _evidence_has_citable_original(evidence: dict) -> bool:
+    layers = _evidence_payload_layers(evidence)
+    archived = any(
+        str(layer.get("asset_status") or layer.get("status") or "").lower() == "archived"
+        and bool(layer.get("asset_id"))
+        for layer in layers
+    )
+    has_body = any(
+        isinstance(layer.get(field), str) and bool(layer[field].strip())
+        for layer in layers
+        for field in ("text", "body", "full_text", "content", "extracted_text")
+    )
+    is_fetched_original = any(
+        str(layer.get("source_type") or "").strip() == "已抓取公开报告/原文"
+        for layer in layers
+    )
+    return archived or (is_fetched_original and has_body)
+
+def _markdown_headings(content: str) -> list[tuple[int, str, int]]:
+    headings = []
+    for line_no, line in enumerate((content or "").splitlines()):
+        match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if match:
+            headings.append((len(match.group(1)), match.group(2).strip(), line_no))
+    return headings
+
+def _institution_pack_missing_sections(headings: list[tuple[int, str, int]]) -> list[str]:
+    titles = [title for _level, title, _line_no in headings]
+    required = (
+        ("信息清单", lambda title: "信息清单" in title),
+        ("短消息", lambda title: "短消息" in title),
+        ("专题报告", lambda title: "专题" in title and ("报告" in title or "分析" in title)),
+        ("事实来源追溯表", lambda title: all(token in title for token in ("事实", "来源", "追溯"))),
+        ("不确定性或证据边界", lambda title: "不确定性" in title or "证据边界" in title),
+        ("诚实边界", lambda title: "诚实边界" in title),
+    )
+    return [label for label, predicate in required if not any(predicate(title) for title in titles)]
+
+def _specific_short_message_headings(
+    headings: list[tuple[int, str, int]],
+) -> list[tuple[int, str, int]]:
+    generic_titles = {"短消息", "短消息汇编", "短消息部分", "短消息板块", "三篇短消息", "3篇短消息"}
+    specific = []
+    for heading in headings:
+        _level, title, _line_no = heading
+        compact = re.sub(r"[\s：:—-]", "", title)
+        if "短消息" not in compact:
+            continue
+        if compact not in generic_titles and not re.fullmatch(r"[三3]篇短消息(?:汇编)?", compact):
+            specific.append(heading)
+    return specific
+
+def _short_message_section_count(headings: list[tuple[int, str, int]]) -> int:
+    return len(_specific_short_message_headings(headings))
+
+def _heading_section_text(
+    content: str,
+    headings: list[tuple[int, str, int]],
+    heading_index: int,
+) -> str:
+    lines = (content or "").splitlines()
+    level, _title, line_no = headings[heading_index]
+    end_line = len(lines)
+    for next_level, _next_title, next_line_no in headings[heading_index + 1:]:
+        if next_level <= level:
+            end_line = next_line_no
+            break
+    return "\n".join(lines[line_no + 1:end_line])
+
+def _trace_table_data_text(section_text: str) -> str:
+    data_lines = []
+    table_header_seen = False
+    for line in (section_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if cells and all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells):
+                continue
+            if not table_header_seen:
+                table_header_seen = True
+                continue
+            data_lines.append(stripped)
+        elif re.match(r"^(?:[-+*]\s+|\d+[.、)]\s+)", stripped):
+            data_lines.append(stripped)
+    return "\n".join(data_lines)
+
+def _institution_pack_section_citation_gaps(
+    content: str,
+    headings: list[tuple[int, str, int]],
+    evidence_count: int,
+) -> list[str]:
+    def has_valid_citation(text: str) -> bool:
+        return any(
+            1 <= int(number) <= evidence_count
+            for number in re.findall(r"\[(\d+)\]", text or "")
+        )
+
+    gaps = []
+    short_headings = set(_specific_short_message_headings(headings))
+    for idx, heading in enumerate(headings):
+        if heading in short_headings and not has_valid_citation(_heading_section_text(content, headings, idx)):
+            gaps.append(heading[1])
+
+    topic_index = next((
+        idx for idx, (_level, title, _line_no) in enumerate(headings)
+        if "专题" in title and ("报告" in title or "分析" in title)
+    ), None)
+    if topic_index is None or not has_valid_citation(_heading_section_text(content, headings, topic_index)):
+        gaps.append("专题报告")
+
+    trace_index = next((
+        idx for idx, (_level, title, _line_no) in enumerate(headings)
+        if all(token in title for token in ("事实", "来源", "追溯"))
+    ), None)
+    trace_data = (
+        _trace_table_data_text(_heading_section_text(content, headings, trace_index))
+        if trace_index is not None else ""
+    )
+    if not has_valid_citation(trace_data):
+        gaps.append("事实来源追溯表数据区")
+    return gaps
+
+def _honest_boundary_item_count(content: str, headings: list[tuple[int, str, int]]) -> int:
+    lines = (content or "").splitlines()
+    for pos, (level, title, line_no) in enumerate(headings):
+        if "诚实边界" not in title:
+            continue
+        end_line = len(lines)
+        for next_level, _next_title, next_line_no in headings[pos + 1:]:
+            if next_level <= level:
+                end_line = next_line_no
+                break
+        item_pattern = re.compile(
+            r"^\s*(?:[-+*]\s+|\d+[.、)]\s*|[（(]?[一二三四五六七八九十]+[）)、.]\s*)\S"
+        )
+        return sum(1 for line in lines[line_no + 1:end_line] if item_pattern.match(line))
+    return 0
+
+def _format_citations(numbers: list[int]) -> str:
+    return "、".join(f"[{number}]" for number in numbers)
+
+def _institution_pack_trace_artifacts(content: str) -> list[str]:
+    artifacts = []
+    process_method_pattern = (
+        r"(?i)(?:" + "131" + "4520" + r"|"
+        r"(?<![A-Za-z0-9])SOD\s*[/／-]\s*SOP(?![A-Za-z0-9])|"
+        r"(?<![A-Za-z0-9])(?:SOD|SOP)(?![A-Za-z0-9])\s*(?:写作|手册|规范|制作)|"
+        r"(?:写作|手册|规范|制作)\s*(?<![A-Za-z0-9])(?:SOD|SOP)(?![A-Za-z0-9]))"
+    )
+    if re.search(process_method_pattern, content):
+        artifacts.append("SOD/SOP制作规范")
+    if (
+        re.search(r"(?i)[A-Z]:[\\/]", content)
+        or re.search(r"\\\\[^\s\\/]+[\\/]", content)
+        or re.search(r"(?i)(?:^|\s)/(?:Users|home|var|tmp|opt|mnt|Volumes)/", content)
+        or re.search(r"(?i)file:/+", content)
+    ):
+        artifacts.append("本地绝对路径")
+    ai_actor = r"(?:生成式人工智能|人工智能|AI|大(?:语言)?模型|LLM|ChatGPT|Claude|Codex)"
+    ai_deliverable = r"(?:本文|本报告|本稿|本包|本内容|制作说明|写作说明)"
+    ai_connector = r"(?:由|经|使用|通过|采用|借助|在)"
+    ai_assist = r"(?:(?:的)?(?:协助|辅助|帮助)(?:下)?)?"
+    ai_action = r"(?:生成|撰写|写作|制作|整理|润色|完成|起草|形成)"
+    ai_trace_pattern = (
+        rf"(?i)(?:{ai_deliverable}\s*(?:系|是)?\s*{ai_connector}\s*{ai_actor}\s*"
+        rf"{ai_assist}\s*{ai_action}"
+        rf"|作为(?:一个)?\s*{ai_actor}\s*(?:语言)?(?:助手|模型))"
+    )
+    if re.search(ai_trace_pattern, content):
+        artifacts.append("AI制作痕迹")
+    return artifacts
+
+def build_delivery_preflight(project: dict, draft: dict, evidence: list[dict] | None) -> dict:
+    """Return a deterministic, fail-closed delivery gate for institution packs."""
+    project = project or {}
+    draft = draft or {}
+    evidence_rows = list(evidence or [])
+    content = str(draft.get("content") or "")
+    base_counts = {
+        "evidence": len(evidence_rows),
+        "valid_links": 0,
+        "citable_originals": 0,
+        "short_messages": 0,
+        "citations_used": 0,
+        "honest_boundaries": 0,
+        "trace_artifacts": 0,
+        "section_citation_gaps": 0,
+    }
+    if project.get("report_type") != "institution_pack":
+        return {
+            "ok": True,
+            "status": "not_required",
+            "checks": [],
+            "counts": base_counts,
+            "blocked_domains": [],
+            "missing_citations": [],
+            "out_of_range_citations": [],
+        }
+
+    invalid_links: list[int] = []
+    blocked_hosts: list[str] = []
+    blocked_rows: list[int] = []
+    for idx, row in enumerate(evidence_rows, 1):
+        link = str((row or {}).get("link") or "").strip()
+        authority_match = re.match(r"(?i)^[a-z][a-z0-9+.-]*://([^/?#]*)", link)
+        authority = authority_match.group(1) if authority_match else ""
+        if "\\" in link or "@" in authority:
+            invalid_links.append(idx)
+            continue
+        try:
+            parsed = urlparse(link)
+            hostname = (parsed.hostname or "").lower().rstrip(".")
+        except ValueError:
+            invalid_links.append(idx)
+            continue
+        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            invalid_links.append(idx)
+            continue
+        base_counts["valid_links"] += 1
+        if any(hostname == domain or hostname.endswith(f".{domain}") for domain in INSTITUTION_PACK_BLOCKED_DOMAINS):
+            blocked_hosts.append(hostname)
+            blocked_rows.append(idx)
+
+    uncitable_rows = [
+        idx for idx, row in enumerate(evidence_rows, 1)
+        if not _evidence_has_citable_original(row or {})
+    ]
+    base_counts["citable_originals"] = len(evidence_rows) - len(uncitable_rows)
+
+    headings = _markdown_headings(content)
+    missing_sections = _institution_pack_missing_sections(headings)
+    short_messages = _short_message_section_count(headings)
+    base_counts["short_messages"] = short_messages
+    honest_boundaries = _honest_boundary_item_count(content, headings)
+    base_counts["honest_boundaries"] = honest_boundaries
+    trace_artifacts = _institution_pack_trace_artifacts(content)
+    base_counts["trace_artifacts"] = len(trace_artifacts)
+
+    fact_level_terms = (
+        "事实分级", "事实层级", "已核实事实", "来源有限陈述", "来源陈述",
+        "分析推断", "分析判断", "估计", "情景研判", "待核实",
+    )
+    fact_levels_present = any(term in content for term in fact_level_terms)
+
+    citations = sorted({int(number) for number in re.findall(r"\[(\d+)\]", content)})
+    base_counts["citations_used"] = len(citations)
+    expected_citations = list(range(1, len(evidence_rows) + 1))
+    missing_citations = [number for number in expected_citations if number not in citations]
+    out_of_range_citations = [
+        number for number in citations if number < 1 or number > len(evidence_rows)
+    ]
+    section_citation_gaps = _institution_pack_section_citation_gaps(
+        content,
+        headings,
+        len(evidence_rows),
+    )
+    base_counts["section_citation_gaps"] = len(section_citation_gaps)
+
+    source_count_ok = INSTITUTION_PACK_MIN_EVIDENCE <= len(evidence_rows) <= INSTITUTION_PACK_MAX_EVIDENCE
+    checks = [
+        _preflight_check(
+            "sources",
+            source_count_ok,
+            "机构来源数量",
+            (f"证据数量为{len(evidence_rows)}条，符合7—10条要求" if source_count_ok
+             else f"证据数量为{len(evidence_rows)}条，必须为7—10条"),
+        ),
+        _preflight_check(
+            "source_links",
+            not invalid_links,
+            "原文链接",
+            (f"{base_counts['valid_links']}/{len(evidence_rows)}条均为HTTP(S)原文链接" if not invalid_links
+             else f"第{_format_citations(invalid_links)}条缺少有效HTTP(S)原文链接"),
+        ),
+        _preflight_check(
+            "content",
+            not uncitable_rows,
+            "可引用原文",
+            (f"{base_counts['citable_originals']}/{len(evidence_rows)}条均已归档或已有正文" if not uncitable_rows
+             else f"第{_format_citations(uncitable_rows)}条缺少已归档资产或可引用原文正文"),
+        ),
+        _preflight_check(
+            "source_policy",
+            not blocked_hosts,
+            "来源合规",
+            ("未命中禁止来源域名" if not blocked_hosts
+             else f"禁止来源域名：{'、'.join(dict.fromkeys(blocked_hosts))}（第{_format_citations(blocked_rows)}条）"),
+        ),
+        _preflight_check(
+            "sections",
+            not missing_sections,
+            "交付结构",
+            ("必需章节齐全" if not missing_sections else f"缺少必需章节：{'、'.join(missing_sections)}"),
+        ),
+        _preflight_check(
+            "short_messages",
+            short_messages == 3,
+            "短消息",
+            ("已识别恰好3篇短消息小节" if short_messages == 3
+             else f"识别到{short_messages}篇短消息小节，必须恰好3篇"),
+        ),
+        _preflight_check(
+            "fact_levels",
+            fact_levels_present,
+            "事实分级",
+            ("正文含明确事实层级词" if fact_levels_present
+             else "正文缺少事实分级词（如“已核实事实/来源陈述/分析推断/待核实”）"),
+        ),
+        _preflight_check(
+            "citations",
+            not missing_citations,
+            "引注闭环",
+            (f"证据[1]—[{len(evidence_rows)}]均已引用" if not missing_citations
+             else f"未引用证据：{_format_citations(missing_citations)}"),
+        ),
+        _preflight_check(
+            "citation_range",
+            not out_of_range_citations,
+            "引注范围",
+            ("未发现越界引注" if not out_of_range_citations
+             else f"存在越界引注：{_format_citations(out_of_range_citations)}"),
+        ),
+        _preflight_check(
+            "section_citations",
+            not section_citation_gaps,
+            "分区引注",
+            ("3篇短消息、专题报告和事实来源追溯表数据区均含有效引注" if not section_citation_gaps
+             else f"以下交付分区缺少有效[1]—[{len(evidence_rows)}]引注：{'、'.join(section_citation_gaps)}"),
+        ),
+        _preflight_check(
+            "honest_boundaries",
+            honest_boundaries >= 3,
+            "诚实边界",
+            (f"诚实边界共{honest_boundaries}条" if honest_boundaries >= 3
+             else f"诚实边界仅{honest_boundaries}条，至少需要3条"),
+        ),
+        _preflight_check(
+            "trace_hygiene",
+            not trace_artifacts,
+            "制作痕迹清理",
+            ("正文未发现本地或AI制作痕迹" if not trace_artifacts
+             else f"正文含禁止交付的制作痕迹：{'、'.join(trace_artifacts)}"),
+        ),
+    ]
+    ok = all(check["ok"] for check in checks)
+    return {
+        "ok": ok,
+        "status": "ready" if ok else "blocked",
+        "checks": checks,
+        "counts": base_counts,
+        "blocked_domains": list(dict.fromkeys(blocked_hosts)),
+        "missing_citations": missing_citations,
+        "out_of_range_citations": out_of_range_citations,
+    }
+
+def assert_report_exportable(draft: dict, project: dict | None = None,
+                             evidence: list[dict] | None = None):
     payload = draft.get("payload") or {}
     content = draft.get("content") or ""
     # 字数目标只从用户意图（已存 payload 或客户需求）解析，绝不从报告正文 content 解析：
@@ -189,6 +583,14 @@ def assert_report_exportable(draft: dict, project: dict | None = None):
             f"当前正文约{quality['word_count']}字，低于目标字数{target}字"
             f"（最低要求{quality['min_required_word_count']}字），请继续生成或扩写后再导出"
         )
+    if (project or {}).get("report_type") == "institution_pack":
+        preflight = build_delivery_preflight(project or {}, draft, evidence)
+        if not preflight["ok"]:
+            first_gap = next(check for check in preflight["checks"] if not check["ok"])
+            raise ValueError(
+                f"机构开源情报整编包交付预检未通过：{first_gap['label']}：{first_gap['detail']}"
+            )
+        quality["delivery_preflight"] = preflight
     return quality
 
 
@@ -1026,7 +1428,7 @@ def _evidence_lines(evidence: list[dict]) -> str:
         reasons = "、".join(ev.get("quality_reasons") or []) or "基础防务相关"
         source_type = ev.get("source_type") or "公开信息"
         lines.append(
-            f"{idx}. 【{source_type}｜{ev.get('source') or '公开来源'}】{ev.get('title')}\n"
+            f"[{idx}] 【{source_type}｜{ev.get('source') or '公开来源'}】{ev.get('title')}\n"
             f"   时间：{ev.get('date') or '未知'}\n"
             f"   链接：{ev.get('link') or '无'}\n"
             f"   质量：{ev.get('quality_level') or '-'}级/{ev.get('quality_score') or 0}分；理由：{reasons}\n"
@@ -1045,8 +1447,20 @@ def _project_line(project: dict) -> str:
     )
 
 
+def _institution_pack_delivery_requirements(project: dict) -> str:
+    if project.get("report_type") != "institution_pack":
+        return ""
+    return (
+        "本项目是机构开源情报整编包，必须形成可当天交付的来源—正文—引注闭环。"
+        "交付内容必须同时包含：7—10条信息清单、恰好3篇短消息、1篇专题报告、事实来源追溯表、"
+        "事实分级、不确定性与观察指标、来源索引，以及至少3条诚实边界。"
+        "正文只可使用证据池内的[N]编号逐条引注，[1]至[N]必须全部被引用；"
+        "不得编造事实、数据、来源或结论，不得越界引用证据池外材料。"
+    )
+
 def build_outline_messages(project: dict, evidence: list[dict], voice: str = DEFAULT_AGENT_VOICE) -> list[dict]:
     writing_requirements = load_report_writing_requirements()
+    pack_requirements = _institution_pack_delivery_requirements(project)
     return [
         {
             "role": "system",
@@ -1055,6 +1469,7 @@ def build_outline_messages(project: dict, evidence: list[dict], voice: str = DEF
                 "这不是要讯、不是新闻简报、不是素材汇编；必须围绕战略问题、能力态势、长期影响和风险预警建立分析框架。"
                 "所有判断必须能追溯到公开源证据、智库报告源或报告线索，不得编造素材未提供的具体数据。"
                 "报告写作方法优先遵循DefenseTracker SOD/SOP手册。"
+                f"{pack_requirements}"
             ),
         },
         {
@@ -1063,6 +1478,7 @@ def build_outline_messages(project: dict, evidence: list[dict], voice: str = DEF
                 "请基于以下项目和证据池生成“目录提纲大纲”，输出中文Markdown。\n\n"
                 f"{_project_line(project)}\n\n写作要求：\n{writing_requirements}\n\n证据池：\n{_evidence_lines(evidence)}\n\n"
                 "大纲必须包含：研究问题、核心判断、证据矩阵、能力与部署态势、战略影响、风险预警、后续跟踪、来源附录。"
+                f"{pack_requirements}"
             ),
         },
     ]
@@ -1073,6 +1489,7 @@ def build_draft_messages(project: dict, evidence: list[dict], outline: str = "",
     outline_part = outline.strip() if outline else "请先形成战略分析框架，再生成完整报告。"
     review_part = review_notes.strip() if review_notes else "无额外审稿意见。"
     writing_requirements = load_report_writing_requirements()
+    pack_requirements = _institution_pack_delivery_requirements(project)
     target_word_count = extract_target_word_count(project.get("client_request", ""), outline, review_notes)
     target_part = (
         f"目标字数：正文约{target_word_count}字，最低不得少于{int(target_word_count * LONG_REPORT_MIN_RATIO)}字；"
@@ -1089,6 +1506,7 @@ def build_draft_messages(project: dict, evidence: list[dict], outline: str = "",
                 "所有判断必须能够从证据池追溯，不得虚构数据、来源和结论。"
                 "报告写作方法优先遵循DefenseTracker SOD/SOP手册。"
                 "严禁使用任何涉密等级标识字眼，报告必须定位为公开源研究成果。"
+                f"{pack_requirements}"
             ),
         },
         {
@@ -1099,6 +1517,7 @@ def build_draft_messages(project: dict, evidence: list[dict], outline: str = "",
                 f"证据池：\n{_evidence_lines(evidence)}\n\n"
                 "输出结构：# 标题、## 执行摘要、## 核心判断、## 证据与来源、## 能力态势分析、"
                 "## 战略影响研判、## 风险预警、## 后续跟踪建议、## 来源附录。"
+                f"{pack_requirements}"
             ),
         },
     ]
@@ -1243,6 +1662,98 @@ def _set_cell_margins(cell, top: int = 100, start: int = 140, bottom: int = 100,
         node.set(qn("w:type"), "dxa")
 
 
+def _section_content_width_dxa(doc) -> int:
+    section = doc.sections[-1]
+    return int(section.page_width.twips - section.left_margin.twips - section.right_margin.twips)
+
+def _allocate_table_widths(total_width: int, weights: list[int]) -> list[int]:
+    weight_total = sum(weights)
+    widths = [int(total_width * weight / weight_total) for weight in weights]
+    widths[-1] += total_width - sum(widths)
+    return widths
+
+def _apply_table_geometry(doc, table, weights: list[int], cell_margin: int):
+    if len(weights) != len(table.columns) or not weights or any(weight <= 0 for weight in weights):
+        raise ValueError("表格列权重必须与列数一致且均为正数")
+    for tc in table._tbl.iter(qn("w:tc")):
+        tcpr = tc.find(qn("w:tcPr"))
+        if tcpr is None:
+            continue
+        grid_span = tcpr.find(qn("w:gridSpan"))
+        vertical_merge = tcpr.find(qn("w:vMerge"))
+        if vertical_merge is not None or (
+            grid_span is not None and int(grid_span.get(qn("w:val"), "1")) > 1
+        ):
+            raise ValueError("固定表格布局不支持合并单元格")
+    for row in table.rows:
+        if len({id(cell._tc) for cell in row.cells}) != len(row.cells):
+            raise ValueError("固定表格布局不支持合并单元格")
+
+    content_width = _section_content_width_dxa(doc)
+    probe_widths = _allocate_table_widths(content_width, weights)
+    if min(probe_widths) <= 0:
+        raise ValueError("表格列权重导致有效列宽不足")
+    effective_margin = min(cell_margin, max(20, min(probe_widths) // 4))
+    total_width = content_width - effective_margin
+    widths = _allocate_table_widths(total_width, weights)
+    if min(widths) <= 0:
+        raise ValueError("表格列权重导致有效列宽不足")
+    table.autofit = False
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+
+    tblpr = table._tbl.tblPr
+    tbl_width = tblpr.find(qn("w:tblW"))
+    if tbl_width is None:
+        tbl_width = OxmlElement("w:tblW")
+        tblpr.append(tbl_width)
+    tbl_width.set(qn("w:w"), str(total_width))
+    tbl_width.set(qn("w:type"), "dxa")
+
+    tbl_indent = tblpr.find(qn("w:tblInd"))
+    if tbl_indent is None:
+        tbl_indent = OxmlElement("w:tblInd")
+        tblpr.append(tbl_indent)
+    tbl_indent.set(qn("w:w"), str(effective_margin))
+    tbl_indent.set(qn("w:type"), "dxa")
+
+    layout = tblpr.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        tblpr.append(layout)
+    layout.set(qn("w:type"), "fixed")
+
+    grid = table._tbl.tblGrid
+    for child in list(grid):
+        grid.remove(child)
+    for width in widths:
+        grid_col = OxmlElement("w:gridCol")
+        grid_col.set(qn("w:w"), str(width))
+        grid.append(grid_col)
+
+    for column, width in zip(table.columns, widths):
+        column.width = Twips(width)
+    for row in table.rows:
+        for cell, width in zip(row.cells, widths):
+            cell.width = Twips(width)
+            tc_width = cell._tc.get_or_add_tcPr().find(qn("w:tcW"))
+            tc_width.set(qn("w:w"), str(width))
+            tc_width.set(qn("w:type"), "dxa")
+            _set_cell_margins(
+                cell,
+                top=effective_margin,
+                start=effective_margin,
+                bottom=effective_margin,
+                end=effective_margin,
+            )
+
+def _mark_table_header(row):
+    trpr = row._tr.get_or_add_trPr()
+    header = trpr.find(qn("w:tblHeader"))
+    if header is None:
+        header = OxmlElement("w:tblHeader")
+        trpr.append(header)
+    header.set(qn("w:val"), "true")
+
 def _set_table_borders(table, color: str = "8A8F98", size: str = "4"):
     tblpr = table._tbl.tblPr
     borders = tblpr.find(qn("w:tblBorders"))
@@ -1275,7 +1786,7 @@ def _add_page_field(paragraph):
     run._r.extend([begin, instr, separate, text, end])
 
 
-def _configure_report_furniture(doc, title: str):
+def _configure_report_furniture(doc, title: str, project: dict | None = None):
     section = doc.sections[0]
     header = section.header
     header.is_linked_to_previous = False
@@ -1283,7 +1794,12 @@ def _configure_report_furniture(doc, title: str):
     hp.text = ""
     hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _format_paragraph(hp, after_pt=0, line_pt=16)
-    _set_run_font(hp.add_run("OSINT 战略研究报告 · DefenseTracker SOD/SOP"), "宋体", 9, color="5B6472")
+    header_text = (
+        "机构开源情报整编包 · 公开源研究成果"
+        if (project or {}).get("report_type") == "institution_pack"
+        else "OSINT 战略研究报告 · DefenseTracker SOD/SOP"
+    )
+    _set_run_font(hp.add_run(header_text), "宋体", 9, color="5B6472")
     _set_paragraph_bottom_border(hp, "B7C0CC", "4")
 
     footer = section.footer
@@ -1425,13 +1941,22 @@ def _add_title_page(doc, project: dict, front_matter: dict | None = None):
     tagline.paragraph_format.space_after = Pt(34)
     _set_run_font(tagline.add_run("基于公开源证据链的技术—能力—规则三维综合研判"), "楷体_GB2312", 14, color="475569")
 
-    meta_rows = [
-        ("写作规范", "DefenseTracker SOD/SOP · 论文式战略研究版式"),
-        ("分析框架", "技术—能力—规则 · PARA · FACT-DATA-CITE"),
-        ("报告类型", REPORT_TYPE_DEFAULTS.get(project.get("report_type"), {}).get("label", "战略分析报告")),
-        ("研究主题", project.get("topic") or title),
-        ("生成时间", _format_chinese_date(datetime.now())),
-    ]
+    if project.get("report_type") == "institution_pack":
+        meta_rows = [
+            ("成果属性", "公开源研究成果"),
+            ("分析框架", "来源核验 · 事实分级 · 不确定性标注"),
+            ("报告类型", REPORT_TYPE_DEFAULTS["institution_pack"]["label"]),
+            ("研究主题", project.get("topic") or title),
+            ("生成时间", _format_chinese_date(datetime.now())),
+        ]
+    else:
+        meta_rows = [
+            ("写作规范", "DefenseTracker SOD/SOP · 论文式战略研究版式"),
+            ("分析框架", "技术—能力—规则 · PARA · FACT-DATA-CITE"),
+            ("报告类型", REPORT_TYPE_DEFAULTS.get(project.get("report_type"), {}).get("label", "战略分析报告")),
+            ("研究主题", project.get("topic") or title),
+            ("生成时间", _format_chinese_date(datetime.now())),
+        ]
     if front_matter:  # 报纸式 masthead：与屏上 newspaper 视图同款
         meta_rows.extend([
             ("期号", front_matter.get("issue") or ""),
@@ -1452,6 +1977,7 @@ def _add_title_page(doc, project: dict, front_matter: dict | None = None):
         right.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
         _set_run_font(left.paragraphs[0].add_run(label), "黑体", 11, bold=True, color="0F172A")
         _set_run_font(right.paragraphs[0].add_run(sanitize_report_text(str(value))), "仿宋_GB2312", 11, color="1F2937")
+    _apply_table_geometry(doc, table, [3, 7], cell_margin=140)
 
     if front_matter and front_matter.get("cards"):  # 报纸式：核心判断卡（与屏上同款）
         cards_head = doc.add_paragraph()
@@ -1568,6 +2094,8 @@ def _render_report_table(doc, rows: list[list[str]]):
             para.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = para.add_run(cell_text)
             _set_run_font(run, "黑体" if r_idx == 0 else "仿宋_GB2312", 10.5, bold=(r_idx == 0), color="0F172A")
+    _apply_table_geometry(doc, table, [1] * width, cell_margin=140)
+    _mark_table_header(table.rows[0])
     doc.add_paragraph()
 
 
@@ -1620,12 +2148,14 @@ def _add_source_index(doc, evidence: list[dict] | None):
                 _set_cell_shading(cell, "F8FAFC")
             cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER if c_idx in (0, 3) else WD_ALIGN_PARAGRAPH.LEFT
             _set_run_font(cell.paragraphs[0].add_run(sanitize_report_text(str(value))), "仿宋_GB2312", 8.5, color="111827")
+    _apply_table_geometry(doc, table, [5, 11, 17, 6, 21], cell_margin=100)
+    _mark_table_header(table.rows[0])
 
 
 def build_report_docx(project: dict, draft: dict, evidence: list[dict] | None = None) -> BytesIO:
     if not DOCX_AVAILABLE:
         raise RuntimeError("python-docx 未安装")
-    assert_report_exportable(draft, project)
+    assert_report_exportable(draft, project, evidence=evidence)
     content = sanitize_report_text(draft.get("content") or "")
     if not content:
         raise ValueError("草稿内容为空")
@@ -1633,7 +2163,7 @@ def build_report_docx(project: dict, draft: dict, evidence: list[dict] | None = 
     doc = Document()
     _configure_defensetracker_docx(doc)
     title = sanitize_report_text(project.get("title") or "防务战略分析报告")
-    _configure_report_furniture(doc, title)
+    _configure_report_furniture(doc, title, project)
     blocks = _markdown_blocks(content)
     front_matter = build_newspaper_front_matter(project, content) if project.get("voice") == NEWSPAPER_VOICE else None
     _add_title_page(doc, project, front_matter)

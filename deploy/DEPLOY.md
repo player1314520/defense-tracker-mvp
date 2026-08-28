@@ -94,7 +94,7 @@ $env:NGROK_DOMAIN = 'your-ngrok-domain.example'
 | SSRF防护 | ✅ | 禁止访问私有/内网地址 |
 | 安全响应头 | ✅ | CSP / X-Frame-Options / nosniff |
 | 文件上传限制 | ✅ | 最大16MB |
-| 飞书Webhook签名验证 | ✅ | 配置 FEISHU_VERIFY_TOKEN 后生效 |
+| 飞书Webhook签名验证 | ✅ | 必须配置 FEISHU_VERIFY_TOKEN；缺失时 webhook 固定返回 503 |
 | 飞书消息去重 | ✅ | 防重试导致重复生成 |
 | HTTPS Cookie | ✅ | 公网HTTPS下自动设置 secure 标志 |
 | Nginx限速 | ✅ | 登录页5r/m，API 30r/m |

@@ -3,7 +3,7 @@
 Defense Data Tracker v8.0 - Priority Scoring Edition
 实时抓取防务数据 · 写作要点优先评分(0-10★) · 3D地球仪热点 · AI在线分析 · PLA专项追踪 · 要讯自动写作
 """
-import re, sys, json, os, sqlite3, hashlib, feedparser, requests, smtplib, mimetypes, zipfile, time
+import re, sys, json, os, sqlite3, hashlib, hmac, feedparser, requests, smtplib, mimetypes, zipfile, time
 # 允许 `py app.py` 直接启动：作 __main__ 时把自身注册为 "app" 模块，令 quality.py 的 `import app`
 # 解析到本运行模块，避免 __main__/app 双份实例触发循环 import（gunicorn/launcher/pytest 走 by-name
 # import，此处 __name__ != "__main__" 故为 no-op，既有启动路径不受影响）。
@@ -29,6 +29,8 @@ from flask import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading, logging
 from bs4 import BeautifulSoup
@@ -93,6 +95,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from v9.redaction import install_redaction_filter
 install_redaction_filter(logger)
+mimetypes.add_type("text/javascript", ".mjs", strict=True)
+mimetypes.add_type("text/javascript", ".mjs", strict=False)
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024   # 修复7：最大16MB上传
@@ -1283,9 +1287,9 @@ def _parse_dt(entry):
     for attr in ("published_parsed", "updated_parsed"):
         t = getattr(entry, attr, None)
         if t:
-            try: return datetime(*t[:6], tzinfo=timezone.utc)
+            try: return datetime(*t[:6], tzinfo=timezone.utc), True
             except: pass
-    return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc), False
 
 _BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1323,14 +1327,65 @@ def _read_limited_response(resp: requests.Response, max_bytes: int = MAX_FETCH_B
     finally:
         resp.close()
 
+
+_SSRF_HTTP_LOCAL = threading.local()
+
+
+def _ssrf_http_session() -> requests.Session:
+    """One direct, proxy-free Session per worker thread for untrusted URLs."""
+    session = getattr(_SSRF_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        _SSRF_HTTP_LOCAL.session = session
+    return session
+
+
+def _connected_peer_ip(resp: requests.Response) -> str:
+    raw = getattr(resp, "raw", None)
+    candidates = [
+        getattr(getattr(raw, "_connection", None), "sock", None),
+        getattr(
+            getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None),
+            "_sock",
+            None,
+        ),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            peer = candidate.getpeername()
+            if peer and peer[0]:
+                return str(peer[0])
+        except (AttributeError, OSError, TypeError):
+            continue
+    raise requests.RequestException("无法核验远端连接地址")
+
+
+def _validate_connected_peer(resp: requests.Response) -> None:
+    try:
+        peer_ip = _connected_peer_ip(resp)
+        blocked, blocked_addr = _is_blocked_addr(peer_ip)
+    except Exception:
+        resp.close()
+        raise
+    if blocked:
+        resp.close()
+        raise requests.RequestException(f"连接被重绑定到私有地址: {blocked_addr}")
+
+
 def _safe_get_once(url: str, headers: dict, timeout: int) -> requests.Response:
     current = url
     for redirect_idx in range(MAX_REDIRECTS + 1):
         safe, reason = _is_ssrf_safe(current)
         if not safe:
             raise requests.RequestException(f"URL不安全: {reason}")
-        resp = requests.get(current, headers=headers, timeout=timeout,
-                            allow_redirects=False, stream=True)
+        resp = _ssrf_http_session().get(
+            current, headers=headers, timeout=timeout,
+            allow_redirects=False, stream=True,
+        )
+        _validate_connected_peer(resp)
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location")
             resp.close()
@@ -1392,7 +1447,7 @@ def fetch_feed(fi: dict) -> list:
             link    = getattr(e, "link",    "").strip()
             summary = re.sub(r"<[^>]+>", "", getattr(e, "summary", ""))[:500]
             if not title or not link: continue
-            pub = _parse_dt(e)
+            pub, publication_date_verified = _parse_dt(e)
             if pub < cutoff: continue
             tags = score_article(title, summary, fi["name"])
             pub_iso = pub.isoformat()
@@ -1410,6 +1465,7 @@ def fetch_feed(fi: dict) -> list:
                 "tier":      fi.get("tier", 2),
                 "focus":     fi.get("focus", "general"),
                 "date":      pub_iso,
+                "publication_date_verified": publication_date_verified,
                 "value_tags": tags,
                 "priority":  priority,
             })
@@ -2143,7 +2199,7 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 【核心文风要求】中文军事媒体机关行文体
 ════════════════════════════════════════
 必用军语词汇（自然嵌入行文）：
-• 开头句式："据XX报道""据XX网站X月X日报道""XX近日报道"
+• 开头句式：统一使用"据XX报道，"；发文日期只写在信息来源行，不得夹在"据XX报道"中
 • 研判用语："值得警惕""值得关注""须警惕""研判""着力""亟需""显著提升""根本性威胁""现实压力"
 • 建议用语："建议持续跟踪""加强""积极参与""着力构建""针对性加强""掌握战略主动""争取战略主动"
 • 战略词汇："战略制高点""战略间隙""战略主动""战略支援""战略意图""根本性威胁""颠覆性威胁"
@@ -2158,15 +2214,16 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 ════════════════════════════════════════
 【输出格式】严格按此六部分输出（参照素材1-5通用模板）
 ════════════════════════════════════════
-第一行：事件时间：YYYY年M月D日
-第二行：价 值 点：<一句话，60字内，指出核心研判与战略意义>
+第一行：事件时间：YYYY年M月D日（只写原文明确支持的实际事件日期；禁用"近期/近日/日前"；不得用发文日期冒充事件日期）
+第二行：价 值 点：<一句话，60字内，用不同于标题的表述指出核心研判与战略意义，严禁复制标题>
 第三行：（空行）
-第四行：<标题：8-20字，主语明确，必须以"值得警惕""值得关注""威胁"或"压力"等警示词收尾>
+第四行：<标题：8-15字，主语明确，不得含中文或英文逗号，必须以"值得警惕"或"值得关注"收尾>
 第五行：（空行）
-第六行开始：<正文：单段成文，250-350字，结构如下>
-     据<具体信息源>报道，<背景：时间+主体+动作+装备数量+地点+目的，80-120字>。（1）<影响一：对我战略/装备/力量的直接影响，35-55字>；（2）<影响二：对区域态势/盟体/对手的影响，35-55字>；（3）<影响三：深层意图/长远威胁研判，35-55字>。建议持续跟踪<对象>的<要素一>、<要素二>及<要素三>，针对性加强<能力一>、<能力二>及<能力三>能力建设。
+第六行开始：<正文：单段成文，250-350字；可选择以下一种结构>
+     编号式：据<具体信息源>报道，<帽段：用80-120字、最终版面约3-4行简述具体事件日期+主体+动作+装备数量+地点+目的>。（1）<影响一>。（2）<影响二>。（3）<影响三>。建议持续跟踪<对象>的<要素一>、<要素二>及<要素三>，针对性加强<能力一>、<能力二>及<能力三>能力建设。
+     无编号式：据<具体信息源>报道，<同上帽段>。<层意一>；<层意二>；<层意三>。建议持续跟踪<对象>的<要素一>、<要素二>及<要素三>，针对性加强<能力一>、<能力二>及<能力三>能力建设。
 （空行）
-倒数第二行：（信息来源：<原报道来源网站>X月X日发文《<原报道标题>》）
+倒数第二行：（信息来源：<来源一>X月X日发文《<标题一>》；<来源二>X月X日发文《<标题二>》）
 末行：报送人：           电话：
 
 ════════════════════════════════════════
@@ -2176,9 +2233,9 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 事件时间：2026年3月24日
 价 值 点：俄太空核武器研发加速，我在轨战略资产面临颠覆性威胁，美欧协调失序形成战略间隙，须研判美方双重意图，掌握战略主动。
 
-俄太空核武器研发加速威胁我战略资产值得警惕
+俄太空核武研发值得警惕
 
-据美防务一号网站报道，美参议院军事委员会听证会上，美战略及太空司令部领导人证实，俄罗斯正公开推进太空核武器研发，一旦于低轨引爆，将无差别摧毁各国近地轨道航天资产，美欧因"核保护伞"可信度分歧亦出现明显裂痕。（1）太空核武器一旦实战化，将对我卫星导航、侦察预警、通信中继等战略支援能力构成根本性威胁；（2）美欧盟体协调失序，客观上为我战略运筹提供窗口期；（3）需警惕美方借此向国会争取经费、对俄施压的双重意图，须辩证研判其信息真实性与战略目的。建议持续跟踪俄太空核武器研发动态及部署进展，加强我太空资产抗毁性与快速补网能力建设。
+据美防务一号网站报道，3月24日美参议院军事委员会举行听证，美战略及太空司令部领导人证实，俄罗斯正公开推进太空核武器研发，一旦于低轨引爆，将无差别摧毁各国近地轨道航天资产，美欧因"核保护伞"可信度分歧亦出现明显裂痕。（1）太空核武器一旦实战化，将对我卫星导航、侦察预警、通信中继等战略支援能力构成根本性威胁。（2）美欧盟体协调失序，客观上为我战略运筹提供窗口期。（3）需警惕美方借此向国会争取经费、对俄施压的双重意图，须辩证研判其信息真实性与战略目的。建议持续跟踪俄太空核武器研发动态及部署进展，加强我太空资产抗毁性与快速补网能力建设。
 
 （信息来源：美防务一号网站3月26日发文《参院军事委员会主席：美国国防战略在核与太空威胁问题上"存在不足"》）
 报送人：           电话：
@@ -2187,9 +2244,9 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 事件时间：2026年3月28日
 价 值 点：美军以F-35A替换F-16进驻三泽，实质性提升第一岛链隐形打击与态势感知能力，对我东北亚方向防空反隐形体系构成直接现实压力。
 
-美向日本部署F-35A隐形战机威胁我周边空中安全值得关注
+美军隐形战机进驻三泽值得关注
 
-据比利时陆军防务网报道，3月28日美军首批F-35A隐形战斗机抵达日本三泽空军基地，取代F-16，投入超100亿美元用于基础设施升级，该机具备隐形、传感器融合及多任务能力，可执行防空压制、精确打击及盟军协同作战。（1）F-35A前沿部署将显著压缩我防空识别区反应时间，增大我周边空中安全压力；（2）三泽成为美日共用F-35平台前沿基地，明显提升美在东北亚的隐形打击与态势感知能力；（3）美方明确称此举针对中国在东海等地日益常态化的军事活动，遏华意图凸显。建议持续跟踪该机在三泽的部署规模及训练强度，针对性加强反隐形侦察、区域防空及电子对抗能力建设。
+据比利时陆军防务网报道，3月28日美军首批F-35A隐形战斗机抵达日本三泽空军基地，取代F-16，投入超100亿美元用于基础设施升级，该机具备隐形、传感器融合及多任务能力，可执行防空压制、精确打击及盟军协同作战。（1）F-35A前沿部署将显著压缩我防空识别区反应时间，增大我周边空中安全压力。（2）三泽成为美日共用F-35平台前沿基地，明显提升美在东北亚的隐形打击与态势感知能力。（3）美方明确称此举针对中国在东海等地日益常态化的军事活动，遏华意图凸显。建议持续跟踪该机在三泽的部署规模及训练强度，针对性加强反隐形侦察、区域防空及电子对抗能力建设。
 
 （信息来源：比利时陆军防务网网站3月30日发文《美国向日本部署F-35A隐形战斗机，取代F-16以应对中国威胁》）
 报送人：           电话：
@@ -2228,16 +2285,21 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 【硬性红线】违反任一条重写
 ════════════════════════════════════════
 1. 必须严格六部分输出（事件时间/价值点/标题/正文/信息来源/报送人电话行），不得增减
-2. 正文必须单段成文，使用（1）（2）（3）三点分列影响
-3. 正文总字数控制在250-350字
-4. 标题必须以警示词（值得警惕/值得关注/威胁/压力）收尾
-5. 不得使用任何markdown符号（#、*、-、**等）
-6. 必须保持PLA机关军语文风，不得口语化
-7. 不得脱离原文编造事实数据
-8. 建议必须严格采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"范式
-9. 末行必须输出"报送人：           电话："（留空待填）
-10. 正文"据XX报道"中的XX必须是中文媒体名称，严禁出现英文域名或英文媒体名
-11. 信息来源行《》内的文章标题必须翻译为中文，严禁保留英文原标题"""
+2. 事件时间必须为原文支持的具体年月日；不得写"近期/近日/日前"等相对时间，不得用媒体发文日期冒充事件日期
+3. 价值点必须另行概括战略意义，不得复制标题
+4. 标题必须为8-15字，不得含中文或英文逗号，并以"值得警惕"或"值得关注"收尾
+5. 正文必须单段成文；帽段用80-120字简述基本情况，在最终DOCX中约占3-4行，并写出与事件时间一致的具体月日
+6. 使用（1）（2）（3）分层时，各层之间必须用句号，严禁用分号；不用编号时，至少三层意思用中文分号分隔并以句号收束
+7. 正文总字数控制在250-350字
+8. 正文统一写"据XX报道，"，XX必须与信息来源行的来源名称一致，发文日期只写在信息来源行；若公众号转引外网消息，优先核验并引用外网第一信源，无法取得时写"据XX公众号报道，"
+9. 信息来源必须逐条写成"XX X月X日发文《标题》"；多个来源以中文分号分隔并全部列全
+10. 不得使用任何markdown符号（#、*、-、**等）
+11. 必须保持PLA机关军语文风，不得口语化
+12. 不得脱离原文编造事实数据
+13. 建议必须严格采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"范式
+14. 末行必须输出"报送人：           电话："（留空待填）
+15. 正文和信息来源中的媒体名称必须使用中文，严禁出现英文域名或英文媒体名
+16. 信息来源行《》内的文章标题必须翻译为中文，严禁保留英文原标题"""
 
 def _build_brief_user_prompt(article: dict) -> str:
     """构造写要讯的用户提示"""
@@ -2253,12 +2315,12 @@ def _build_brief_user_prompt(article: dict) -> str:
         dt = datetime.fromisoformat(date.replace("Z", "+00:00"))
         date_cn = _format_cn_date(dt)
         pub_md = _format_cn_month_day(dt)
-    except:
-        dt = datetime.now()
-        date_cn = _format_cn_date(dt)
-        pub_md = _format_cn_month_day(dt)
+    except (AttributeError, TypeError, ValueError):
+        date_cn = "未提供"
+        pub_md = ""
 
     today_cn = _format_cn_date(datetime.now())
+    source_entry_example = f"{source_cn}{pub_md or 'X月X日'}发文《{title}》"
 
     return f"""请根据以下境外防务原始素材，撰写一份PLA机关军语要讯（情报简报）：
 
@@ -2275,24 +2337,413 @@ def _build_brief_user_prompt(article: dict) -> str:
 
 ════════ 写作任务 ════════
 请输出一份要讯，严格遵循以下要求：
-1. 事件时间填写【原报道发布日期】：{date_cn}
-2. 正文开头使用"据{source_cn}报道"或"据{source_cn}{pub_md}报道"
-3. 末尾信息来源填写：（信息来源：{source_cn}{pub_md}发文《{title}》）
-4. 必须单段成文、（1）（2）（3）三点分列影响、250-350字；结尾建议必须采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"的范式
-5. 标题以"值得警惕/值得关注/威胁/压力"收尾
-6. 使用PLA机关军语，必须出现"研判/建议/着力/加强/威胁/值得警惕"等词
-7. 从原文提炼对我军/对华影响，不得编造原文未提及的具体数据
+1. 事件时间只填写原文明确记载的实际事件日期，必须写完整年月日，不得写"近期/近日/日前"，也不得把原报道发布日期{date_cn}或今日日期当作事件日期。原文未给具体事件日期时不得臆造
+2. 价值点必须用不同于标题的表述概括战略意义，严禁复制标题
+3. 标题控制在8-15字，不得含中文或英文逗号，且以"值得警惕"或"值得关注"收尾
+4. 正文统一以"据{source_cn}报道，"开头，该来源名称必须与信息来源行一致，发文日期只写在信息来源行。若该素材来自公众号转引，优先采用已核验的外网第一信源；无法取得第一信源时写"据XX公众号报道，"
+5. 帽段先用80-120字简述事件基本情况，写出与事件时间一致的具体月日，使其在最终DOCX版面约占3-4行，再进入分析
+6. 必须单段成文、250-350字；可使用（1）（2）（3）三点分列且各层用句号，写成"。（2）""。（3）"；也可不用编号，将至少三层意思用中文分号分隔并以句号收束
+7. 结尾建议必须采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"的范式
+8. 末尾信息来源逐条写成"来源名X月X日发文《中文标题》"；当前素材至少写：（信息来源：{source_entry_example}）。如日期未提供，须从原文核实后替换X月X日；如正文还引用其他来源，全部补入同一行并以中文分号分隔
+9. 使用PLA机关军语，从原文提炼对我军/对华影响，不得编造原文未提及的具体数据
 
 直接输出要讯全文，不要任何解释说明。"""
 
-BRIEF_WARNING_WORDS = ("值得警惕", "值得关注", "值得重视", "威胁", "压力", "引发关注", "引发热议")
+BRIEF_WARNING_WORDS = ("值得警惕", "值得关注")
 BRIEF_MARKDOWN_RE = re.compile(r"(?:^|\s)(#{1,6}\s|\*\*|__|```|~~~|^\s*[-*+]\s)", re.MULTILINE)
+
+BRIEF_RELATIVE_EVENT_WORDS = ("近期", "近日", "日前", "最近", "当前", "本月", "今年")
+
+BRIEF_EVENT_DATE_RE = re.compile(r"(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日")
+
+BRIEF_SOURCE_ENTRY_RE = re.compile(
+    r"^(?P<name>.+?)\s*(?P<month>\d{1,2})月(?P<day>\d{1,2})日发文《(?P<title>[^》]+)》$"
+)
+
+BRIEF_BODY_ATTRIBUTION_RE = re.compile(r"据(?P<label>[^，,。；;]{1,80}?)报道")
+
+BRIEF_SECONDARY_ATTRIBUTION_RE = re.compile(
+    r"(?P<name>[\u4e00-\u9fffA-Za-z0-9·]{2,30}?(?:通讯社|新闻社|电视台|新闻网|网站|研究所|中心|智库|公众号|杂志|周刊|日报|时报|报|社|网|新闻))"
+    r"(?:称|指出|披露|报道(?:称)?|援引)"
+)
+
+BRIEF_CONTEXT_ATTRIBUTION_RE = re.compile(
+    r"(?:另据|根据|援引|据)(?P<name>[^，,。；;]{2,40}?)"
+    r"(?:的)?(?:报道|消息|声明|数据|报告)(?:显示|称|指出|披露|证实|，|,|。|；|;|$)"
+)
+
+BRIEF_RECIPIENT_ATTRIBUTION_RE = re.compile(
+    r"(?:消息人士|官员|知情人士|发言人)向(?P<name>[^，,。；;]{2,40}?)(?:表示|透露|称)"
+)
 
 def _count_cn(text: str) -> int:
     """统计正文字符数（含中英文数字标点，不含空白）"""
     return len(re.sub(r"\s", "", text or ""))
 
-def _validate_brief(parsed: dict) -> dict:
+def _brief_compact(text: str) -> str:
+    """去除不影响复用判断的空白和常见标点。"""
+    return re.sub(r"[\s，,。；;：:！？!?（）()《》“”\"'、]", "", text or "")
+
+BRIEF_MEDIA_ALIAS_GROUPS = (
+    ("美国防务新闻", "防务新闻", "Defense News", "defensenews.com"),
+    ("美防务一号网站", "防务一号", "Defense One", "defenseone.com"),
+    ("美突破防务网", "突破防务", "Breaking Defense", "breakingdefense.com"),
+    ("美海军学会新闻网", "美海军研究所", "USNI News", "news.usni.org", "usni.org"),
+    ("路透社", "Reuters", "reuters.com"),
+    ("美联社", "AP", "Associated Press", "apnews.com"),
+    ("彭博社", "Bloomberg", "bloomberg.com"),
+    ("英国广播公司", "BBC", "bbc.com", "bbc.co.uk"),
+    ("香港南华早报", "南华早报", "South China Morning Post", "scmp.com"),
+    ("日本共同社", "共同社", "Kyodo News", "kyodonews.net"),
+    ("韩联社", "Yonhap", "yna.co.kr"),
+    ("日本经济新闻", "Nikkei", "Nikkei Asia", "nikkei.com"),
+    ("英国金融时报", "金融时报", "Financial Times", "ft.com"),
+)
+
+BRIEF_ENGLISH_MONTHS = (
+    (1, "January", "Jan"), (2, "February", "Feb"), (3, "March", "Mar"),
+    (4, "April", "Apr"), (5, "May", "May"), (6, "June", "Jun"),
+    (7, "July", "Jul"), (8, "August", "Aug"), (9, "September", "Sep", "Sept"),
+    (10, "October", "Oct"), (11, "November", "Nov"), (12, "December", "Dec"),
+)
+
+def _brief_parse_date_value(value) -> datetime | None:
+    """解析来源元数据中的完整日期；不为缺失年份的月日做推断。"""
+    if isinstance(value, datetime):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    normalized = re.sub(r"\s+", " ", raw)
+    for fmt in (
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日",
+        "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    match = re.search(r"(?P<year>\d{4})[-/.年](?P<month>\d{1,2})[-/.月](?P<day>\d{1,2})(?:日)?", raw)
+    if match:
+        try:
+            return datetime(int(match.group("year")), int(match.group("month")), int(match.group("day")))
+        except ValueError:
+            return None
+    return None
+
+def _brief_month_day_supported(text: str, month: int, day: int) -> bool:
+    haystack = str(text or "")
+    if re.search(rf"(?<!\d)0?{month}\s*月\s*0?{day}\s*[日号](?!\d)", haystack):
+        return True
+    if re.search(rf"(?<!\d)0?{month}\s*[-/.]\s*0?{day}(?!\d)", haystack):
+        return True
+    for number, *names in BRIEF_ENGLISH_MONTHS:
+        if number != month:
+            continue
+        month_names = "|".join(map(re.escape, names))
+        if re.search(rf"\b(?:{month_names})\.?\s+0?{day}(?:st|nd|rd|th)?\b", haystack, re.I):
+            return True
+        if re.search(rf"\b0?{day}(?:st|nd|rd|th)?\s+(?:{month_names})\.?\b", haystack, re.I):
+            return True
+    return False
+
+def _brief_event_date_supported(text: str, year: int, month: int, day: int,
+                                publication_year: int | None = None) -> bool:
+    haystack = str(text or "")
+    full_patterns = (
+        rf"(?<!\d){year}\s*年\s*0?{month}\s*月\s*0?{day}\s*[日号](?!\d)",
+        rf"(?<!\d){year}\s*[-/.]\s*0?{month}\s*[-/.]\s*0?{day}(?!\d)",
+    )
+    if any(re.search(pattern, haystack) for pattern in full_patterns):
+        return True
+    for number, *names in BRIEF_ENGLISH_MONTHS:
+        if number != month:
+            continue
+        month_names = "|".join(map(re.escape, names))
+        if re.search(rf"\b(?:{month_names})\.?\s+0?{day}(?:st|nd|rd|th)?,?\s+{year}\b", haystack, re.I):
+            return True
+        if re.search(rf"\b0?{day}(?:st|nd|rd|th)?\s+(?:{month_names})\.?,?\s+{year}\b", haystack, re.I):
+            return True
+    year_is_supported = publication_year == year or re.search(rf"(?<!\d){year}(?!\d)", haystack)
+    return bool(year_is_supported and _brief_month_day_supported(haystack, month, day))
+
+def _brief_aliases_for_name(name: str, url: str = "") -> set[str]:
+    aliases = {str(name or "").strip()}
+    host = urlparse(url).hostname or "" if url else ""
+    compact_name = _brief_compact(name).casefold()
+    for group in BRIEF_MEDIA_ALIAS_GROUPS:
+        compact_group = {_brief_compact(item).casefold() for item in group}
+        domains = {item.casefold() for item in group if "." in item}
+        if compact_name in compact_group or any(host.casefold().endswith(domain) for domain in domains):
+            aliases.update(group)
+    for feed in RSS_FEEDS:
+        feed_aliases = {str(feed.get("name") or ""), str(feed.get("name_cn") or "")}
+        feed_host = urlparse(str(feed.get("url") or "")).hostname or ""
+        if compact_name in {_brief_compact(item).casefold() for item in feed_aliases} or (
+            host and feed_host and (host.endswith(feed_host) or feed_host.endswith(host))
+        ):
+            aliases.update(feed_aliases)
+            if feed_host:
+                aliases.add(feed_host)
+    return {item for item in aliases if item}
+
+def _brief_name_supported_in_material(name: str, material_text: str) -> bool:
+    material = _brief_compact(material_text).casefold()
+    return any(
+        _brief_compact(alias).casefold() in material
+        for alias in _brief_aliases_for_name(name)
+        if _brief_compact(alias)
+    )
+
+def _brief_source_context(*, material_text: str, source_name: str = "",
+                          source_title: str = "", publication_date="",
+                          publication_date_verified: bool = False,
+                          url: str = "", origin: str = "unknown") -> dict:
+    parsed_publication_date = _brief_parse_date_value(publication_date)
+    return {
+        "material_text": str(material_text or ""),
+        "source_name": str(source_name or "").strip(),
+        "source_aliases": sorted(_brief_aliases_for_name(source_name, url)),
+        "source_title": str(source_title or "").strip(),
+        "publication_date": parsed_publication_date,
+        "publication_date_verified": bool(publication_date_verified and parsed_publication_date),
+        "url": str(url or ""),
+        "origin": str(origin or "unknown")[:64],
+    }
+
+_BRIEF_EVIDENCE_KEY_FILE = os.path.join(DATA_DIR, ".brief_evidence.key")
+_BRIEF_EVIDENCE_SIGNING_KEY = None
+_BRIEF_EVIDENCE_KEY_LOCK = threading.Lock()
+
+
+def _brief_evidence_signing_key() -> bytes:
+    """Return a stable local HMAC key without ever exposing it to the browser."""
+    global _BRIEF_EVIDENCE_SIGNING_KEY
+    configured = os.environ.get("BRIEF_EVIDENCE_SIGNING_KEY", "").strip()
+    if configured:
+        if len(configured.encode("utf-8")) < 32:
+            raise RuntimeError("BRIEF_EVIDENCE_SIGNING_KEY must contain at least 32 bytes")
+        return hashlib.sha256(configured.encode("utf-8")).digest()
+    if _BRIEF_EVIDENCE_SIGNING_KEY is not None:
+        return _BRIEF_EVIDENCE_SIGNING_KEY
+    with _BRIEF_EVIDENCE_KEY_LOCK:
+        if _BRIEF_EVIDENCE_SIGNING_KEY is not None:
+            return _BRIEF_EVIDENCE_SIGNING_KEY
+        os.makedirs(os.path.dirname(_BRIEF_EVIDENCE_KEY_FILE) or ".", exist_ok=True)
+        try:
+            with open(_BRIEF_EVIDENCE_KEY_FILE, "r", encoding="ascii") as handle:
+                raw = handle.read().strip()
+        except FileNotFoundError:
+            raw = secrets.token_hex(32)
+            try:
+                with open(_BRIEF_EVIDENCE_KEY_FILE, "x", encoding="ascii") as handle:
+                    handle.write(raw)
+                try:
+                    os.chmod(_BRIEF_EVIDENCE_KEY_FILE, 0o600)
+                except OSError:
+                    pass
+            except FileExistsError:
+                with open(_BRIEF_EVIDENCE_KEY_FILE, "r", encoding="ascii") as handle:
+                    raw = handle.read().strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", raw):
+            raise RuntimeError("brief evidence signing key file is invalid")
+        _BRIEF_EVIDENCE_SIGNING_KEY = bytes.fromhex(raw)
+        return _BRIEF_EVIDENCE_SIGNING_KEY
+
+def _brief_seal_source_context(source_context: dict) -> dict:
+    """签发不可由浏览器改写、且可跨正常进程重启核验的来源证据。"""
+    publication_date = source_context.get("publication_date")
+    payload = {
+        "version": 1,
+        "material_text": str(source_context.get("material_text") or "")[:10000],
+        "source_name": str(source_context.get("source_name") or "")[:500],
+        "source_title": str(source_context.get("source_title") or "")[:1000],
+        "publication_date": publication_date.isoformat() if publication_date else "",
+        "publication_date_verified": bool(source_context.get("publication_date_verified")),
+        "url": str(source_context.get("url") or "")[:4000],
+        "origin": str(source_context.get("origin") or "unknown")[:64],
+    }
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(
+        _brief_evidence_signing_key(), serialized, hashlib.sha256,
+    ).hexdigest()
+    return {"payload": payload, "signature": signature}
+
+def _brief_open_source_evidence(envelope) -> dict:
+    if not isinstance(envelope, dict):
+        raise ValueError("缺少服务器签发的原始素材证据")
+    payload = envelope.get("payload")
+    signature = str(envelope.get("signature") or "")
+    if not isinstance(payload, dict) or payload.get("version") != 1 or len(signature) != 64:
+        raise ValueError("原始素材证据格式无效")
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    expected = hmac.new(
+        _brief_evidence_signing_key(), serialized, hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("原始素材证据已失效或被修改，请从原文重新生成")
+    return _brief_source_context(
+        material_text=str(payload.get("material_text") or ""),
+        source_name=str(payload.get("source_name") or ""),
+        source_title=str(payload.get("source_title") or ""),
+        publication_date=str(payload.get("publication_date") or ""),
+        publication_date_verified=payload.get("publication_date_verified") is True,
+        url=str(payload.get("url") or ""),
+        origin=str(payload.get("origin") or "unknown"),
+    )
+
+class _BriefArticleStaleError(ValueError):
+    pass
+
+
+class _BriefArticleConflictError(ValueError):
+    pass
+
+
+def _resolve_trusted_brief_article(client_article: dict) -> dict:
+    """Resolve an RSS article from server cache; client fact fields are ignored."""
+    if not isinstance(client_article, dict):
+        raise _BriefArticleStaleError("文章引用无效，请刷新候选列表")
+    client_aid = str(client_article.get("aid") or "").strip()
+    client_article_id = str(client_article.get("article_id") or "").strip()
+    client_link = str(client_article.get("link") or "").strip()
+    client_link_aid = canonical_article_id(client_link) if client_link else ""
+    if not any((client_aid, client_article_id, client_link_aid)):
+        raise _BriefArticleStaleError("缺少服务器文章标识，请刷新候选列表")
+
+    with cache_lock:
+        rows = [dict(row) for row in cache.get("news", []) if isinstance(row, dict)]
+    identifiers = []
+    if client_aid:
+        identifiers.append({
+            index for index, row in enumerate(rows)
+            if (str(row.get("aid") or "").strip() or canonical_article_id(row.get("link") or "")) == client_aid
+        })
+    if client_article_id:
+        identifiers.append({
+            index for index, row in enumerate(rows)
+            if _article_id(row) == client_article_id
+        })
+    if client_link_aid:
+        identifiers.append({
+            index for index, row in enumerate(rows)
+            if canonical_article_id(row.get("link") or "") == client_link_aid
+        })
+
+    if not any(identifiers):
+        raise _BriefArticleStaleError("文章已离开当前服务器缓存，请刷新后重试")
+    matching = set.intersection(*identifiers)
+    if len(matching) != 1:
+        raise _BriefArticleConflictError("文章标识相互冲突，请刷新候选列表")
+    trusted = rows[matching.pop()]
+    trusted["aid"] = str(trusted.get("aid") or "").strip() or canonical_article_id(trusted.get("link") or "")
+    trusted["article_id"] = _article_id(trusted)
+    return trusted
+
+
+def _brief_source_context_from_article(article: dict, *, origin: str = "unknown") -> dict:
+    raw_date = article.get("date") or ""
+    verified = article.get("publication_date_verified") is True
+    return _brief_source_context(
+        material_text="\n".join(filter(None, [article.get("title"), article.get("summary")])),
+        source_name=article.get("source_cn") or article.get("source") or "",
+        source_title=article.get("title") or "",
+        publication_date=raw_date,
+        publication_date_verified=verified,
+        url=article.get("link") or "",
+        origin=origin,
+    )
+
+def _parse_brief_source_entries(source: str) -> tuple[list[dict], list[str], str]:
+    """解析“来源名X月X日发文《标题》”条目，保留不合规项供校验报错。"""
+    raw = (source or "").strip()
+    raw = re.sub(r"^[（(]?\s*信息来源\s*[:：]\s*", "", raw)
+    raw = re.sub(r"\s*[）)]\s*$", "", raw)
+    parts = [part.strip() for part in re.split(r"[；;]", raw) if part.strip()]
+    entries, invalid = [], []
+    for part in parts:
+        match = BRIEF_SOURCE_ENTRY_RE.fullmatch(part)
+        if not match:
+            invalid.append(part)
+            continue
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        try:
+            datetime(2000, month, day)
+        except ValueError:
+            invalid.append(part)
+            continue
+        entries.append({
+            "name": match.group("name").strip(),
+            "month": month,
+            "day": day,
+            "title": match.group("title").strip(),
+        })
+    return entries, invalid, raw
+
+def _brief_body_attributions(body: str) -> list[dict]:
+    """提取“据XX报道”及“XX称/指出/披露”等显式来源归属。"""
+    attributions, seen = [], set()
+    for match in BRIEF_BODY_ATTRIBUTION_RE.finditer(body or ""):
+        label = match.group("label").strip()
+        date_match = re.search(r"(?P<date>\d{1,2}月\d{1,2}日)$", label)
+        if date_match:
+            name = label[:date_match.start()].strip()
+            date = date_match.group("date")
+        else:
+            name = label
+            date = ""
+        key = _brief_compact(name)
+        if key and key not in seen:
+            seen.add(key)
+            attributions.append({"name": name, "date": date, "kind": "据XX报道"})
+    for pattern in (
+        BRIEF_SECONDARY_ATTRIBUTION_RE,
+        BRIEF_CONTEXT_ATTRIBUTION_RE,
+        BRIEF_RECIPIENT_ATTRIBUTION_RE,
+    ):
+        for match in pattern.finditer(body or ""):
+            name = match.group("name").removeprefix("据").strip()
+            key = _brief_compact(name)
+            if key and key not in seen:
+                seen.add(key)
+                attributions.append({"name": name, "date": "", "kind": "二次归属"})
+    return attributions
+
+def _brief_split_unnumbered_body(body: str) -> tuple[str, str, list[str], int]:
+    """定位无编号帽段和分析层，兼容帽段含多个句号或中文分号。"""
+    suggestion_start = (body or "").find("建议")
+    if suggestion_start < 0:
+        suggestion_start = len(body or "")
+    candidates = []
+    for match in re.finditer("。", (body or "")[:suggestion_start]):
+        boundary = match.end()
+        hat = body[:boundary].strip()
+        layered_text = body[boundary:suggestion_start]
+        layered_parts = [part.strip(" 。") for part in layered_text.split("；")]
+        structurally_valid = (
+            len(layered_parts) >= 3
+            and all(layered_parts)
+            and ";" not in layered_text
+            and layered_text.rstrip().endswith("。")
+        )
+        if structurally_valid:
+            candidates.append((hat, layered_text, layered_parts, suggestion_start))
+    if not candidates:
+        return "", "", [], suggestion_start
+    sized = [item for item in candidates if 80 <= _count_cn(item[0]) <= 120]
+    pool = sized or candidates
+    return min(pool, key=lambda item: (len(item[2]), -len(item[0])))
+
+def _validate_brief(parsed: dict, *, source_context: dict | None = None) -> dict:
     """校验要讯格式合规性，返回 {valid, errors, warnings, metrics}"""
     errors, warnings = [], []
     title = parsed.get("title", "") or ""
@@ -2300,6 +2751,7 @@ def _validate_brief(parsed: dict) -> dict:
     event_time = parsed.get("event_time", "") or ""
     value_point = parsed.get("value_point", "") or ""
     source = parsed.get("source", "") or ""
+    reporter = parsed.get("reporter", "") or ""
 
     # 1) 必填字段
     if not event_time: errors.append("缺少事件时间")
@@ -2307,47 +2759,240 @@ def _validate_brief(parsed: dict) -> dict:
     if not title: errors.append("缺少标题")
     if not body: errors.append("缺少正文")
     if not source: errors.append("缺少信息来源")
+    if not reporter: errors.append("缺少报送人电话行")
 
-    # 2) 事件时间格式
-    if event_time and not re.search(r"\d{4}年\d{1,2}月\d{1,2}日", event_time):
-        warnings.append(f"事件时间格式异常: {event_time}")
+    # 2) 事件时间必须具体、有效；生成/导出路径还会在第11项绑定原始素材证据
+    event_match = None
+    if event_time:
+        if any(word in event_time for word in BRIEF_RELATIVE_EVENT_WORDS):
+            errors.append("事件时间不得使用'近期/近日/日前/最近'等相对表述")
+        event_match = BRIEF_EVENT_DATE_RE.fullmatch(event_time.strip())
+        if not event_match:
+            errors.append("事件时间必须写成具体的YYYY年M月D日")
+        else:
+            try:
+                datetime(
+                    int(event_match.group("year")),
+                    int(event_match.group("month")),
+                    int(event_match.group("day")),
+                )
+            except ValueError:
+                errors.append(f"事件时间不是有效日期: {event_time}")
 
-    # 3) 标题长度与警示词
+    # 3) 价值点不得复制标题
+    value_reuses_title = False
+    value_title_similarity = 0.0
+    if title and value_point:
+        title_compact = _brief_compact(title)
+        value_compact = _brief_compact(value_point)
+        title_core = re.sub(r"(?:值得警惕|值得关注)$", "", title_compact)
+        value_title_similarity = SequenceMatcher(None, title_core, value_compact).ratio() if title_core else 0.0
+        value_reuses_title = bool(
+            title_compact and title_compact in value_compact
+            or title_core and value_compact == title_core
+            or title_core and value_compact.startswith(title_core) and len(value_compact) - len(title_core) < 8
+            or title_core and len(value_compact) <= len(title_core) + 6 and value_title_similarity >= 0.85
+        )
+        if value_reuses_title:
+            errors.append("价值点不得复制标题，须另行概括战略意义")
+
+    # 4) 标题长度、标点与警示词
     title_len = len(title)
-    if title and not any(w in title[-10:] for w in BRIEF_WARNING_WORDS):
-        errors.append(f"标题未以警示词结尾（需含: 值得警惕/值得关注/威胁/压力等）")
-    if title_len > 0 and (title_len < 8 or title_len > 30):
-        warnings.append(f"标题字数 {title_len}，建议 8-24 字")
+    title_has_comma = bool(re.search(r"[，,]", title))
+    if title and not any(title.endswith(word) for word in BRIEF_WARNING_WORDS):
+        errors.append("标题必须以'值得警惕'或'值得关注'收尾")
+    if title_len > 0 and not 8 <= title_len <= 15:
+        errors.append(f"标题字数 {title_len}，必须控制在8-15字")
+    if title_has_comma:
+        errors.append("标题不得含中文或英文逗号")
 
-    # 4) 正文字数
+    # 5) 正文字数
     body_len = _count_cn(body)
     if body_len < 250: errors.append(f"正文仅 {body_len} 字，低于下限 250")
     elif body_len > 350: errors.append(f"正文 {body_len} 字，超出上限 350")
 
-    # 5) 三点分列结构
+    # 6) 分层结构与层间标点
     has_123 = all(k in body for k in ("（1）", "（2）", "（3）"))
     if not has_123:
         has_123 = all(k in body for k in ("(1)", "(2)", "(3)"))
-    if not has_123: warnings.append("正文缺少（1）（2）（3）三点分列结构")
+    has_any_number = any(k in body for k in ("（1）", "（2）", "（3）", "(1)", "(2)", "(3)"))
+    numbered_uses_periods = False
+    semicolon_uses_layers = False
+    structure_style = "invalid"
+    numbered_body = body.replace("(1)", "（1）").replace("(2)", "（2）").replace("(3)", "（3）")
+    hat = ""
+    if has_any_number:
+        if not has_123:
+            errors.append("编号式正文必须完整包含（1）（2）（3）")
+        else:
+            structure_style = "numbered"
+            marker_position = numbered_body.find("（1）")
+            hat = numbered_body[:marker_position].strip()
+            numbered_uses_periods = "。（2）" in numbered_body and "。（3）" in numbered_body
+            if not numbered_uses_periods:
+                errors.append("使用（1）（2）（3）分层时，各层之间必须用句号")
+            point_three = numbered_body.split("（3）", 1)[1]
+            if "建议" in point_three and "。建议" not in point_three:
+                errors.append("第（3）层与建议句之间必须用句号")
+    else:
+        structure_style = "semicolon"
+        hat, layered_text, layered_parts, suggestion_start = _brief_split_unnumbered_body(body)
+        semicolon_uses_layers = bool(hat and layered_parts)
+        if not semicolon_uses_layers:
+            errors.append("无编号正文须写成帽段。层意一；层意二；层意三。建议……")
 
-    # 6) 建议范式
+    # 7) 帽段在固定模板中以80-120字近似3-4物理行
+    hat_chars = _count_cn(hat)
+    if body and not 80 <= hat_chars <= 120:
+        errors.append(f"帽段 {hat_chars} 字，应控制在80-120字（最终版面约3-4行）")
+    event_date_in_hat = False
+    if event_match and hat:
+        month = int(event_match.group("month"))
+        day = int(event_match.group("day"))
+        event_date_in_hat = (
+            f"{month}月{day}日" in hat
+            or f"{month:02d}月{day:02d}日" in hat
+        )
+        if not event_date_in_hat:
+            errors.append("事件时间的月日必须在帽段事实叙述中出现并保持一致")
+
+    # 8) 建议范式
     has_suggest = ("建议持续跟踪" in body) and ("能力建设" in body) and ("针对性加强" in body)
     if not has_suggest: errors.append("建议句未采用'持续跟踪X+针对性加强Y能力建设'范式")
 
-    # 7) markdown符号
+    # 9) markdown符号
     if BRIEF_MARKDOWN_RE.search(body) or BRIEF_MARKDOWN_RE.search(title):
         errors.append("正文或标题出现markdown符号（#/*/**/```/-）")
 
-    # 8) 信息来源格式
-    if source and "发文" not in source:
-        warnings.append("信息来源格式可能不标准（应含'X月X日发文《...》'）")
+    # 10) 来源条目必须完整，且正文归属必须与来源行一致
+    source_entries, invalid_source_entries, source_raw = _parse_brief_source_entries(source)
+    if source and (invalid_source_entries or not source_entries):
+        errors.append("信息来源每条均须写成'XX X月X日发文《标题》'，多条以中文分号分隔")
+    if ";" in source_raw:
+        errors.append("多个信息来源须使用中文分号'；'分隔")
+
+    attributions = _brief_body_attributions(body)
+    opening_has_attribution = bool(re.match(r"^据[^，,。；;]{1,80}?报道[，,]", body))
+    if body and not opening_has_attribution:
+        errors.append("帽段必须以'据XX报道，'开头")
+    source_names = {_brief_compact(entry["name"]) for entry in source_entries}
+    attribution_matches = True
+    if attributions and source_entries:
+        lead_name = _brief_compact(attributions[0]["name"])
+        first_source_name = _brief_compact(source_entries[0]["name"])
+        if lead_name != first_source_name:
+            attribution_matches = False
+            errors.append("帽段'据XX报道'必须与信息来源第一条名称一致")
+    for attribution in attributions:
+        name = attribution["name"]
+        if attribution["date"]:
+            errors.append("正文须写'据XX报道，'，发文日期只写在信息来源行")
+        if source_names and _brief_compact(name) not in source_names:
+            attribution_matches = False
+            errors.append(f"正文来源'{name}'与信息来源行不一致")
+    if body and not attributions:
+        attribution_matches = False
+        errors.append("正文缺少可核对的'据XX报道'来源归属")
+
+    if parsed.get("unexpected_lines"):
+        errors.append("报送人电话行之后或六部分之外不得附加其他内容")
+
+    # 11) 生成路径必须把成品重新绑定到原始素材证据；纯手工导出无上下文时仅做格式校验
+    event_date_supported_by_material = None
+    primary_source_supported_by_material = None
+    publication_date_matches_material = None
+    all_sources_supported_by_material = None
+    if source_context is not None:
+        material_text = str(source_context.get("material_text") or "")
+        publication_date = _brief_parse_date_value(source_context.get("publication_date"))
+        if source_context.get("publication_date_verified") and not publication_date:
+            raise DailyBriefIngestError(
+                "invalid_source", f"第{index}篇来源发文日期无效",
+            )
+        publication_verified = bool(source_context.get("publication_date_verified"))
+        publication_year = publication_date.year if publication_verified and publication_date else None
+        if event_match:
+            event_date_supported_by_material = _brief_event_date_supported(
+                material_text,
+                int(event_match.group("year")),
+                int(event_match.group("month")),
+                int(event_match.group("day")),
+                publication_year=publication_year,
+            )
+            if not event_date_supported_by_material:
+                errors.append("事件时间未在原始素材中获得对应日期证据")
+
+        if source_entries:
+            first_entry = source_entries[0]
+            first_name_key = _brief_compact(first_entry["name"]).casefold()
+            expected_aliases = {
+                _brief_compact(alias).casefold()
+                for alias in source_context.get("source_aliases") or []
+                if _brief_compact(alias)
+            }
+            primary_matches_expected = bool(expected_aliases and first_name_key in expected_aliases)
+            primary_source_supported_by_material = bool(
+                primary_matches_expected
+                or _brief_name_supported_in_material(first_entry["name"], material_text)
+            )
+            if not primary_source_supported_by_material:
+                errors.append("信息来源第一条名称未在输入来源或原始素材中获得支持")
+
+            if primary_matches_expected:
+                publication_date_matches_material = bool(
+                    publication_verified
+                    and publication_date
+                    and first_entry["month"] == publication_date.month
+                    and first_entry["day"] == publication_date.day
+                )
+                if not publication_verified:
+                    errors.append("输入来源缺少可核实的发文日期，不能生成信息来源行")
+                elif not publication_date_matches_material:
+                    errors.append("信息来源第一条发文日期与输入来源发布日期不一致")
+            else:
+                publication_date_matches_material = _brief_month_day_supported(
+                    material_text, first_entry["month"], first_entry["day"]
+                )
+                if not publication_date_matches_material:
+                    errors.append("第一信源发文日期未在原始素材中获得支持")
+
+            unsupported_sources = []
+            for entry in source_entries[1:]:
+                if not (
+                    _brief_name_supported_in_material(entry["name"], material_text)
+                    and _brief_month_day_supported(material_text, entry["month"], entry["day"])
+                ):
+                    unsupported_sources.append(entry["name"])
+            all_sources_supported_by_material = not unsupported_sources
+            if unsupported_sources:
+                errors.append(
+                    "以下引用来源缺少名称和发文日期证据：" + "、".join(unsupported_sources[:5])
+                )
+
+    # 12) 报送人和电话必须保留为空白占位，禁止模型生成个人信息
+    if reporter and not re.fullmatch(r"报送人：\s+电话：", reporter.strip()):
+        errors.append("报送人电话行必须留空，格式为'报送人：           电话：'")
 
     metrics = {
         "title_len": title_len,
         "body_chars": body_len,
+        "hat_chars": hat_chars,
+        "event_date_in_hat": event_date_in_hat,
+        "structure_style": structure_style,
         "has_123_structure": has_123,
+        "numbered_uses_periods": numbered_uses_periods,
+        "semicolon_uses_layers": semicolon_uses_layers,
         "has_suggest_pattern": has_suggest,
-        "title_has_warning": any(w in title[-10:] for w in BRIEF_WARNING_WORDS),
+        "title_has_warning": any(title.endswith(word) for word in BRIEF_WARNING_WORDS),
+        "title_has_comma": title_has_comma,
+        "value_reuses_title": value_reuses_title,
+        "value_title_similarity": round(value_title_similarity, 3),
+        "source_count": len(source_entries),
+        "source_attribution_matches": attribution_matches,
+        "event_date_supported_by_material": event_date_supported_by_material,
+        "primary_source_supported_by_material": primary_source_supported_by_material,
+        "publication_date_matches_material": publication_date_matches_material,
+        "all_sources_supported_by_material": all_sources_supported_by_material,
     }
     return {
         "valid": len(errors) == 0,
@@ -2356,12 +3001,20 @@ def _validate_brief(parsed: dict) -> dict:
         "metrics": metrics,
     }
 
-def _validate_brief_text(brief: str) -> dict:
+def _validate_brief_text(brief: str, *, source_context: dict | None = None) -> dict:
     """从原始要讯文本直接校验（先解析再校验）"""
     parsed = _parse_brief_text(brief)
-    result = _validate_brief(parsed)
+    result = _validate_brief(parsed, source_context=source_context)
     result["parsed"] = parsed
     return result
+
+def _public_brief_validation(validation: dict) -> dict:
+    """移除内部解析结果，供API、日志和质量记录安全复用。"""
+    return {key: value for key, value in validation.items() if key != "parsed"}
+
+def _brief_validation_error_text(validation: dict) -> str:
+    errors = validation.get("errors") or ["未知校验错误"]
+    return f"要讯校验未通过: {'; '.join(map(str, errors))[:500]}"
 
 def _parse_brief_text(brief: str) -> dict:
     """解析AI生成的要讯文本为结构化字段（事件时间/价值点/标题/正文/信息来源/报送人）"""
@@ -2371,7 +3024,8 @@ def _parse_brief_text(brief: str) -> dict:
     title_lines = []
     body_lines = []
     source = ""
-    reporter_line = "报送人：           电话："
+    reporter_line = ""
+    unexpected_lines = []
     state = "meta"  # meta → title → body → done
     for ln in lines:
         s = ln.strip()
@@ -2382,19 +3036,35 @@ def _parse_brief_text(brief: str) -> dict:
                 state = "body"
             continue
         if s.startswith("事件时间"):
+            if event_time:
+                unexpected_lines.append(s)
+                continue
             event_time = s.split("：", 1)[-1].strip() if "：" in s else s.replace("事件时间", "").strip()
             state = "meta"
             continue
         if s.startswith("价 值 点") or s.startswith("价值点"):
+            if value_point:
+                unexpected_lines.append(s)
+                continue
             value_point = s.split("：", 1)[-1].strip() if "：" in s else ""
             state = "meta"
             continue
         if s.startswith("（信息来源") or s.startswith("(信息来源"):
+            if source:
+                unexpected_lines.append(s)
+                continue
             source = s
             state = "done"
             continue
         if s.startswith("报送人"):
+            if state != "done" or reporter_line:
+                unexpected_lines.append(s)
+                continue
             reporter_line = s
+            state = "reported"
+            continue
+        if state in ("done", "reported"):
+            unexpected_lines.append(s)
             continue
         if state == "title":
             title_lines.append(s)
@@ -2411,6 +3081,7 @@ def _parse_brief_text(brief: str) -> dict:
         "body": body,
         "source": source,
         "reporter": reporter_line,
+        "unexpected_lines": unexpected_lines,
     }
 
 def _set_cn_font(run, cn_font, size=16, bold=True):
@@ -2525,9 +3196,15 @@ def _render_brief_block(doc, parsed: dict):
     p.paragraph_format.first_line_indent = Pt(HANGING_BIG)
     _set_cn_font(p.add_run(parsed.get("reporter", "报送人：           电话：")), cn_font="楷体_GB2312", size=16, bold=True)
 
+def _clear_brief_docx_generator_metadata(doc) -> None:
+    """Keep deterministic brief files free of library/user author traces."""
+    doc.core_properties.author = ""
+    doc.core_properties.last_modified_by = ""
+
 def _build_brief_docx(parsed: dict) -> BytesIO:
     """单篇要讯 -> .docx（BytesIO）"""
     doc = Document()
+    _clear_brief_docx_generator_metadata(doc)
     _setup_brief_section(doc)
     _render_brief_block(doc, parsed)
     buf = BytesIO()
@@ -2552,12 +3229,18 @@ _DAILY_BRIEF_OUTPUT_ROOT = os.environ.get(
     os.path.join(VAULT_DIR, _DAILY_BRIEF_FOLDER_NAME),
 )
 
-def _persist_brief_to_disk(brief_text: str, output_dir: str | None = None, now: datetime | None = None) -> str:
+def _persist_brief_to_disk(brief_text: str, output_dir: str | None = None,
+                           now: datetime | None = None, *,
+                           source_context: dict | None = None) -> str:
     """生成成功后自动写一份 .docx 到 _BRIEF_OUTPUT_DIR；
     失败只 warn 不抛异常，保证主流程不中断；返回保存的绝对路径或空串。"""
     if not DOCX_AVAILABLE or not brief_text or not brief_text.strip():
         return ""
     try:
+        validation = _validate_brief_text(brief_text, source_context=source_context)
+        if validation.get("valid") is not True:
+            logger.warning("[brief auto-save] blocked: %s", _brief_validation_error_text(validation))
+            return ""
         output_dir = output_dir or _BRIEF_OUTPUT_DIR
         now = now or datetime.now()
         os.makedirs(output_dir, exist_ok=True)
@@ -2577,6 +3260,7 @@ def _persist_brief_to_disk(brief_text: str, output_dir: str | None = None, now: 
 def _build_brief_docx_compiled(parsed_list: list) -> BytesIO:
     """汇编多篇要讯到单一 docx：每篇之间插入分页符；与单篇共享 _render_brief_block 排版"""
     doc = Document()
+    _clear_brief_docx_generator_metadata(doc)
     _setup_brief_section(doc)
     for idx, parsed in enumerate(parsed_list):
         if idx > 0:
@@ -2588,8 +3272,18 @@ def _build_brief_docx_compiled(parsed_list: list) -> BytesIO:
     buf.seek(0)
     return buf
 
+_DAILY_BRIEF_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+def _daily_brief_now(now: datetime | None = None) -> datetime:
+    """Return an Asia/Shanghai timestamp, treating legacy naive inputs as local time."""
+    if now is None:
+        return datetime.now(_DAILY_BRIEF_TIMEZONE)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=_DAILY_BRIEF_TIMEZONE)
+    return now.astimezone(_DAILY_BRIEF_TIMEZONE)
+
 def _daily_brief_output_dir(now: datetime | None = None) -> str:
-    now = now or datetime.now()
+    now = _daily_brief_now(now)
     return os.path.join(_DAILY_BRIEF_OUTPUT_ROOT, now.strftime("%Y%m%d"))
 
 def _generate_brief_for_article(article: dict, output_dir: str | None = None,
@@ -2597,30 +3291,42 @@ def _generate_brief_for_article(article: dict, output_dir: str | None = None,
     """Generate one brief through the same prompt/validation/storage path used by the UI."""
     if not _ai_is_enabled():
         raise RuntimeError("AI API Key 未配置，请先在AI标签页配置")
+    source_context = _brief_source_context_from_article(article, origin="rss_cache")
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
         {"role": "user", "content": _build_brief_user_prompt(article)},
     ]
     result = _call_ai(messages, temperature=0.4)
-    validation = _validate_brief_text(result)
-    saved_path = _persist_brief_to_disk(result, output_dir=output_dir, now=now)
+    validation = _validate_brief_text(result, source_context=source_context)
+    public_validation = _public_brief_validation(validation)
+    if validation.get("valid") is not True:
+        raise ValueError(_brief_validation_error_text(validation))
+
+    run_now = _daily_brief_now(now)
+    saved_path = _persist_brief_to_disk(
+        result, output_dir=output_dir, now=now, source_context=source_context,
+    )
     article_id = record_quality_generation(
         article,
         result,
-        {k: v for k, v in validation.items() if k != "parsed"},
+        public_validation,
     )
     return {
         "brief": result,
-        "validation": {k: v for k, v in validation.items() if k != "parsed"},
+        "validation": public_validation,
+        "source_evidence": _brief_seal_source_context(source_context),
         "article_id": article_id,
         "source_article": {
             "title": article.get("title"),
             "source": article.get("source"),
             "link": article.get("link"),
             "date": article.get("date"),
+            "summary": article.get("summary"),
+            "source_cn": article.get("source_cn"),
+            "publication_date_verified": article.get("publication_date_verified"),
         },
         "model": _ai_model_id(),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": run_now.isoformat(),
         "saved_to": saved_path,
     }
 
@@ -2641,25 +3347,409 @@ def _brief_text_to_parsed_fallback(brief_text: str, source_article: dict | None 
 def _write_daily_compiled_docx(briefs: list[dict], output_dir: str, now: datetime | None = None) -> str:
     if not DOCX_AVAILABLE or not briefs:
         return ""
-    try:
-        now = now or datetime.now()
-        os.makedirs(output_dir, exist_ok=True)
-        parsed_list = [
-            _brief_text_to_parsed_fallback(item.get("brief", ""), item.get("source_article", {}))
-            for item in briefs
-            if item.get("brief")
-        ]
-        if not parsed_list:
-            return ""
-        buf = _build_brief_docx_compiled(parsed_list)
-        fpath = os.path.join(output_dir, f"要讯汇编_{now.strftime('%Y%m%d')}_共{len(parsed_list)}篇.docx")
-        with open(fpath, "wb") as f:
-            f.write(buf.getvalue())
-        logger.info("[daily brief compiled] %s", fpath)
-        return fpath
-    except Exception as e:
-        logger.warning("[daily brief compiled] failed: %s", e)
+    now = _daily_brief_now(now)
+    parsed_list = []
+    for index, item in enumerate(briefs, 1):
+        brief_text = str(item.get("brief") or "")
+        if not brief_text:
+            continue
+        source_article = item.get("source_article") or {}
+        source_context = _brief_source_context_from_article(source_article, origin="rss_cache")
+        validation = _validate_brief_text(brief_text, source_context=source_context)
+        if validation.get("valid") is not True:
+            raise ValueError(
+                f"汇编第{index}篇要讯校验未通过: "
+                + "; ".join((validation.get("errors") or ["未知错误"])[:5])
+            )
+        parsed_list.append(validation["parsed"])
+    if not parsed_list:
         return ""
+    os.makedirs(output_dir, exist_ok=True)
+    buf = _build_brief_docx_compiled(parsed_list)
+    fpath = os.path.join(output_dir, f"要讯汇编_{now.strftime('%Y%m%d')}_共{len(parsed_list)}篇.docx")
+    with open(fpath, "wb") as f:
+        f.write(buf.getvalue())
+    logger.info("[daily brief compiled] %s", fpath)
+    return fpath
+
+class DailyBriefIngestError(RuntimeError):
+    """可安全返回给本地自动化的 Codex 要讯落盘错误。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.safe_message = message
+
+_DAILY_BRIEF_INGEST_MANIFEST = ".codex-ingest.json"
+
+def _daily_brief_ingest_buffer_bytes(buffer) -> bytes:
+    if isinstance(buffer, bytes):
+        return buffer
+    getvalue = getattr(buffer, "getvalue", None)
+    if callable(getvalue):
+        value = getvalue()
+        if isinstance(value, bytes):
+            return value
+    raise TypeError("document builder did not return bytes")
+
+def _write_daily_brief_ingest_file(path: str, content: bytes) -> None:
+    """只写暂存目录；最终目录由目录级原子替换一次性提交。"""
+    with open(path, "xb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+def _daily_brief_ingest_result(
+    *, target_dir: str, edition_date: str, content_sha256: str,
+    document_names: list[str], idempotent: bool, ingest_mode: str,
+    recovery_date: str | None,
+) -> dict:
+    return {
+        "status": "ok",
+        "idempotent": idempotent,
+        "edition_date": edition_date,
+        "ingest_mode": ingest_mode,
+        "recovery_date": recovery_date,
+        "count": len(document_names) - 1,
+        "output_dir": os.path.abspath(target_dir),
+        "documents": [
+            os.path.abspath(os.path.join(target_dir, name))
+            for name in document_names
+        ],
+        "content_sha256": content_sha256,
+    }
+
+def _verify_existing_daily_brief_ingest(
+    *, target_dir: str, edition_date: str, expected_count: int,
+    content_sha256: str, document_names: list[str], ingest_mode: str,
+    recovery_date: str | None,
+) -> dict:
+    """仅在清单、规范输入哈希和全部 DOCX 哈希闭环一致时接受幂等重试。"""
+    if not os.path.isdir(target_dir):
+        raise DailyBriefIngestError("edition_conflict", "当日要讯目标已存在且不是目录")
+    manifest_path = os.path.join(target_dir, _DAILY_BRIEF_INGEST_MANIFEST)
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        raise DailyBriefIngestError(
+            "existing_output_invalid", "当日要讯目录已存在但缺少有效落盘清单",
+        ) from None
+    if manifest.get("content_sha256") != content_sha256:
+        raise DailyBriefIngestError("edition_conflict", "当日已落盘另一版本要讯，拒绝覆盖")
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("edition_date") != edition_date
+        or manifest.get("expected_count") != expected_count
+        or manifest.get("ingest_mode", "daily") != ingest_mode
+        or manifest.get("recovery_date") != recovery_date
+    ):
+        raise DailyBriefIngestError("existing_output_invalid", "当日要讯清单元数据不一致")
+    entries = manifest.get("documents")
+    if not isinstance(entries, list) or len(entries) != len(document_names):
+        raise DailyBriefIngestError("existing_output_invalid", "当日要讯清单文件数量不一致")
+    by_name = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise DailyBriefIngestError("existing_output_invalid", "当日要讯清单文件项无效")
+        name = entry.get("name")
+        digest = entry.get("sha256")
+        if (
+            not isinstance(name, str)
+            or os.path.basename(name) != name
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or name in by_name
+        ):
+            raise DailyBriefIngestError("existing_output_invalid", "当日要讯清单文件项无效")
+        by_name[name] = digest
+    if set(by_name) != set(document_names):
+        raise DailyBriefIngestError("existing_output_invalid", "当日要讯清单文件名不一致")
+    actual_docx = {
+        name for name in os.listdir(target_dir)
+        if name.casefold().endswith(".docx")
+    }
+    if actual_docx != set(document_names):
+        raise DailyBriefIngestError("existing_output_invalid", "当日要讯目录文件集合不一致")
+    for name in document_names:
+        path = os.path.join(target_dir, name)
+        try:
+            with open(path, "rb") as handle:
+                actual_digest = hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            raise DailyBriefIngestError(
+                "existing_output_invalid", "当日要讯文件不可读取",
+            ) from None
+        if not hmac.compare_digest(actual_digest, by_name[name]):
+            raise DailyBriefIngestError("existing_output_invalid", "当日要讯文件完整性校验失败")
+    return _daily_brief_ingest_result(
+        target_dir=target_dir,
+        edition_date=edition_date,
+        content_sha256=content_sha256,
+        document_names=document_names,
+        idempotent=True,
+        ingest_mode=ingest_mode,
+        recovery_date=recovery_date,
+    )
+
+def ingest_codex_daily_briefs(
+    payload: dict, *, expected_count: int = 5, output_root: str | None = None,
+    now: datetime | None = None, check_history: bool = True,
+    recovery_date: str | None = None,
+) -> dict:
+    """校验并原子落盘由 Codex 已写好的每日 5 篇要讯，不调用任何 AI 后端。
+
+    输入结构：``edition_date``、``expected_count`` 与 ``briefs``；每个 brief
+    同时携带 ``source_material``，由现有来源证据与要讯规则重新校验。
+    """
+    if expected_count != 5 or isinstance(expected_count, bool):
+        raise DailyBriefIngestError("invalid_count", "Codex 每日要讯固定要求5篇")
+    if not isinstance(payload, dict):
+        raise DailyBriefIngestError("invalid_payload", "输入必须为JSON对象")
+    payload_count = payload.get("expected_count")
+    briefs = payload.get("briefs")
+    if (
+        isinstance(payload_count, bool)
+        or payload_count != expected_count
+        or not isinstance(briefs, list)
+        or len(briefs) != expected_count
+    ):
+        raise DailyBriefIngestError("invalid_count", "输入必须恰好包含5篇要讯")
+
+    run_now = _daily_brief_now(now)
+    edition_date = payload.get("edition_date")
+    if not isinstance(edition_date, str):
+        raise DailyBriefIngestError("invalid_date", "edition_date必须使用YYYY-MM-DD")
+    try:
+        edition_day = datetime.strptime(edition_date, "%Y-%m-%d").date()
+        parsed_edition_date = edition_day.isoformat()
+    except ValueError:
+        raise DailyBriefIngestError(
+            "invalid_date", "edition_date必须使用YYYY-MM-DD",
+        ) from None
+    if parsed_edition_date != edition_date:
+        raise DailyBriefIngestError("invalid_date", "edition_date必须使用YYYY-MM-DD")
+    run_day = run_now.date()
+    ingest_mode = "daily"
+    if recovery_date is None:
+        if edition_day != run_day:
+            raise DailyBriefIngestError(
+                "date_mismatch", "edition_date与上海时区运行日期不一致",
+            )
+    else:
+        if not isinstance(recovery_date, str):
+            raise DailyBriefIngestError(
+                "invalid_recovery_date", "recovery_date必须使用YYYY-MM-DD",
+            )
+        try:
+            recovery_day = datetime.strptime(recovery_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise DailyBriefIngestError(
+                "invalid_recovery_date", "recovery_date必须使用YYYY-MM-DD",
+            ) from None
+        if recovery_day.isoformat() != recovery_date:
+            raise DailyBriefIngestError(
+                "invalid_recovery_date", "recovery_date必须使用YYYY-MM-DD",
+            )
+        if recovery_date != edition_date:
+            raise DailyBriefIngestError(
+                "recovery_date_mismatch", "recovery_date必须与edition_date一致",
+            )
+        recovery_age_days = (run_day - recovery_day).days
+        if recovery_age_days <= 0:
+            raise DailyBriefIngestError(
+                "recovery_date_not_past", "漏跑恢复日期必须早于上海时区运行日期",
+            )
+        if recovery_age_days > 7:
+            raise DailyBriefIngestError(
+                "recovery_date_out_of_window", "漏跑恢复日期仅允许近7天内的过去日期",
+            )
+        ingest_mode = "recovery"
+    if not DOCX_AVAILABLE:
+        raise DailyBriefIngestError("docx_unavailable", "当前环境未安装DOCX组件")
+
+    validated = []
+    canonical_items = []
+    seen_titles = set()
+    document_names = []
+    for index, item in enumerate(briefs, 1):
+        if not isinstance(item, dict):
+            raise DailyBriefIngestError("invalid_payload", f"第{index}篇要讯不是JSON对象")
+        brief_text = item.get("brief")
+        source_material = item.get("source_material")
+        if not isinstance(brief_text, str) or not brief_text.strip():
+            raise DailyBriefIngestError("invalid_payload", f"第{index}篇要讯正文为空")
+        if not isinstance(source_material, dict):
+            raise DailyBriefIngestError("invalid_source", f"第{index}篇缺少source_material")
+        material_text = source_material.get("material_text")
+        if not isinstance(material_text, str) or not material_text.strip():
+            raise DailyBriefIngestError("invalid_source", f"第{index}篇原始素材为空")
+        try:
+            source_context = _brief_source_context(
+                material_text=material_text,
+                source_name=source_material.get("source_name") or "",
+                source_title=source_material.get("source_title") or "",
+                publication_date=source_material.get("publication_date") or "",
+                publication_date_verified=source_material.get("publication_date_verified") is True,
+                url=source_material.get("url") or "",
+            )
+            validation = _validate_brief_text(
+                brief_text.strip(), source_context=source_context,
+            )
+        except Exception:
+            raise DailyBriefIngestError(
+                "validation_failed", f"第{index}篇要讯来源或格式校验失败",
+            ) from None
+        if not isinstance(validation, dict) or validation.get("valid") is not True:
+            errors = validation.get("errors") if isinstance(validation, dict) else None
+            reason = "; ".join(map(str, (errors or ["未知校验错误"])[:5]))[:300]
+            raise DailyBriefIngestError(
+                "validation_failed", f"第{index}篇要讯校验未通过: {reason}",
+            )
+        parsed = validation.get("parsed")
+        if not isinstance(parsed, dict):
+            raise DailyBriefIngestError("validation_failed", f"第{index}篇缺少解析结果")
+        title = str(parsed.get("title") or "").strip()
+        title_key = _brief_compact(title).casefold()
+        if not title_key or title_key in seen_titles:
+            raise DailyBriefIngestError("duplicate_title", "本批要讯标题存在重复")
+        seen_titles.add(title_key)
+        filename = f"{index:02d}_{_safe_filename(title, max_len=40)}.docx"
+        document_names.append(filename)
+        publication_date = source_context.get("publication_date")
+        canonical_items.append({
+            "brief": brief_text.replace("\r\n", "\n").replace("\r", "\n").strip(),
+            "source_material": {
+                "material_text": str(source_context.get("material_text") or "").strip(),
+                "source_name": str(source_context.get("source_name") or "").strip(),
+                "source_title": str(source_context.get("source_title") or "").strip(),
+                "publication_date": publication_date.isoformat() if publication_date else "",
+                "publication_date_verified": bool(source_context.get("publication_date_verified")),
+                "url": str(source_context.get("url") or "").strip(),
+            },
+        })
+        validated.append({"parsed": parsed, "title": title})
+
+    edition_stamp = edition_day.strftime("%Y%m%d")
+    compiled_name = f"要讯汇编_{edition_stamp}_共{expected_count}篇.docx"
+    document_names.append(compiled_name)
+    canonical_payload = {
+        "schema_version": 1,
+        "edition_date": edition_date,
+        "expected_count": expected_count,
+        "briefs": canonical_items,
+    }
+    canonical_bytes = json.dumps(
+        canonical_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    content_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    root = os.path.abspath(output_root or _DAILY_BRIEF_OUTPUT_ROOT)
+    target_dir = os.path.join(root, edition_stamp)
+
+    if os.path.exists(target_dir):
+        return _verify_existing_daily_brief_ingest(
+            target_dir=target_dir,
+            edition_date=edition_date,
+            expected_count=expected_count,
+            content_sha256=content_sha256,
+            document_names=document_names,
+            ingest_mode=ingest_mode,
+            recovery_date=recovery_date,
+        )
+
+    if check_history:
+        for index, item in enumerate(validated, 1):
+            try:
+                matches = find_similar_generations(item["title"], days=7)
+            except Exception:
+                raise DailyBriefIngestError(
+                    "history_check_failed", f"第{index}篇近7日查重失败",
+                ) from None
+            if matches:
+                raise DailyBriefIngestError(
+                    "recent_duplicate", f"第{index}篇与近7日生成记录重复",
+                )
+
+    try:
+        document_bytes = [
+            _daily_brief_ingest_buffer_bytes(_build_brief_docx(item["parsed"]))
+            for item in validated
+        ]
+        document_bytes.append(_daily_brief_ingest_buffer_bytes(
+            _build_brief_docx_compiled([item["parsed"] for item in validated]),
+        ))
+    except Exception:
+        raise DailyBriefIngestError(
+            "document_build_failed", "DOCX构建失败，未写入任何最终文件",
+        ) from None
+
+    manifest = {
+        "schema_version": 1,
+        "edition_date": edition_date,
+        "expected_count": expected_count,
+        "content_sha256": content_sha256,
+        "created_at": run_now.isoformat(),
+        "ingest_mode": ingest_mode,
+        "recovery_date": recovery_date,
+        "documents": [
+            {"name": name, "sha256": hashlib.sha256(content).hexdigest()}
+            for name, content in zip(document_names, document_bytes)
+        ],
+    }
+    manifest_bytes = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+
+    import shutil
+    import tempfile
+    stage_dir = ""
+    committed = False
+    try:
+        os.makedirs(root, exist_ok=True)
+        stage_dir = tempfile.mkdtemp(prefix=f".{edition_stamp}-", dir=root)
+        for name, content in zip(document_names, document_bytes):
+            _write_daily_brief_ingest_file(os.path.join(stage_dir, name), content)
+        _write_daily_brief_ingest_file(
+            os.path.join(stage_dir, _DAILY_BRIEF_INGEST_MANIFEST), manifest_bytes,
+        )
+        try:
+            os.replace(stage_dir, target_dir)
+        except OSError:
+            if os.path.exists(target_dir):
+                return _verify_existing_daily_brief_ingest(
+                    target_dir=target_dir,
+                    edition_date=edition_date,
+                    expected_count=expected_count,
+                    content_sha256=content_sha256,
+                    document_names=document_names,
+                    ingest_mode=ingest_mode,
+                    recovery_date=recovery_date,
+                )
+            raise
+        committed = True
+    except DailyBriefIngestError:
+        raise
+    except Exception:
+        raise DailyBriefIngestError(
+            "package_write_failed", "要讯暂存或原子提交失败，未形成最终包",
+        ) from None
+    finally:
+        if not committed and stage_dir and os.path.exists(stage_dir):
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+    logger.info(
+        "[Codex daily brief ingest] committed edition=%s count=%d",
+        edition_date, expected_count,
+    )
+    return _daily_brief_ingest_result(
+        target_dir=target_dir,
+        edition_date=edition_date,
+        content_sha256=content_sha256,
+        document_names=document_names,
+        idempotent=False,
+        ingest_mode=ingest_mode,
+        recovery_date=recovery_date,
+    )
 
 def _email_config_ready(config: dict) -> bool:
     return bool(
@@ -2728,66 +3818,135 @@ def _send_daily_brief_email(summary: list[dict], attachment_paths: list[str],
 def run_daily_brief_job(count: int = 5, now: datetime | None = None,
                         send_email: bool = False, include_prc: bool = False) -> dict:
     """Generate the nightly five-brief package and email the compiled DOCX when configured."""
-    now = now or datetime.now()
+    now = _daily_brief_now(now)
+    try:
+        requested_count = int(count)
+    except (TypeError, ValueError):
+        requested_count = 0
     output_dir = _daily_brief_output_dir(now)
     errors = []
+    skipped_duplicates = []
+    if requested_count <= 0:
+        errors.append({"stage": "input", "error": "count must be a positive integer"})
     try:
         refresh_news()
     except Exception as e:
         logger.warning("[daily brief] refresh_news failed: %s", e)
         errors.append({"stage": "refresh", "error": str(e)[:200]})
 
-    articles = select_brief_candidates(top_n=count, include_prc=include_prc)[:count]
+    articles = []
+    if requested_count > 0:
+        try:
+            articles = select_brief_candidates(
+                top_n=max(requested_count * 3, requested_count),
+                include_prc=include_prc,
+            )
+        except Exception as e:
+            logger.warning("[daily brief] candidate selection failed: %s", e)
+            errors.append({"stage": "selection", "error": str(e)[:200]})
+
     briefs = []
     for article in articles:
+        if len(briefs) >= requested_count:
+            break
+        title = str(article.get("title") or "").strip()
         try:
-            briefs.append(_generate_brief_for_article(article, output_dir=output_dir, now=now))
+            similar = find_similar_generations(title, days=7)
         except Exception as e:
-            logger.warning("[daily brief] generate failed for %s: %s", article.get("title", ""), e)
-            errors.append({"stage": "generate", "title": article.get("title", ""), "error": str(e)[:200]})
+            logger.warning("[daily brief] dedupe failed for %s: %s", title, e)
+            errors.append({"stage": "dedupe", "title": title, "error": str(e)[:200]})
+            continue
+        if similar:
+            skipped_duplicates.append({"title": title, "matches": similar[:3]})
+            continue
+        try:
+            generated = _generate_brief_for_article(article, output_dir=output_dir, now=now)
+        except Exception as e:
+            logger.warning("[daily brief] generate failed for %s: %s", title, e)
+            errors.append({"stage": "generate", "title": title, "error": str(e)[:200]})
+            continue
+        validation = generated.get("validation") if isinstance(generated, dict) else None
+        if not isinstance(validation, dict) or validation.get("valid") is not True:
+            validation_errors = validation.get("errors") if isinstance(validation, dict) else None
+            errors.append({
+                "stage": "validation",
+                "title": title,
+                "error": "; ".join(map(str, validation_errors or ["missing valid validation result"]))[:200],
+            })
+            continue
+        briefs.append(generated)
 
-    compiled_path = _write_daily_compiled_docx(briefs, output_dir, now=now)
+    if len(briefs) < requested_count:
+        errors.append({
+            "stage": "selection",
+            "error": "insufficient_unique_valid_briefs",
+            "requested_count": requested_count,
+            "generated_count": len(briefs),
+        })
+
+    compiled_path = ""
+    if briefs:
+        try:
+            compiled_path = _write_daily_compiled_docx(briefs, output_dir, now=now)
+            if not compiled_path:
+                errors.append({"stage": "compile", "error": "compiled_output_unavailable"})
+        except Exception as e:
+            logger.warning("[daily brief] compile failed: %s", e)
+            errors.append({"stage": "compile", "error": str(e)[:200]})
+
+    package_complete = (
+        requested_count > 0
+        and len(briefs) == requested_count
+        and bool(compiled_path)
+        and not errors
+    )
     attachments = [compiled_path] if compiled_path else [b.get("saved_to", "") for b in briefs if b.get("saved_to")]
     email_result = {"sent": False, "reason": "email_disabled"}
-    if send_email and attachments:
+    if send_email and not package_complete:
+        email_result = {"sent": False, "reason": "package_incomplete"}
+    elif send_email and attachments:
         try:
             email_result = _send_daily_brief_email(briefs, attachments, email_config=EMAIL_CONFIG)
         except Exception as e:
             logger.warning("[daily brief] email failed: %s", e)
             email_result = {"sent": False, "reason": str(e)[:200]}
 
-    status = "ok" if briefs and not errors else ("partial" if briefs else "failed")
+    status = "ok" if package_complete else ("partial" if briefs else "failed")
     return {
         "status": status,
         "count": len(briefs),
-        "requested_count": count,
+        "requested_count": requested_count,
         "output_dir": output_dir,
         "compiled_path": compiled_path,
         "briefs": briefs,
         "email": email_result,
         "errors": errors,
+        "skipped_duplicates": skipped_duplicates,
     }
 
 def add_background_jobs(scheduler):
-    """Register shared background jobs for both Flask dev mode and desktop launcher."""
+    """Register RSS refresh; legacy AI brief scheduling requires explicit opt-in."""
     scheduler.add_job(refresh_news, "interval", minutes=30, id="refresh")
-    scheduler.add_job(
-        run_daily_brief_job,
-        "cron",
-        hour=22,
-        minute=0,
-        id="daily_brief_2200",
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
-    )
+    if _env_bool("ENABLE_LEGACY_AI_DAILY_BRIEF"):
+        scheduler.add_job(
+            run_daily_brief_job,
+            "cron",
+            hour=22,
+            minute=0,
+            timezone="Asia/Shanghai",
+            id="daily_brief_2200",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
 
 
 def _start_scheduler_once(force: bool = False):
-    """启动后台调度器（30min RSS 刷新 + 22:00 每日要讯），进程内只启动一次。
+    """启动后台调度器（默认仅 30min RSS 刷新），进程内只启动一次。
     gunicorn 以 import 方式加载 app:app 不会进入 __main__，故必须在模块级显式启动；
     模块级调用受 RUN_SCHEDULER 环境变量控制（部署时在 Dockerfile 置 1），
     而 `py app.py` 开发模式用 force=True 始终启动；测试导入 app 时不设该变量即跳过。
+    旧 AI 每日要讯任务仅在 ENABLE_LEGACY_AI_DAILY_BRIEF=1 时注册；手工调用不受影响。
     多 worker 部署务必配 --workers 1，否则每个 worker 各起一份调度器会重复刷新。"""
     if not force and os.environ.get("RUN_SCHEDULER", "").strip().lower() not in ("1", "true", "yes", "on"):
         return
@@ -2799,7 +3958,11 @@ def _start_scheduler_once(force: bool = False):
         add_background_jobs(scheduler)
         scheduler.start()
         threading.Thread(target=refresh_news, daemon=True).start()  # 启动即首刷，避免缓存长期为空
-        logger.info("后台调度器已启动：RSS 30min 刷新 + 22:00 每日要讯（已触发首次刷新）")
+        legacy_daily_enabled = _env_bool("ENABLE_LEGACY_AI_DAILY_BRIEF")
+        logger.info(
+            "后台调度器已启动：RSS 30min 刷新%s（已触发首次刷新）",
+            " + 旧 AI 22:00 每日要讯" if legacy_daily_enabled else "",
+        )
     except Exception as e:
         logger.error("后台调度器启动失败: %s", e)
 
@@ -2814,12 +3977,22 @@ def api_brief_export_docx():
     brief = data.get("brief", "").strip()
     if not brief:
         return jsonify({"error": "缺少brief文本"}), 400
+    try:
+        source_context = _brief_open_source_evidence(data.get("source_evidence"))
+    except ValueError as error:
+        return jsonify({"error": f"要讯校验未通过: {error}"}), 422
     parsed = _parse_brief_text(brief)
     # 允许前端覆盖字段
     for k in ("event_time", "value_point", "title", "body", "source", "reporter"):
         v = data.get(k)
         if v:
             parsed[k] = v
+    validation = _validate_brief(parsed, source_context=source_context)
+    if validation.get("valid") is not True:
+        return jsonify({
+            "error": _brief_validation_error_text(validation),
+            "validation": validation,
+        }), 422
     buf = _build_brief_docx(parsed)
     fname = _safe_filename(parsed.get("title", "要讯")) + ".docx"
     return send_file(
@@ -2828,6 +4001,28 @@ def api_brief_export_docx():
         download_name=fname,
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+
+@app.route("/api/brief/validate", methods=["POST"])
+@require_auth
+def api_brief_validate():
+    """Validate edited text against the server-signed source before release actions."""
+    data = request.get_json(silent=True) or {}
+    brief = str(data.get("brief") or "").strip()
+    if not brief:
+        return jsonify({"error": "缺少brief文本"}), 400
+    try:
+        source_context = _brief_open_source_evidence(data.get("source_evidence"))
+        validation = _validate_brief_text(brief, source_context=source_context)
+    except ValueError as error:
+        return jsonify({"error": f"要讯校验未通过: {error}"}), 422
+    public_validation = _public_brief_validation(validation)
+    if validation.get("valid") is not True:
+        return jsonify({
+            "error": _brief_validation_error_text(validation),
+            "validation": public_validation,
+        }), 422
+    return jsonify({"ok": True, "validation": public_validation})
 
 @app.route("/api/brief/export_docx_compiled", methods=["POST"])
 @require_auth
@@ -2840,10 +4035,30 @@ def api_brief_export_docx_compiled():
     if not briefs:
         return jsonify({"error": "缺少briefs列表"}), 400
     parsed_list = []
-    for b in briefs:
+    invalid_items = []
+    for index, b in enumerate(briefs, 1):
         text = (b or "").strip() if isinstance(b, str) else (b.get("brief", "") if isinstance(b, dict) else "")
         if not text: continue
-        parsed_list.append(_parse_brief_text(text))
+        source_evidence = b.get("source_evidence") if isinstance(b, dict) else None
+        try:
+            source_context = _brief_open_source_evidence(source_evidence)
+        except ValueError as error:
+            invalid_items.append({"index": index, "errors": [str(error)]})
+            continue
+        parsed = _parse_brief_text(text)
+        validation = _validate_brief(
+            parsed,
+            source_context=source_context,
+        )
+        if validation.get("valid") is not True:
+            invalid_items.append({"index": index, "errors": validation.get("errors") or []})
+            continue
+        parsed_list.append(parsed)
+    if invalid_items:
+        return jsonify({
+            "error": "要讯汇编校验未通过",
+            "invalid_items": invalid_items,
+        }), 422
     if not parsed_list:
         return jsonify({"error": "无有效要讯内容"}), 400
     buf = _build_brief_docx_compiled(parsed_list)
@@ -4661,10 +5876,15 @@ def _agent_error_response(e: Exception):
     logger.error("Report agent error: %s", e)
     return jsonify({"error": f"报告Agent处理失败: {str(e)[:200]}"}), 500
 
-def _agent_selected_evidence(project_id: str, data: dict) -> list[dict]:
-    evidence_ids = data.get("evidence_ids") or []
-    evidence = report_agent.get_project_evidence(project_id, evidence_ids or None)
-    if not evidence:
+def _agent_selected_evidence(project_id: str, data: dict, allow_empty: bool = False) -> list[dict]:
+    if "evidence_ids" not in data:
+        evidence = report_agent.get_project_evidence(project_id)
+    else:
+        evidence_ids = data.get("evidence_ids")
+        if not isinstance(evidence_ids, list) or not all(isinstance(item, str) for item in evidence_ids):
+            raise ValueError("evidence_ids必须是字符串数组")
+        evidence = report_agent.get_project_evidence(project_id, evidence_ids) if evidence_ids else []
+    if not evidence and not allow_empty:
         raise ValueError("缺少可用证据")
     return evidence
 
@@ -4983,6 +6203,51 @@ def api_agent_project_revise(project_id):
     except Exception as e:
         return _agent_error_response(e)
 
+@app.route("/api/agent/projects/<project_id>/preflight", methods=["POST"])
+@require_auth
+def api_agent_project_preflight(project_id):
+    """对当前报告正文与所选证据执行确定性交付预检。"""
+    data = request.get_json()
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求体必须是JSON对象"}), 400
+
+    try:
+        project = report_agent.get_project(project_id)
+        draft_id = data.get("draft_id") or ""
+        if not isinstance(draft_id, str):
+            raise ValueError("draft_id必须是字符串")
+        draft_id = draft_id.strip()
+
+        if draft_id:
+            draft = report_agent.get_draft(draft_id)
+            if draft["project_id"] != project_id:
+                raise ValueError("草稿不属于当前项目")
+        else:
+            drafts = report_agent.get_project_drafts(project_id)
+            draft = next((item for item in drafts if item.get("kind") != "outline"), None)
+
+        if "content" in data:
+            content = data.get("content")
+            if content is None:
+                content = ""
+            if not isinstance(content, str):
+                raise ValueError("content必须是字符串")
+            draft = {
+                **(draft or {"project_id": project_id, "kind": "draft", "payload": {}}),
+                "content": content,
+            }
+
+        evidence = _agent_selected_evidence(project_id, data, allow_empty=True)
+        if "evidence_ids" in data and len(evidence) != len(data["evidence_ids"]):
+            raise KeyError("证据不存在或不属于当前项目")
+
+        preflight = report_agent.build_delivery_preflight(project, draft, evidence)
+        return jsonify({"ok": True, "preflight": preflight})
+    except Exception as e:
+        return _agent_error_response(e)
+
 @app.route("/api/agent/projects/<project_id>/export_docx", methods=["POST"])
 @require_auth
 def api_agent_project_export_docx(project_id):
@@ -4998,7 +6263,9 @@ def api_agent_project_export_docx(project_id):
             return jsonify({"error": "草稿不属于当前项目"}), 400
         if data.get("content"):
             draft = {**draft, "content": data.get("content")}
-        evidence = report_agent.get_project_evidence(project_id)
+        evidence = _agent_selected_evidence(project_id, data, allow_empty=True)
+        if "evidence_ids" in data and len(evidence) != len(data["evidence_ids"]):
+            raise KeyError("证据不存在或不属于当前项目")
         buf = report_agent.build_report_docx(project, draft, evidence)
         today = datetime.now().strftime("%Y%m%d")
         fname = f"{_safe_filename(project.get('title') or '防务报告')}_{today}.docx"
@@ -5016,36 +6283,53 @@ def api_agent_project_export_docx(project_id):
 @require_ai_rate
 def api_brief_generate():
     """根据单篇文章生成要讯"""
-    data = request.get_json()
-    article = data.get("article")
-    if not article:
+    data = request.get_json(silent=True) or {}
+    article_ref = data.get("article")
+    if not article_ref:
         return jsonify({"error": "缺少文章数据"}), 400
+    try:
+        article = _resolve_trusted_brief_article(article_ref)
+    except _BriefArticleStaleError as error:
+        return jsonify({"error": str(error)}), 409
+    except _BriefArticleConflictError as error:
+        return jsonify({"error": str(error)}), 400
     if not _ai_is_enabled():
         return jsonify({"error": "AI API Key 未配置，请先在AI标签页配置"}), 400
 
     try:
+        source_context = _brief_source_context_from_article(article, origin="rss_cache")
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
             {"role": "user", "content": _build_brief_user_prompt(article)},
         ]
         # 要讯写作使用低温度保证格式稳定
         result = _call_ai(messages, temperature=0.4)
-        validation = _validate_brief_text(result)
-        saved_path = _persist_brief_to_disk(result)
+        validation = _validate_brief_text(result, source_context=source_context)
+        public_validation = _public_brief_validation(validation)
+        if validation.get("valid") is not True:
+            return jsonify({
+                "error": _brief_validation_error_text(validation),
+                "validation": public_validation,
+            }), 422
+        saved_path = _persist_brief_to_disk(result, source_context=source_context)
         article_id = record_quality_generation(
             article,
             result,
-            {k: v for k, v in validation.items() if k != "parsed"},
+            public_validation,
         )
         return jsonify({
             "brief": result,
-            "validation": {k: v for k, v in validation.items() if k != "parsed"},
+            "validation": public_validation,
+            "source_evidence": _brief_seal_source_context(source_context),
             "article_id": article_id,
             "source_article": {
                 "title": article.get("title"),
                 "source": article.get("source"),
+                "source_cn": article.get("source_cn"),
                 "link": article.get("link"),
                 "date": article.get("date"),
+                "summary": article.get("summary"),
+                "publication_date_verified": article.get("publication_date_verified"),
             },
             "model": _ai_model_id(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -5064,7 +6348,17 @@ def api_brief_batch():
     """批量生成要讯（SSE流式返回，一次生成5-10篇）"""
     data = request.get_json() or {}
     count = max(1, min(int(data.get("count", 8)), 10))
-    articles = data.get("articles")  # 可选：用户指定的文章列表
+    articles = data.get("articles")  # 可选：用户指定的文章引用列表
+
+    if articles is not None:
+        if not isinstance(articles, list):
+            return jsonify({"error": "articles必须是列表"}), 400
+        try:
+            articles = [_resolve_trusted_brief_article(item) for item in articles[:count]]
+        except _BriefArticleStaleError as error:
+            return jsonify({"error": str(error)}), 409
+        except _BriefArticleConflictError as error:
+            return jsonify({"error": str(error)}), 400
 
     if not _ai_is_enabled():
         return jsonify({"error": "AI API Key 未配置"}), 400
@@ -5083,24 +6377,29 @@ def api_brief_batch():
         yield f"data: {json.dumps({'type': 'start', 'total': total}, ensure_ascii=False)}\n\n"
         for idx, art in enumerate(articles, 1):
             try:
+                source_context = _brief_source_context_from_article(art, origin="rss_cache")
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
                     {"role": "user", "content": _build_brief_user_prompt(art)},
                 ]
                 result = _call_ai(messages, temperature=0.4)
-                validation = _validate_brief_text(result)
-                saved_path = _persist_brief_to_disk(result)
+                validation = _validate_brief_text(result, source_context=source_context)
+                public_validation = _public_brief_validation(validation)
+                if validation.get("valid") is not True:
+                    raise ValueError(_brief_validation_error_text(validation))
+                saved_path = _persist_brief_to_disk(result, source_context=source_context)
                 article_id = record_quality_generation(
                     art,
                     result,
-                    {k: v for k, v in validation.items() if k != "parsed"},
+                    public_validation,
                 )
                 payload = {
                     "type": "brief",
                     "index": idx,
                     "total": total,
                     "brief": result,
-                    "validation": {k: v for k, v in validation.items() if k != "parsed"},
+                    "validation": public_validation,
+                    "source_evidence": _brief_seal_source_context(source_context),
                     "article_id": article_id,
                     "saved_to": saved_path,
                     "article": {
@@ -5111,6 +6410,8 @@ def api_brief_batch():
                         "region": art.get("region"),
                         "link": art.get("link"),
                         "date": art.get("date"),
+                        "publication_date_verified": art.get("publication_date_verified"),
+                        "summary": art.get("summary"),
                         "brief_score": art.get("brief_score", 0),
                         "brief_hits": art.get("brief_hits", []),
                     },
@@ -5217,18 +6518,14 @@ def _build_brief_user_prompt_imported(title: str, body: str, source: str = "", u
     """为导入内容构造要讯写作prompt"""
     today_cn = _format_cn_date(datetime.now())
     # 解析日期
-    date_cn = today_cn
-    pub_md = _format_cn_month_day(datetime.now())
-    if pub_date:
-        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d", "%Y/%m/%d"):
-            try:
-                dt = datetime.strptime(pub_date.replace("+00:00","Z").replace("+08:00","Z")[:19], fmt.replace("%z","")[:19] if "%z" in fmt else fmt)
-                date_cn = _format_cn_date(dt)
-                pub_md = _format_cn_month_day(dt)
-                break
-            except:
-                continue
-    source_label = source if source else "境外媒体"
+    date_cn = "未提供"
+    pub_md = ""
+    dt = _brief_parse_date_value(pub_date)
+    if dt:
+        date_cn = _format_cn_date(dt)
+        pub_md = _format_cn_month_day(dt)
+    source_label = source if source else "素材中明确标注的来源"
+    source_entry_example = f"{source_label}{pub_md or 'X月X日'}发文《{title}》"
     return f"""请根据以下导入素材，撰写一份PLA机关军语要讯（情报简报）：
 
 ════════ 导入素材 ════════
@@ -5244,14 +6541,16 @@ def _build_brief_user_prompt_imported(title: str, body: str, source: str = "", u
 
 ════════ 写作任务 ════════
 请输出一份要讯，严格遵循以下要求：
-1. 事件时间填写：{date_cn}
-2. 正文开头使用"据{source_label}报道"或"据{source_label}{pub_md}报道"
-3. 末尾信息来源填写：（信息来源：{source_label}{pub_md}发文《{title}》）
-4. 必须单段成文、（1）（2）（3）三点分列影响、250-350字；结尾建议必须采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"的范式
-5. 标题以"值得警惕/值得关注/威胁/压力"收尾
-6. 使用PLA机关军语，必须出现"研判/建议/着力/加强/威胁/值得警惕"等词
-7. 从素材提炼对我军/对华影响，不得编造素材未提及的具体数据
-8. 如素材为中文，标题和正文直接用中文军语撰写；如素材为外文，需翻译为符合中文风格的PLA机关军语
+1. 事件时间只填写素材正文明确记载的实际事件日期，必须写完整年月日，不得写"近期/近日/日前"，也不得把来源发布日期{date_cn}或今日日期当作事件日期。素材未给具体事件日期时不得臆造
+2. 价值点必须用不同于标题的表述概括战略意义，严禁复制标题
+3. 标题控制在8-15字，不得含中文或英文逗号，且以"值得警惕"或"值得关注"收尾
+4. 正文统一以"据{source_label}报道，"开头，该来源名称必须与信息来源行一致，发文日期只写在信息来源行。若素材来自公众号转引，优先采用已核验的外网第一信源；无法取得第一信源时写"据XX公众号报道，"
+5. 帽段先用80-120字简述事件基本情况，写出与事件时间一致的具体月日，使其在最终DOCX版面约占3-4行，再进入分析
+6. 必须单段成文、250-350字；可使用（1）（2）（3）三点分列且各层用句号，写成"。（2）""。（3）"；也可不用编号，将至少三层意思用中文分号分隔并以句号收束
+7. 结尾建议必须采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"的范式
+8. 末尾信息来源逐条写成"来源名X月X日发文《中文标题》"；当前素材至少写：（信息来源：{source_entry_example}）。如日期未提供，须从原文核实后替换X月X日；如正文还引用其他来源，全部补入同一行并以中文分号分隔
+9. 使用PLA机关军语，从素材提炼对我军/对华影响，不得编造素材未提及的具体数据
+10. 如素材为中文，标题和正文直接用中文军语撰写；如素材为外文，需翻译为符合中文风格的PLA机关军语
 
 直接输出要讯全文，不要任何解释说明。"""
 
@@ -5276,6 +6575,17 @@ def api_brief_import_url():
         extracted = _extract_url_content(url)
         if not extracted["body"] or len(extracted["body"]) < 50:
             return jsonify({"error": "页面正文提取失败或内容过短，请检查URL"}), 400
+        if not _brief_parse_date_value(extracted.get("pub_date")):
+            return jsonify({"error": "页面未提取到可核实的发文日期，无法生成完整信息来源行"}), 422
+        source_context = _brief_source_context(
+            material_text="\n".join(filter(None, [extracted["title"], extracted["body"]])),
+            source_name=extracted["source"],
+            source_title=extracted["title"],
+            publication_date=extracted["pub_date"],
+            publication_date_verified=True,
+            url=url,
+            origin="import_url",
+        )
         # 2. 调用AI生成要讯
         prompt = _build_brief_user_prompt_imported(
             title=extracted["title"], body=extracted["body"],
@@ -5285,33 +6595,27 @@ def api_brief_import_url():
             {"role": "user",   "content": prompt},
         ]
         result = _call_ai(messages, temperature=0.4)
-        validation = _validate_brief_text(result)
-        saved_path = _persist_brief_to_disk(result)
-        imported_article = {
-            "title": extracted["title"],
-            "summary": extracted["body"][:800],
-            "source": extracted["source"],
-            "source_cn": extracted["source"],
-            "link": url,
-            "date": extracted["pub_date"] or datetime.now(timezone.utc).isoformat(),
-            "tier": 2,
-            "focus": "imported",
-            "region": "📎 导入",
-        }
-        article_id = record_quality_generation(
-            imported_article,
-            result,
-            {k: v for k, v in validation.items() if k != "parsed"},
-        )
+        validation = _validate_brief_text(result, source_context=source_context)
+        public_validation = _public_brief_validation(validation)
+        if validation.get("valid") is not True:
+            return jsonify({
+                "error": _brief_validation_error_text(validation),
+                "validation": public_validation,
+            }), 422
+        saved_path = _persist_brief_to_disk(result, source_context=source_context)
+        # 用户导入原文不进入本地质量训练库；仅返回本次会话使用的随机引用。
+        article_id = "import-" + secrets.token_hex(10)
         return jsonify({
             "brief": result,
-            "validation": {k: v for k, v in validation.items() if k != "parsed"},
+            "validation": public_validation,
+            "source_evidence": _brief_seal_source_context(source_context),
             "article_id": article_id,
             "source_info": {
                 "title": extracted["title"],
                 "source": extracted["source"],
                 "url": url,
                 "pub_date": extracted["pub_date"],
+                "material_text": extracted["body"],
                 "body_length": len(extracted["body"]),
             },
             "model": _ai_model_id(),
@@ -5338,42 +6642,51 @@ def api_brief_import_file():
     if not _ai_is_enabled():
         return jsonify({"error": "AI API Key 未配置，请先在AI标签页配置"}), 400
     try:
+        source = (request.form.get("source") or "").strip()
+        pub_date = (request.form.get("pub_date") or "").strip()
+        if not source:
+            return jsonify({"error": "请填写文件素材的原始信息来源"}), 400
+        if not _brief_parse_date_value(pub_date):
+            return jsonify({"error": "请填写可核实的来源发文日期"}), 400
         extracted = _extract_file_text(file)
         if not extracted["body"] or len(extracted["body"]) < 30:
             return jsonify({"error": "文件内容提取失败或内容过短"}), 400
         prompt = _build_brief_user_prompt_imported(
             title=extracted["title"], body=extracted["body"],
-            source=f"文件《{file.filename}》")
+            source=source, pub_date=pub_date)
+        source_context = _brief_source_context(
+            material_text="\n".join(filter(None, [extracted["title"], extracted["body"]])),
+            source_name=source,
+            source_title=extracted["title"],
+            publication_date=pub_date,
+            publication_date_verified=True,
+            origin="import_file",
+        )
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
             {"role": "user",   "content": prompt},
         ]
         result = _call_ai(messages, temperature=0.4)
-        validation = _validate_brief_text(result)
-        saved_path = _persist_brief_to_disk(result)
-        imported_article = {
-            "title": extracted["title"],
-            "summary": extracted["body"][:800],
-            "source": file.filename,
-            "source_cn": file.filename,
-            "link": "",
-            "date": datetime.now(timezone.utc).isoformat(),
-            "tier": 2,
-            "focus": "imported",
-            "region": "📎 导入",
-        }
-        article_id = record_quality_generation(
-            imported_article,
-            result,
-            {k: v for k, v in validation.items() if k != "parsed"},
-        )
+        validation = _validate_brief_text(result, source_context=source_context)
+        public_validation = _public_brief_validation(validation)
+        if validation.get("valid") is not True:
+            return jsonify({
+                "error": _brief_validation_error_text(validation),
+                "validation": public_validation,
+            }), 422
+        saved_path = _persist_brief_to_disk(result, source_context=source_context)
+        # 用户导入原文不进入本地质量训练库；仅返回本次会话使用的随机引用。
+        article_id = "import-" + secrets.token_hex(10)
         return jsonify({
             "brief": result,
-            "validation": {k: v for k, v in validation.items() if k != "parsed"},
+            "validation": public_validation,
+            "source_evidence": _brief_seal_source_context(source_context),
             "article_id": article_id,
             "source_info": {
                 "title": extracted["title"],
-                "source": file.filename,
+                "source": source,
+                "pub_date": pub_date,
+                "material_text": extracted["body"],
                 "body_length": len(extracted["body"]),
             },
             "model": _ai_model_id(),
@@ -5396,43 +6709,53 @@ def api_brief_import_text():
     text = (data.get("text") or "").strip()
     title = (data.get("title") or "").strip()
     source = (data.get("source") or "").strip()
+    pub_date = (data.get("pub_date") or "").strip()
     if not text or len(text) < 30:
         return jsonify({"error": "文本内容过短（至少30字）"}), 400
+    if not source:
+        return jsonify({"error": "请填写文本素材的原始信息来源"}), 400
+    if not _brief_parse_date_value(pub_date):
+        return jsonify({"error": "请填写可核实的来源发文日期"}), 400
     if not _ai_is_enabled():
         return jsonify({"error": "AI API Key 未配置，请先在AI标签页配置"}), 400
     try:
         if not title:
             title = text[:60].split("\n")[0]
         prompt = _build_brief_user_prompt_imported(
-            title=title, body=text[:8000], source=source or "用户导入素材")
+            title=title, body=text[:8000], source=source, pub_date=pub_date)
+        source_context = _brief_source_context(
+            material_text="\n".join(filter(None, [title, text[:8000]])),
+            source_name=source,
+            source_title=title,
+            publication_date=pub_date,
+            publication_date_verified=True,
+            origin="import_text",
+        )
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
             {"role": "user",   "content": prompt},
         ]
         result = _call_ai(messages, temperature=0.4)
-        validation = _validate_brief_text(result)
-        saved_path = _persist_brief_to_disk(result)
-        imported_article = {
-            "title": title,
-            "summary": text[:800],
-            "source": source or "用户导入",
-            "source_cn": source or "用户导入",
-            "link": "",
-            "date": datetime.now(timezone.utc).isoformat(),
-            "tier": 2,
-            "focus": "imported",
-            "region": "📎 导入",
-        }
-        article_id = record_quality_generation(
-            imported_article,
-            result,
-            {k: v for k, v in validation.items() if k != "parsed"},
-        )
+        validation = _validate_brief_text(result, source_context=source_context)
+        public_validation = _public_brief_validation(validation)
+        if validation.get("valid") is not True:
+            return jsonify({
+                "error": _brief_validation_error_text(validation),
+                "validation": public_validation,
+            }), 422
+        saved_path = _persist_brief_to_disk(result, source_context=source_context)
+        # 用户导入原文不进入本地质量训练库；仅返回本次会话使用的随机引用。
+        article_id = "import-" + secrets.token_hex(10)
         return jsonify({
             "brief": result,
-            "validation": {k: v for k, v in validation.items() if k != "parsed"},
+            "validation": public_validation,
+            "source_evidence": _brief_seal_source_context(source_context),
             "article_id": article_id,
-            "source_info": {"title": title, "source": source or "用户导入", "body_length": len(text)},
+            "source_info": {
+                "title": title, "source": source, "pub_date": pub_date,
+                "material_text": text[:8000],
+                "body_length": len(text),
+            },
             "model": _ai_model_id(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "saved_to": saved_path,

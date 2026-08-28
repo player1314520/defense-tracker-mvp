@@ -90,11 +90,11 @@ def _verify_feishu_signature(token: str, timestamp: str, nonce: str, body: bytes
     算法：sha256(timestamp + nonce + token + body_str)
     token 为飞书开放平台 → 事件订阅 → 验证令牌（Verification Token）。
     """
-    if not token:
-        return True   # 未配置 token 则跳过校验（开发环境）
+    incoming = request.headers.get("X-Lark-Signature", "")
+    if not all((token, timestamp, nonce, incoming)):
+        return False
     key = (timestamp + nonce + token).encode("utf-8") + body
     sig = hashlib.sha256(key).hexdigest()
-    incoming = request.headers.get("X-Lark-Signature", "")
     return hmac.compare_digest(sig, incoming)
 
 
@@ -272,11 +272,10 @@ def _add_para(doc, align=None, left_indent=None, first_indent=None):
 
 
 def _parse_brief_sections(text: str) -> dict:
-    """解析 AI 输出为六部分结构，带健壮的 fallback。
-    即使 AI 输出格式不规范（缺少标签行、段落混乱），也能尽量提取可用内容。"""
+    """解析已通过门禁的六部分要讯；缺项时失败关闭。"""
     lines = text.strip().split('\n')
     sec = {'event_time': '', 'value_point': '', 'title': '',
-           'body': '', 'source': '', 'reporter': '报送人：           电话：'}
+           'body': '', 'source': '', 'reporter': ''}
 
     remaining = []
     for line in lines:
@@ -301,19 +300,9 @@ def _parse_brief_sections(text: str) -> dict:
         title_parts = [non_empty[i] for i in range(len(non_empty)) if i != longest_idx]
         sec['title'] = ''.join(title_parts)
 
-    # ── Fallback 兜底 ──
-    if not sec['event_time']:
-        now = time.localtime()
-        sec['event_time'] = f"事件时间：{now.tm_year:04d}年{now.tm_mon:02d}月{now.tm_mday:02d}日"
-        logger.warning("AI 输出缺少'事件时间'行，已自动填充今日日期")
-    if not sec['title'] and sec['body']:
-        sec['title'] = sec['body'][:20].rstrip('，。、；') + "值得关注"
-        logger.warning("AI 输出缺少标题，已从正文截取")
-    if not sec['body']:
-        sec['body'] = text.strip()[:500]
-        logger.warning("AI 输出无法解析正文段落，已将全文作为正文")
-    if not sec['source']:
-        logger.warning("AI 输出缺少'信息来源'行")
+    missing = [name for name, value in sec.items() if not value]
+    if missing:
+        raise ValueError("要讯结构不完整，不能生成DOCX：" + "、".join(missing))
     return sec
 
 
@@ -484,6 +473,8 @@ def _process_async(chat_id: str, text: str):
             _build_brief_user_prompt_imported,
             _call_ai,
             _validate_brief_text,
+            _brief_source_context,
+            _brief_parse_date_value,
             SYSTEM_PROMPT_BRIEF_WRITE,
             AI_CONFIG,
         )
@@ -511,11 +502,22 @@ def _process_async(chat_id: str, text: str):
                 send_card(chat_id, _build_error_card(
                     f"无法提取页面正文（字符数：{len(body)}）\n链接：{url}"))
                 return
+            if not _brief_parse_date_value(extracted.get("pub_date")):
+                send_text(chat_id, "❌ 页面未提取到可核实的发文日期，无法生成完整信息来源行。")
+                return
             source_info = {
                 "title":  extracted.get("title", url[:60]),
                 "source": extracted.get("source", ""),
                 "url":    url,
             }
+            source_context = _brief_source_context(
+                material_text="\n".join(filter(None, [extracted.get("title"), body])),
+                source_name=extracted.get("source", ""),
+                source_title=extracted.get("title", ""),
+                publication_date=extracted.get("pub_date", ""),
+                publication_date_verified=True,
+                url=url,
+            )
             prompt = _build_brief_user_prompt_imported(
                 title=extracted.get("title", ""),
                 body=body,
@@ -528,9 +530,10 @@ def _process_async(chat_id: str, text: str):
             # ── 纯文本模式 ────────────────────────────────
             send_text(chat_id, "⏳ 正在根据文本内容生成要讯，请稍候…")
             source_info = {"title": text[:40], "source": "用户导入", "url": ""}
+            source_context = _brief_source_context(material_text=text)
             prompt = _build_brief_user_prompt_imported(
                 title=text[:40], body=text,
-                source="用户导入", url="", pub_date="")
+                source="", url="", pub_date="")
 
         else:
             send_text(chat_id,
@@ -546,6 +549,14 @@ def _process_async(chat_id: str, text: str):
             {"role": "user",   "content": prompt},
         ]
         result = _call_ai(messages, temperature=0.4)
+        validation = _validate_brief_text(result, source_context=source_context)
+        if validation.get("valid") is not True:
+            errors = validation.get("errors") or ["未知校验错误"]
+            send_card(chat_id, _build_error_card(
+                "要讯未通过写作规范，已停止发送和导出：\n" +
+                "\n".join(f"• {error}" for error in errors[:8])
+            ))
+            return
 
         # ── 回复卡片预览 ─────────────────────────────────
         send_card(chat_id, _build_brief_card(result, source_info))
@@ -587,25 +598,37 @@ def feishu_webhook():
     """飞书事件订阅回调入口（需在飞书开放平台注册为事件订阅URL）"""
     raw_body = request.get_data()
     data = request.get_json(silent=True) or {}
+    verify_token = str(FEISHU_CONFIG.get("verify_token") or "").strip()
+    if not verify_token:
+        logger.error("feishu_bot: webhook verification token is not configured")
+        return jsonify({"code": 1, "msg": "webhook verification not configured"}), 503
 
     # ── URL 验证（首次注册 webhook 时飞书发来）──────────────
     if data.get("type") == "url_verification":
+        incoming_token = str(data.get("token") or "")
+        if not hmac.compare_digest(verify_token, incoming_token):
+            logger.warning("feishu_bot: URL verification token invalid")
+            return jsonify({"code": 1, "msg": "invalid token"}), 403
         challenge = data.get("challenge", "")
         logger.info("feishu_bot: URL verification OK")
         return jsonify({"challenge": challenge})
-
-    # ── 签名校验（防伪造事件）────────────────────────────────
-    ts    = request.headers.get("X-Lark-Request-Timestamp", "")
-    nonce = request.headers.get("X-Lark-Request-Nonce", "")
-    verify_token = FEISHU_CONFIG.get("verify_token", "")
-    if verify_token and not _verify_feishu_signature(verify_token, ts, nonce, raw_body):
-        logger.warning("feishu_bot: 签名校验失败，请求被拒绝")
-        return jsonify({"code": 1, "msg": "invalid signature"}), 403
 
     # ── 事件处理（schema 2.0）────────────────────────────────
     header     = data.get("header", {})
     event_type = header.get("event_type", "")
     event      = data.get("event", {})
+    incoming_token = str(header.get("token") or "")
+    if not hmac.compare_digest(verify_token, incoming_token):
+        logger.warning("feishu_bot: Verification Token invalid")
+        return jsonify({"code": 1, "msg": "invalid token"}), 403
+
+    # 签名头出现时必须完整、正确；无签名头时仍由 header.token 鉴权。
+    if request.headers.get("X-Lark-Signature"):
+        ts = request.headers.get("X-Lark-Request-Timestamp", "")
+        nonce = request.headers.get("X-Lark-Request-Nonce", "")
+        if not _verify_feishu_signature(verify_token, ts, nonce, raw_body):
+            logger.warning("feishu_bot: 签名校验失败，请求被拒绝")
+            return jsonify({"code": 1, "msg": "invalid signature"}), 403
 
     if event_type != "im.message.receive_v1":
         return jsonify({"code": 0})

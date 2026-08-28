@@ -21,18 +21,40 @@ try {
 } catch(e) { briefResults = []; }
 
 function briefSave() {
+  const clean = briefResults.slice(0, 50).map(r => {
+    const {_editing, _editBuffer, sourceEvidence, ...rest} = r;
+    const evidenceOrigin = sourceEvidence?.payload?.origin || 'unknown';
+    const article = {...(rest.article || {})};
+    // 用户导入的原文及其证据只保留在当前页面内存，不写浏览器或用户状态库。
+    if (evidenceOrigin !== 'rss_cache') article.summary = '';
+    return {
+      ...rest,
+      article,
+      ...(evidenceOrigin === 'rss_cache' ? {sourceEvidence} : {}),
+    };
+  });
   try {
-    // 持久化时剥离编辑态临时字段
-    const clean = briefResults.slice(0, 50).map(r => {
-      const {_editing, _editBuffer, ...rest} = r;
-      return rest;
-    });
     localStorage.setItem('briefResults', JSON.stringify(clean));
-    // ☁ write-through：同步到服务端（udSync 来自 news.js，先加载；不可达仅 warn）
+  } catch(e) {
+    console.warn('要讯历史未能写入浏览器存储', e);
+    if (typeof showToast === 'function') showToast('浏览器存储空间不足；本次要讯仍保留在当前页面', 7000);
+  }
+  // 浏览器配额失败不能阻断服务端 write-through。
+  try {
     if (typeof udSync === 'function') {
       udSync('/api/userdata/kv/briefResults', { _method: 'PUT', value: clean });
     }
-  } catch(e) {}
+  } catch(e) {
+    console.warn('要讯历史未能同步到服务端', e);
+  }
+}
+
+function _briefArticleRef(article) {
+  return {
+    aid: article?.aid || '',
+    article_id: article?.article_id || '',
+    link: article?.link || '',
+  };
 }
 
 // ☁ 启动合并：服务端要讯历史与本地按 id 并集（服务端优先），合并后回推
@@ -160,12 +182,12 @@ async function briefGenerateSingle(idx) {
     const r = await apiFetch('/api/brief/generate', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ article })
+      body: JSON.stringify({ article: _briefArticleRef(article) })
     }, {toast: false});
     const data = await r.json();
     if (data.error) { showToast('❌ ' + data.error); return; }
     if (data.article_id) article.article_id = data.article_id;
-    briefAddResult(data.brief, article);
+    briefAddResult(data.brief, {...article, ...(data.source_article || {})}, data.source_evidence);
     showToast(data.saved_to ? '✅ 已生成1篇要讯 · 已存档到 素材库/每日新闻/' : '✅ 已生成1篇要讯');
   } catch(e) {
     showToast('❌ 生成失败: ' + e.message);
@@ -186,11 +208,11 @@ async function oneClickBrief(idx, btn) {
     const r = await apiFetch('/api/brief/generate', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ article: item })
+      body: JSON.stringify({ article: _briefArticleRef(item) })
     }, {toast: false});
     const data = await r.json();
     if (data.error) { showToast('生成失败：' + data.error); return; }
-    briefAddResult(data.brief, item);
+    briefAddResult(data.brief, {...item, ...(data.source_article || {})}, data.source_evidence);
     showTab('brief');
     showToast(data.saved_to ? '要讯已生成并存档到 素材库/每日新闻/' : '要讯已生成');
   } catch(e) {
@@ -244,7 +266,7 @@ async function briefBatchGenerate() {
           } else if (obj.type === 'brief') {
             done = obj.index;
             if (obj.article_id && obj.article) obj.article.article_id = obj.article_id;
-            briefAddResult(obj.brief, obj.article);
+            briefAddResult(obj.brief, obj.article, obj.source_evidence);
             const pct = (done / total * 100).toFixed(0);
             fill.style.width = pct + '%';
             txt.textContent = `已完成 ${done} / ${total} 篇 (${pct}%)`;
@@ -272,11 +294,12 @@ async function briefBatchGenerate() {
   }
 }
 
-function briefAddResult(brief, article) {
+function briefAddResult(brief, article, sourceEvidence) {
   const id = 'br_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
   briefResults.unshift({
     id,
     brief,
+    sourceEvidence,
     article: {
       title: article.title,
       source: article.source_cn || article.source,
@@ -284,6 +307,8 @@ function briefAddResult(brief, article) {
       region: article.region,
       link: article.link,
       date: article.date,
+      summary: article.summary,
+      publication_date_verified: article.publication_date_verified !== false,
       article_id: article.article_id,
       quality_level: article.quality_level,
       quality_score: article.quality_score,
@@ -362,14 +387,16 @@ function briefClientValidate(text) {
   const out = {
     bodyCount: 0, bodyOk: false,
     titleCount: 0, titleOk: false,
-    suggestOk: false, structOk: false, mdOk: true,
+    eventOk: false, valueOk: false, hatOk: false, sourceOk: false,
+    suggestOk: false, structOk: false, mdOk: true, valid: false,
     issues: []
   };
   if (!text || typeof text !== 'string') { out.issues.push('空内容'); return out; }
-  // 解析：与后端一致 — 空行驱动 meta→title→body 状态切换
   const rawLines = text.replace(/\r/g, '').split('\n').map(s => s.replace(/\s+$/, ''));
   let state = 'meta';
   const titleLines = [], bodyLines = [];
+  let eventTime = '', valuePoint = '', sourceLine = '', reporter = '';
+  const unexpected = [];
   for (const raw of rawLines) {
     const s = raw.trim();
     if (!s) {
@@ -377,11 +404,25 @@ function briefClientValidate(text) {
       else if (state === 'title' && titleLines.length) state = 'body';
       continue;
     }
-    if (s.startsWith('事件时间') || s.startsWith('价 值 点') || s.startsWith('价值点')) {
+    if (/^事件时间[：:]/.test(s)) {
+      if (eventTime) unexpected.push(s);
+      eventTime = s.replace(/^事件时间[：:]\s*/, '');
       state = 'meta'; continue;
     }
-    if (s.startsWith('（信息来源') || s.startsWith('(信息来源')) { state = 'done'; continue; }
-    if (s.startsWith('报送人')) continue;
+    if (/^价\s*值\s*点[：:]/.test(s)) {
+      if (valuePoint) unexpected.push(s);
+      valuePoint = s.replace(/^价\s*值\s*点[：:]\s*/, '');
+      state = 'meta'; continue;
+    }
+    if (s.startsWith('（信息来源') || s.startsWith('(信息来源')) {
+      if (sourceLine) unexpected.push(s);
+      sourceLine = s; state = 'done'; continue;
+    }
+    if (s.startsWith('报送人')) {
+      if (reporter) unexpected.push(s);
+      reporter = s; state = 'done'; continue;
+    }
+    if (state === 'done') { unexpected.push(s); continue; }
     if (state === 'title') { titleLines.push(s); }
     else if (state === 'body' || state === 'meta') {
       if (state === 'meta') state = 'body';
@@ -390,29 +431,70 @@ function briefClientValidate(text) {
   }
   const title = titleLines.join('');
   const body = bodyLines.join('');
-  // 去除中文标点后计字符数（与后端 _count_cn 一致）
-  const countCn = (s) => (s || '').replace(/[，。、；：""''（）《》〈〉「」『』【】—…,.\s]/g, '').length;
+  const countCn = (s) => (s || '').replace(/\s/g, '').length;
+  const compact = (s) => (s || '').replace(/[\s，,。；;：:！？!?（）()《》“”"'、]/g, '');
   out.bodyCount = countCn(body);
-  out.titleCount = countCn(title);
+  out.titleCount = title.length;
   out.bodyOk = out.bodyCount >= 250 && out.bodyCount <= 350;
-  out.titleOk = out.titleCount >= 8 && out.titleCount <= 30;
+  out.titleOk = out.titleCount >= 8 && out.titleCount <= 15
+    && !/[，,]/.test(title) && /(?:值得关注|值得警惕)$/.test(title);
   if (!out.bodyOk) out.issues.push(`正文${out.bodyCount}字（应250-350）`);
-  if (!out.titleOk) out.issues.push(`标题${out.titleCount}字（应8-30）`);
-  // 建议范式：持续跟踪...针对性加强...能力建设
+  if (!out.titleOk) out.issues.push('标题应为8-15字、无逗号并以“值得关注/值得警惕”收尾');
+
+  const eventMatch = /^(\d{4})年(\d{1,2})月(\d{1,2})日$/.exec(eventTime);
+  if (eventMatch && !/(近期|近日|日前|最近)/.test(eventTime)) {
+    const y = Number(eventMatch[1]), m = Number(eventMatch[2]), d = Number(eventMatch[3]);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    out.eventOk = dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+  }
+  if (!out.eventOk) out.issues.push('事件时间必须是有效的YYYY年M月D日，不能写近期');
+
+  const titleCore = compact(title).replace(/(?:值得关注|值得警惕)$/, '');
+  const valueCompact = compact(valuePoint);
+  out.valueOk = Boolean(valueCompact && titleCore
+    && valueCompact !== titleCore
+    && !(valueCompact.startsWith(titleCore) && valueCompact.length - titleCore.length < 8));
+  if (!out.valueOk) out.issues.push('价值点不得复制标题');
+
   out.suggestOk = /建议持续跟踪[^。]*?针对性加强[^。]*?能力建设/.test(body);
   if (!out.suggestOk) out.issues.push('建议未采用"持续跟踪X+针对性加强Y能力建设"范式');
-  // (1)(2)(3) 结构
-  const hasStruct = (/（一）|\(1\)|一、/.test(body)) && (/（二）|\(2\)|二、/.test(body)) && (/（三）|\(3\)|三、/.test(body));
-  out.structOk = hasStruct;
-  if (!hasStruct) out.issues.push('缺少（一）（二）（三）三段结构');
-  // Markdown 检查
+
+  const normalizedBody = body.replace(/\(1\)/g, '（1）').replace(/\(2\)/g, '（2）').replace(/\(3\)/g, '（3）');
+  const hasNumbered = ['（1）','（2）','（3）'].every(mark => normalizedBody.includes(mark));
+  let hat = '';
+  if (hasNumbered) {
+    hat = normalizedBody.slice(0, normalizedBody.indexOf('（1）')).trim();
+    out.structOk = normalizedBody.includes('。（2）') && normalizedBody.includes('。（3）');
+  } else {
+    const suggestion = normalizedBody.lastIndexOf('。建议');
+    const beforeSuggestion = suggestion >= 0 ? normalizedBody.slice(0, suggestion) : '';
+    const semicolons = [...beforeSuggestion.matchAll(/；/g)].map(match => match.index);
+    const firstLayerSep = semicolons.length >= 2 ? semicolons[semicolons.length - 2] : -1;
+    const hatEnd = firstLayerSep >= 0 ? beforeSuggestion.lastIndexOf('。', firstLayerSep) : -1;
+    hat = hatEnd >= 0 ? normalizedBody.slice(0, hatEnd + 1).trim() : '';
+    const layers = hatEnd >= 0 ? beforeSuggestion.slice(hatEnd + 1).split('；').map(s => s.trim()) : [];
+    out.structOk = layers.length >= 3 && layers.every(Boolean) && !beforeSuggestion.includes(';');
+  }
+  if (!out.structOk) out.issues.push('编号层意须用句号，无编号层意须用中文分号');
+  out.hatOk = countCn(hat) >= 80 && countCn(hat) <= 120;
+  if (eventMatch) out.hatOk = out.hatOk && hat.includes(`${Number(eventMatch[2])}月${Number(eventMatch[3])}日`);
+  if (!out.hatOk) out.issues.push('帽段应为80-120字并写明与事件时间一致的月日');
+
+  const sourceMatch = /^[（(]信息来源[：:]([\s\S]+)[）)]$/.exec(sourceLine);
+  const sourceItems = sourceMatch ? sourceMatch[1].split('；').map(s => s.trim()).filter(Boolean) : [];
+  const sourceEntry = /^(.{1,100}?)\s*(\d{1,2})月(\d{1,2})日发文《([^》]+)》$/;
+  const parsedSources = sourceItems.map(item => sourceEntry.exec(item));
+  const lead = /^据([^，,。；;]{1,80}?)报道[，,]/.exec(body);
+  out.sourceOk = Boolean(sourceItems.length && parsedSources.every(Boolean) && !sourceLine.includes(';')
+    && lead && parsedSources[0][1].trim() === lead[1].trim() && !/\d{1,2}月\d{1,2}日/.test(lead[1]));
+  if (!out.sourceOk) out.issues.push('据XX报道须与首条来源一致，来源须逐条按规定格式用中文分号列全');
+  if (!/^报送人：\s+电话：\s*$/.test(reporter)) out.issues.push('报送人和电话必须留空');
+  if (unexpected.length) out.issues.push('六部分之外不得附加内容');
+
   if (/(^|\s)(#{1,6}\s|\*\*|__|```|~~~|^\s*[-*+]\s)/m.test(text)) {
     out.mdOk = false; out.issues.push('含Markdown符号');
   }
-  // 警示词检查
-  const warnWords = ['值得警惕','值得关注','值得重视','威胁','压力','引发关注','引发热议'];
-  const hitWarn = warnWords.filter(w => title.includes(w));
-  if (hitWarn.length) out.issues.push(`标题含警示词：${hitWarn.join('、')}`);
+  out.valid = out.issues.length === 0;
   return out;
 }
 
@@ -450,10 +532,16 @@ function briefOnEditInput(id, val) {
     <button class="brief-edit-cancel" onclick="briefEditCancel('${id}')">✕ 取消</button>`;
 }
 
-function briefEditSave(id) {
+async function briefEditSave(id) {
   const r = briefResults.find(x => x.id === id);
   if (!r) return;
   const newText = (r._editBuffer != null) ? r._editBuffer : r.brief;
+  if (!await _briefValidateForRelease(r, newText)) return;
+  const currentText = (r._editBuffer != null) ? r._editBuffer : r.brief;
+  if (currentText !== newText) {
+    showToast('校验期间内容已变化，请再次保存', 5000);
+    return;
+  }
   r.brief = newText;
   r._editing = false;
   delete r._editBuffer;
@@ -482,23 +570,66 @@ function _briefFlushEdit(r) {
   return false;
 }
 
-function briefCopyOne(id) {
+function _briefReleaseReady(r, text) {
+  const validation = briefClientValidate(text);
+  if (!validation.valid) {
+    showToast('要讯未通过写作门禁：' + validation.issues.slice(0, 3).join('；'), 7000);
+    return false;
+  }
+  if (!r?.sourceEvidence) {
+    showToast('缺少服务器签发的原始素材证据，请从原文重新生成', 7000);
+    return false;
+  }
+  return true;
+}
+
+async function _briefValidateForRelease(r, text) {
+  if (!_briefReleaseReady(r, text)) return false;
+  try {
+    await apiFetch('/api/brief/validate', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({brief: text, source_evidence: r.sourceEvidence}),
+    }, {toast: false});
+    return true;
+  } catch (e) {
+    showToast('要讯未通过来源门禁：' + e.message, 7000);
+    return false;
+  }
+}
+
+async function briefCopyOne(id) {
   const r = briefResults.find(x => x.id === id);
   if (!r) return;
-  if (_briefFlushEdit(r)) { briefSave(); briefRenderResults(); }
-  navigator.clipboard.writeText(r.brief).then(() => showToast('已复制要讯'));
+  const candidate = (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief;
+  if (!await _briefValidateForRelease(r, candidate)) return;
+  const current = (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief;
+  if (current !== candidate) {
+    showToast('校验期间内容已变化，请重新复制', 5000);
+    return;
+  }
+  if (r._editing) {
+    r.brief = candidate;
+    r._editing = false;
+    delete r._editBuffer;
+    briefSave();
+    briefRenderResults();
+  }
+  navigator.clipboard.writeText(candidate).then(() => showToast('已复制要讯'));
 }
 
 async function briefDownloadDocx(id) {
   const r = briefResults.find(x => x.id === id);
   if (!r) return;
+  const candidate = (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief;
+  if (!_briefReleaseReady(r, candidate)) return;
   if (_briefFlushEdit(r)) { briefSave(); briefRenderResults(); }
   showToast('生成Word文件…');
   try {
     const resp = await apiFetch('/api/brief/export_docx', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ brief: r.brief })
+      body: JSON.stringify({ brief: r.brief, source_evidence: r.sourceEvidence })
     }, {toast: false});
     await downloadResponseBlob(resp, '要讯.docx', '.docx');
     showToast('Word已下载');
@@ -509,6 +640,10 @@ async function briefDownloadDocx(id) {
 
 async function briefDownloadCompiledDocx() {
   if (!briefResults.length) { showToast('暂无要讯可汇编'); return; }
+  const invalid = briefResults.find(r => !_briefReleaseReady(
+    r, (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief
+  ));
+  if (invalid) return;
   // 把所有编辑态未保存的修改 flush 到 r.brief
   let _flushed = 0;
   briefResults.forEach(r => { if (_briefFlushEdit(r)) _flushed++; });
@@ -518,7 +653,9 @@ async function briefDownloadCompiledDocx() {
     const resp = await apiFetch('/api/brief/export_docx_compiled', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ briefs: briefResults.map(r => r.brief) })
+      body: JSON.stringify({
+        briefs: briefResults.map(r => ({brief: r.brief, source_evidence: r.sourceEvidence})),
+      })
     }, {toast: false});
     await downloadResponseBlob(resp, '要讯汇编.docx', '.docx');
     showToast(`汇编Word已下载（${briefResults.length}篇）`);
@@ -529,6 +666,10 @@ async function briefDownloadCompiledDocx() {
 
 async function briefDownloadAllDocx() {
   if (!briefResults.length) { showToast('暂无要讯可导出'); return; }
+  const invalid = briefResults.find(r => !_briefReleaseReady(
+    r, (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief
+  ));
+  if (invalid) return;
   let _flushed = 0;
   briefResults.forEach(r => { if (_briefFlushEdit(r)) _flushed++; });
   if (_flushed) { briefSave(); briefRenderResults(); }
@@ -538,7 +679,7 @@ async function briefDownloadAllDocx() {
       const resp = await apiFetch('/api/brief/export_docx', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ brief: r.brief })
+        body: JSON.stringify({ brief: r.brief, source_evidence: r.sourceEvidence })
       }, {toast: false});
       await downloadResponseBlob(resp, '要讯_' + r.id + '.docx', '.docx');
       await new Promise(r => setTimeout(r, 400));
@@ -557,6 +698,13 @@ function briefDeleteOne(id) {
 async function briefDiscardResult(id) {
   const r = briefResults.find(x => x.id === id);
   if (!r) return;
+  if (r.article?.region === '导入') {
+    briefResults = briefResults.filter(x => x.id !== id);
+    briefSave();
+    briefRenderResults();
+    showToast('已废弃并删除；导入内容未写入质量样本库');
+    return;
+  }
   try {
     await apiFetch('/api/quality/feedback', {
       method: 'POST',
@@ -600,21 +748,43 @@ async function briefRegenerate(id) {
     let resp;
     // 导入素材要讯走 import_text 接口（无RSS原文结构），RSS要讯走 generate 接口
     if (r.article.region === '导入') {
+      if (!r.article.summary) {
+        showToast('原始导入素材已缺失，不能用成稿反向自证；请重新导入原文', 7000);
+        return;
+      }
       resp = await apiFetch('/api/brief/import_text', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ text: r.brief, title: r.article.title, source: r.article.source })
+        body: JSON.stringify({
+          text: r.article.summary,
+          title: r.article.title,
+          source: r.article.source,
+          pub_date: r.article.date,
+        })
       }, {toast: false});
     } else {
       resp = await apiFetch('/api/brief/generate', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ article: art })
+        body: JSON.stringify({ article: _briefArticleRef(art) })
       }, {toast: false});
     }
     const data = await resp.json();
     if (data.error) { showToast(data.error, 5000); return; }
     r.brief = data.brief;
+    r.sourceEvidence = data.source_evidence;
+    if (data.source_article) r.article = {...r.article, ...data.source_article};
+    if (data.source_info) {
+      r.article = {
+        ...r.article,
+        title: data.source_info.title || r.article.title,
+        source: data.source_info.source || r.article.source,
+        source_cn: data.source_info.source || r.article.source_cn,
+        date: data.source_info.pub_date || r.article.date,
+        summary: data.source_info.material_text || r.article.summary,
+        publication_date_verified: Boolean(data.source_info.pub_date),
+      };
+    }
     r.timestamp = new Date().toISOString();
     if (data.validation) r.validation = data.validation;
     briefSave();
@@ -640,16 +810,44 @@ function briefClearResults() {
   showToast('已清空');
 }
 
-function briefExportAll() {
+async function briefExportAll() {
   if (!briefResults.length) { showToast('暂无要讯可导出'); return; }
+  const snapshots = briefResults.map(r => ({
+    result: r,
+    text: (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief,
+  }));
+  for (const item of snapshots) {
+    if (!await _briefValidateForRelease(item.result, item.text)) return;
+  }
+  if (
+    briefResults.length !== snapshots.length
+    || snapshots.some((item, index) => briefResults[index] !== item.result)
+    || snapshots.some(item => {
+    const r = item.result;
+    const current = (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief;
+    return current !== item.text;
+    })
+  ) {
+    showToast('校验期间要讯集合或内容已变化，请重新导出', 5000);
+    return;
+  }
   let _flushed = 0;
-  briefResults.forEach(r => { if (_briefFlushEdit(r)) _flushed++; });
+  snapshots.forEach(item => {
+    const r = item.result;
+    if (r._editing) {
+      r.brief = item.text;
+      r._editing = false;
+      delete r._editBuffer;
+      _flushed++;
+    }
+  });
   if (_flushed) { briefSave(); briefRenderResults(); }
   const today = new Date().toISOString().slice(0, 10);
-  const content = briefResults.map((r, i) => {
-    return `════════════════════════════════════════\n要讯 #${i+1}  · 生成时间 ${new Date(r.timestamp).toLocaleString('zh-CN')}\n════════════════════════════════════════\n${r.brief}\n\n【原文链接】${r.article.link}\n【原始来源】${r.article.source} · ${r.article.region||''}\n`;
+  const content = snapshots.map((item, i) => {
+    const r = item.result;
+    return `════════════════════════════════════════\n要讯 #${i+1}  · 生成时间 ${new Date(r.timestamp).toLocaleString('zh-CN')}\n════════════════════════════════════════\n${item.text}\n\n【原文链接】${r.article.link}\n【原始来源】${r.article.source} · ${r.article.region||''}\n`;
   }).join('\n\n');
-  const header = `防务要讯汇编 · ${today}\n共 ${briefResults.length} 篇\n基于《写作要点》选题 · 符合《命令》规范\n\n\n`;
+  const header = `防务要讯汇编 · ${today}\n共 ${snapshots.length} 篇\n基于《写作要点》选题 · 符合《命令》规范\n\n\n`;
   const blob = new Blob([header + content], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -657,7 +855,7 @@ function briefExportAll() {
   a.download = `防务要讯汇编_${today}.txt`;
   a.click();
   URL.revokeObjectURL(url);
-  showToast(`已导出 ${briefResults.length} 篇`);
+  showToast(`已导出 ${snapshots.length} 篇`);
 }
 
 function briefToggleAuto() {
@@ -768,6 +966,7 @@ function _importAddResult(data) {
   const result = {
     id: 'br_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
     brief: data.brief,
+    sourceEvidence: data.source_evidence,
     validation: data.validation,
     article: {
       title: data.source_info.title || '导入素材',
@@ -775,7 +974,9 @@ function _importAddResult(data) {
       source_cn: data.source_info.source || '用户导入',
       region: '导入',
       link: data.source_info.url || '',
-      date: data.generated_at,
+      date: data.source_info.pub_date || data.generated_at,
+      publication_date_verified: Boolean(data.source_info.pub_date),
+      summary: data.source_info.material_text || '',
       brief_score: 0,
       brief_hits: ['imported'],
     },
@@ -831,6 +1032,10 @@ async function importFromFile() {
   const input = document.getElementById('importFileInput');
   if (!input.files.length) { showToast('请先选择文件'); return; }
   const file = input.files[0];
+  const source = document.getElementById('importFileSource').value.trim();
+  const pubDate = document.getElementById('importFilePubDate').value;
+  if (!source) { showToast('请填写文件素材的原始信息来源'); return; }
+  if (!pubDate) { showToast('请选择文件素材的来源发文日期'); return; }
   const maxSize = 10 * 1024 * 1024; // 10MB
   if (file.size > maxSize) { showToast('文件过大（最大10MB）'); return; }
   _importDisableBtn('importFileBtn', true);
@@ -838,12 +1043,16 @@ async function importFromFile() {
   try {
     const formData = new FormData();
     formData.append('file', file);
+    formData.append('source', source);
+    formData.append('pub_date', pubDate);
     const resp = await apiFetch('/api/brief/import_file', {method: 'POST', body: formData}, {toast: false});
     const data = await resp.json();
     _importShowStatus('✅', `生成成功！提取 ${data.source_info.body_length} 字 · 文件: ${data.source_info.source}${data.saved_to ? ' · 已存档到 素材库/每日新闻/' : ''}`);
     _importAddResult(data);
     input.value = '';
     document.getElementById('importFileText').textContent = '点击选择文件或拖拽至此';
+    document.getElementById('importFileSource').value = '';
+    document.getElementById('importFilePubDate').value = '';
     document.getElementById('importFileBtn').disabled = true;
   } catch (e) {
     _importShowStatus('❌', '失败: ' + e.message);
@@ -858,13 +1067,16 @@ async function importFromText() {
   if (!text || text.length < 30) { showToast('文本内容过短（至少30字）'); textArea.focus(); return; }
   const title = document.getElementById('importTextTitle').value.trim();
   const source = document.getElementById('importTextSource').value.trim();
+  const pubDate = document.getElementById('importTextPubDate').value;
+  if (!source) { showToast('请填写文本素材的原始信息来源'); return; }
+  if (!pubDate) { showToast('请选择文本素材的来源发文日期'); return; }
   _importDisableBtn('importTextBtn', true);
   _importShowStatus('⏳', '正在生成要讯…');
   try {
     const resp = await apiFetch('/api/brief/import_text', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text, title, source}),
+      body: JSON.stringify({text, title, source, pub_date: pubDate}),
     }, {toast: false});
     const data = await resp.json();
     _importShowStatus('✅', `生成成功！来源: ${data.source_info.source}${data.saved_to ? ' · 已存档到 素材库/每日新闻/' : ''}`);
@@ -872,6 +1084,7 @@ async function importFromText() {
     textArea.value = '';
     document.getElementById('importTextTitle').value = '';
     document.getElementById('importTextSource').value = '';
+    document.getElementById('importTextPubDate').value = '';
   } catch (e) {
     _importShowStatus('❌', '失败: ' + e.message);
   } finally {

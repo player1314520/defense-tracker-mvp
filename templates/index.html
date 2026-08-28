@@ -664,13 +664,14 @@
         <span class="agent-logo">RW</span>
         <div>
           <h2>防务报告 Agent 工作台</h2>
-          <p class="agent-sub">客户一句话委托 · 智库/报告源检索 · 战略分析报告 · DOCX交付</p>
+          <p class="agent-sub">客户一句话委托 · 机构开源情报整编包 MVP · 高价值防务战略分析报告 · DOCX交付</p>
         </div>
       </div>
       <div class="agent-header-right">
         <span class="agent-stat">项目 <strong id="agentProjectCount">0</strong></span>
         <span class="agent-stat">证据 <strong id="agentEvidenceCount">0</strong></span>
-        <button class="agent-secondary-btn" onclick="agentLoadProjects()">刷新</button>
+        <button id="agentMvpRunBtn" type="button" class="agent-mvp-run-btn" aria-controls="agentMvpPreflight" onclick="agentRunMvp()">⚡ 一键跑通 MVP</button>
+        <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentLoadProjects()">刷新</button>
       </div>
     </div>
 
@@ -684,8 +685,8 @@
           <strong id="agentProjectSidebarCount">0个</strong>
         </div>
         <div class="agent-project-actions">
-          <button class="agent-secondary-btn" onclick="agentNewProjectDraft()">新建</button>
-          <button class="agent-secondary-btn" onclick="agentLoadProjects()">刷新</button>
+          <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentNewProjectDraft()">新建</button>
+          <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentLoadProjects()">刷新</button>
         </div>
         <div id="agentProjectList" class="agent-project-list">
           <div class="agent-empty">暂无项目</div>
@@ -694,14 +695,22 @@
         <h3 class="agent-panel-title agent-create-title">新建报告项目</h3>
         <div class="agent-client-brief">
           <div class="agent-brief-kicker">最简输入</div>
+          <label class="agent-field-label" for="agentRequest">客户任务</label>
           <textarea id="agentRequest" class="agent-request-area"
                     placeholder="帮我做一个XXX报告，例如：帮我做一个台海军力平衡报告"></textarea>
+          <label class="agent-field-label" for="agentTopic">聚焦主题（可选）</label>
           <input id="agentTopic" class="agent-input" type="text" placeholder="可选聚焦：台海 / 六代机 / 印太 / 核力量">
+          <label class="agent-field-label" for="agentReportType">报告类型</label>
+          <select id="agentReportType" class="agent-select">
+            <option value="institution_pack" selected>机构开源情报整编包（MVP）</option>
+            <option value="strategic">战略分析报告</option>
+          </select>
           <div class="agent-form-row">
-            <span class="agent-mode-chip">高价值防务战略分析报告</span>
-            <input id="agentTargetCount" class="agent-input agent-small-input" type="number" min="1" value="12" title="目标证据源数量">
+            <span id="agentReportTypeHint" class="agent-mode-chip">机构开源情报整编包（MVP）</span>
+            <label class="agent-count-label" for="agentTargetCount">目标来源</label>
+            <input id="agentTargetCount" class="agent-input agent-small-input" type="number" min="1" value="8" title="目标证据源数量">
           </div>
-          <button class="agent-primary-btn wide" onclick="agentCreateProject()">创建战略报告项目</button>
+          <button id="agentCreateProjectBtn" type="button" class="agent-primary-btn wide" data-agent-action onclick="agentCreateProject()">创建机构开源情报整编包（MVP）</button>
         </div>
       </aside>
 
@@ -709,13 +718,13 @@
         <div class="agent-panel-head">
           <h3 class="agent-panel-title">智能体证据池</h3>
           <div class="agent-actions">
-            <select id="agentMinLevel" class="agent-select compact">
+            <select id="agentMinLevel" class="agent-select compact" aria-label="最低证据质量等级">
               <option value="A">S/A级</option>
               <option value="S">仅S级</option>
               <option value="B">B级以上</option>
             </select>
-            <button class="agent-secondary-btn" onclick="agentCollectEvidence()">检索信息源</button>
-            <button class="agent-secondary-btn" onclick="agentAutonomousCollect()" title="Agent 自主联网检索并归档公开信源，补齐至目标数；未配 .search_config.json 时降级用公开网页抓取">🛰 自主扩池</button>
+            <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentCollectEvidence()">检索信息源</button>
+            <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentAutonomousCollect()" title="Agent 自主联网检索并归档公开信源，补齐至目标数；未配 .search_config.json 时降级用公开网页抓取">🛰 自主扩池</button>
           </div>
         </div>
         <div id="agentEvidenceMeta" class="agent-evidence-meta">
@@ -729,26 +738,27 @@
 
       <main class="agent-panel agent-editor-panel">
         <div class="agent-panel-head">
-          <h3 class="agent-panel-title">战略报告生产台</h3>
+          <h3 id="agentProductionTitle" class="agent-panel-title">机构开源情报整编包（MVP）生产台</h3>
           <div class="agent-actions">
-            <button class="agent-secondary-btn" onclick="agentGenerateOutline()">生成目录提纲</button>
+            <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentGenerateOutline()">生成目录提纲</button>
             <button class="agent-primary-btn" onclick="agentGenerateDraft()">生成完整报告</button>
-            <button class="agent-secondary-btn" onclick="agentExportDocx()">导出Word</button>
+            <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentExportDocx()">导出Word</button>
           </div>
         </div>
         <div class="agent-writing-spec">写作规范：DefenseTracker SOD/SOP · 技术—能力—规则 · PARA · FACT-DATA-CITE</div>
+        <section id="agentMvpPreflight" class="agent-mvp-preflight" role="status" aria-live="polite" aria-atomic="false"></section>
         <div id="agentDraftQuality" class="agent-draft-quality">字数校验：暂无完整报告</div>
         <div id="agentReviewRadar" class="agent-review-radar"></div>
-        <label class="agent-editor-label">目录提纲大纲</label>
+        <label class="agent-editor-label" for="agentOutlineText">目录提纲大纲</label>
         <textarea id="agentOutlineText" class="agent-outline-area" placeholder="先生成或手工编辑报告目录、提纲、分析框架"></textarea>
-        <label class="agent-editor-label">审稿意见</label>
+        <label class="agent-editor-label" for="agentReviewInput">审稿意见</label>
         <div class="agent-revise-row">
           <input id="agentReviewInput" class="agent-input" type="text" placeholder="例如：增强战略判断、补充智库来源、压缩执行摘要、突出后续跟踪">
-          <button class="agent-secondary-btn" onclick="agentReviseDraft()">修订</button>
+          <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentReviseDraft()">修订</button>
         </div>
-        <label class="agent-editor-label">完整报告正文</label>
+        <label class="agent-editor-label" for="agentDraftText">完整报告正文</label>
         <textarea id="agentDraftText" class="agent-draft-area" placeholder="生成完整报告后可在这里继续编辑"></textarea>
-        <div class="agent-preview" id="agentPreview">
+        <div class="agent-preview" id="agentPreview" aria-live="polite">
           <div class="agent-empty">暂无完整报告</div>
         </div>
       </main>
@@ -773,7 +783,7 @@
           <input id="v9DocumentVersion" type="hidden">
           <div class="v9-document-meta">
             <label>标题<input id="v9DocumentTitle" maxlength="300" required placeholder="稿件标题"></label>
-            <label>类型<select id="v9DocumentKind"><option value="report">专题报告</option><option value="brief">要讯</option></select></label>
+            <label>类型<select id="v9DocumentKind"><option value="report">专题报告</option><option value="brief" disabled>要讯（使用下方专用流程）</option></select></label>
             <label>阶段<select id="v9DocumentStage"><option value="outline">大纲</option><option value="draft">草稿</option><option value="review">复核</option><option value="ready">定稿</option></select></label>
           </div>
           <label class="v9-document-outline">大纲<textarea id="v9DocumentOutline" placeholder="结构、大纲和写作要求"></textarea></label>
@@ -792,7 +802,7 @@
       </main>
     </div>
   </section>
-  <div class="brief-zone" hidden aria-hidden="true">
+  <div class="brief-zone" id="briefDedicatedWriter">
     <!-- 顶部控制栏 -->
     <div class="brief-header">
       <div class="brief-header-left">
@@ -893,13 +903,18 @@
             <input type="file" id="importFileInput" accept=".txt,.docx,.pdf" style="display:none" onchange="importFileSelected(this)" />
             <button class="import-go-btn" id="importFileBtn" onclick="importFromFile()" disabled>生成要讯</button>
           </div>
+          <div class="import-text-row">
+            <input type="text" id="importFileSource" class="import-text-source" placeholder="原始信息来源（必填，如：美防务一号网站）" />
+            <input type="date" id="importFilePubDate" class="import-text-source" aria-label="文件素材来源发文日期" />
+          </div>
         </div>
         <!-- 文本导入 -->
         <div class="import-content" id="importContentText" style="display:none">
           <input type="text" id="importTextTitle" class="import-text-title" placeholder="标题（可选，不填则自动截取首行）" />
           <textarea id="importTextArea" class="import-text-area" rows="6" placeholder="粘贴原始素材内容（新闻报道、研究论文摘要、情报简报等，至少30字）..."></textarea>
           <div class="import-text-row">
-            <input type="text" id="importTextSource" class="import-text-source" placeholder="信息来源（可选，如：美防务一号网站）" />
+            <input type="text" id="importTextSource" class="import-text-source" placeholder="原始信息来源（必填，如：美防务一号网站）" />
+            <input type="date" id="importTextPubDate" class="import-text-source" aria-label="文本素材来源发文日期" />
             <button class="import-go-btn" id="importTextBtn" onclick="importFromText()">生成要讯</button>
           </div>
         </div>
@@ -1039,7 +1054,7 @@
       <button type="button" data-job-template="rapid_assessment"><span>01 · 快速研判</span><strong>把一条突发新闻扩展为可追溯研判卡</strong><em>搜集 → 精读 → 构架 → 成稿 → 校验</em></button>
       <button type="button" data-job-template="deep_research"><span>02 · 专题深挖</span><strong>围绕目标实体建立证据链与时间线</strong><em>大纲处设置人工闸门</em></button>
       <button type="button" data-job-template="scenario_simulation"><span>03 · 情景推演</span><strong>生成关键变量、触发器与三分支路径</strong><em>红队 → 蓝队 → 裁判</em></button>
-      <button type="button" data-job-template="brief_draft"><span>04 · 要讯成稿</span><strong>从证据池生成可校验要讯草案</strong><em>签发前再次人工确认</em></button>
+      <button type="button" onclick="showTab('brief'); document.getElementById('briefDedicatedWriter')?.scrollIntoView({behavior:'smooth'})"><span>04 · 要讯成稿</span><strong>进入要讯专用生成与来源校验</strong><em>事件日期与原始素材不对应即阻断</em></button>
     </div>
     <form id="v9JobForm" class="v9-p3-form v9-p4-form" hidden>
       <input id="v9JobTemplate" type="hidden">

@@ -75,6 +75,8 @@ def new_agent_job(value: dict) -> dict:
     template = str(value.get("template") or "").strip()
     if template not in JOB_TEMPLATES:
         raise ValueError("无效智能体任务模板")
+    if template == "brief_draft":
+        raise ValueError("要讯成稿须使用写作室中的要讯专用生成与来源校验流程")
     now = _now()
     return {
         "template": template,
@@ -105,6 +107,8 @@ def transition_agent_job(current: dict, action: str, value: dict | None = None) 
     value = value or {}
     action = str(action or "").strip().lower()
     result = dict(current)
+    if result.get("template") == "brief_draft":
+        raise ValueError("要讯成稿须使用写作室中的要讯专用生成与来源校验流程")
     state = str(result.get("state") or "")
     phase = str(result.get("phase") or "")
     if state not in JOB_STATES or phase not in JOB_PHASES:

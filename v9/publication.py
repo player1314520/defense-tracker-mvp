@@ -84,6 +84,10 @@ def validate_document(content: dict) -> dict:
             errors.append(f"{label}：事实核查未通过")
         if paragraph.get("source_status") not in SOURCE_STATUSES:
             errors.append(f"{label}：来源状态无效")
+    if content.get("kind") == "brief":
+        errors.append(
+            "V9通用稿件不承载要讯签发；请使用写作室中的要讯专用生成与来源校验流程"
+        )
     return {
         "ready": not errors,
         "errors": errors,
@@ -289,6 +293,8 @@ def build_document_docx(
 ) -> bytes:
     from docx import Document
 
+    if not validate_document(document_content).get("ready"):
+        raise ValueError("稿件校验未通过，禁止生成DOCX")
     document = Document()
     document.add_heading(document_content.get("title") or "V9 稿件", 0)
     document.add_paragraph(
@@ -334,6 +340,8 @@ def build_document_docx(
 def build_document_pdf(
     document_content: dict, source_index: list[dict]
 ) -> bytes:
+    if not validate_document(document_content).get("ready"):
+        raise ValueError("稿件校验未通过，禁止生成PDF")
     from reportlab.lib.enums import TA_LEFT
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet

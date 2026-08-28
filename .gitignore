@@ -15,6 +15,10 @@ node_modules/
 .email_config.json
 .email_config.key
 .feishu_config.json
+.search_config.json
+.wechat_mp.vault
+.wechat_mp.vault.tmp
+.wechat_publications.sqlite3
 .supabase_config.json
 .supabase_v9_config.json
 .v9_local_master.key
@@ -25,6 +29,7 @@ node_modules/
 # IDE & tools
 .claude/
 .codex/
+.worktrees/
 .vscode/
 .idea/
 *.swp
@@ -50,10 +55,18 @@ data/
 # 审阅/工具产物 & 本地压缩包（非源码，仅根目录）
 /*.png
 /*.zip
+/.codex_app_fix.patch
+/.docx_qa_*/
+/qa_*/
+/tmp/
 .playwright-mcp/
 .superpowers/
 .agents/
 每日自动要讯/
+
+# 独立 GitHub Pages 发布源（由 defense-open-source-mvp 单独管理）
+/public_mvp_site/
+/private-input/
 
 # 设计稿工作参考（Claude Design 导出，可复现，不入库）
 *.dc.html

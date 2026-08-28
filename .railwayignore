@@ -3,15 +3,26 @@
 
 # Git history (huge)
 .git/
+.worktrees/
 
 # Claude / IDE workspace (contains worktrees = duplicate project)
 .claude/
+.codex/
+.agents/
+.superpowers/
+.playwright-mcp/
 .vscode/
 .idea/
 
 # Compiled / build artifacts
 dist/
 build/
+.venv-build/
+tmp/
+.docx_qa_*/
+qa_*/
+public_mvp_site/
+private-input/
 *.spec
 __pycache__/
 *.py[cod]
@@ -24,9 +35,13 @@ __pycache__/
 .email_config.json
 .email_config.key
 .feishu_config.json
+.search_config.json
 .supabase_config.json
 .supabase_v9_config.json
 .v9_local_master.key
+.wechat_mp.vault
+.wechat_mp.vault.tmp
+.wechat_publications.sqlite3
 *.key
 .env
 .env.*
@@ -42,8 +57,15 @@ desktop.ini
 # Project-specific runtime / generated files
 ssl/
 data/
+logs/
+素材库/
+归档/
+每日自动要讯/
 *.ico
 *.log
+*.db
+*.sqlite
+*.sqlite3
 test_output.docx
 
 # Documentation (not needed at runtime)
@@ -52,6 +74,7 @@ docs/
 
 # Scripts & desktop launcher assets (cloud bot doesn't use them)
 scripts/
+tests/
 launcher.py
 
 # Local-only Flask and legacy full-text bots are never cloud-deployed.
@@ -59,6 +82,8 @@ app.py
 feishu_bot.py
 feishu_cloud.py
 feishu_common.py
+wechat_publisher.py
+wechat_runtime.py
 templates/
 static/
 

@@ -17,6 +17,7 @@ authorized evaluation.
 |---|---|---|
 | Windows desktop/local workspace | Local research, evidence, drafting, and device-held key workflows | Source and automated tests; no signed public installer |
 | V9 Portal | Application/login entry point and role-aware team workflow | Local browser and contract-test scope; requires an operator-supplied Supabase environment for live use |
+| Optional WeChat publication tools | Prepare, stage, and explicitly approve public-account drafts | Simulated API and local vault tests only; public writes remain disabled by default and no real-account delivery is claimed |
 | Self-hosted cloud services | Supabase Auth, Postgres, Storage, Realtime, and Edge Functions | Deployment assets and static checks only in this snapshot |
 | MVP deployment | Caddy plus the isolated Portal and self-hosted Supabase | **Only [`deploy/mvp`](deploy/mvp) is supported**; all other deployment paths are outside the public MVP contract |
 

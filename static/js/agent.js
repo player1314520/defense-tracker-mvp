@@ -10,22 +10,208 @@ let agentSelectedEvidence = new Set();
 let agentActiveDraft = null;
 let agentNewspaper = null;
 let agentLoading = false;
+let agentMvpRunning = false;
+let agentMvpPreflightState = null;
+let agentMvpRunState = null;
 const AGENT_LAST_PROJECT_KEY = 'agentLastProjectId';
+const AGENT_MVP_MIN_SOURCES = 7;
+const AGENT_VISIBLE_REPORT_TYPES = new Set(['institution_pack', 'strategic']);
 
 function agentSetLoading(on, msg) {
   agentLoading = !!on;
   const preview = document.getElementById('agentPreview');
+  if (preview) preview.setAttribute('aria-busy', agentLoading ? 'true' : 'false');
   if (preview && msg) {
     preview.innerHTML = `<div class="agent-loading"><div class="ai-spinner-sm"></div><span>${escHtml(msg)}</span></div>`;
   }
+  agentSyncActionButtons();
 }
 
 function agentReportTypeLabel(t) {
-  return ({strategic:'战略分析报告', daily:'每日简报', weekly:'周报汇编', short_topic:'专题短报'})[t] || t || '报告';
+  return ({
+    institution_pack:'机构开源情报整编包（MVP）',
+    strategic:'战略分析报告',
+    daily:'每日简报',
+    weekly:'周报汇编',
+    short_topic:'专题短报'
+  })[t] || t || '报告';
 }
 
 function agentDefaultCount(t) {
-  return ({strategic:12, daily:5, weekly:8, short_topic:5})[t] || 12;
+  return ({institution_pack:8, strategic:12, daily:5, weekly:8, short_topic:5})[t] || 12;
+}
+
+function agentIsVisibleReportType(reportType) {
+  return AGENT_VISIBLE_REPORT_TYPES.has(reportType);
+}
+
+function agentMvpSourceGate(evidence) {
+  const count = Array.isArray(evidence) ? evidence.length : Math.max(0, Number(evidence) || 0);
+  return {
+    ok: count >= AGENT_MVP_MIN_SOURCES,
+    count,
+    required: AGENT_MVP_MIN_SOURCES,
+    gap: Math.max(0, AGENT_MVP_MIN_SOURCES - count),
+  };
+}
+
+function agentMvpCollectionTarget(project) {
+  const type = project?.report_type || 'strategic';
+  const configured = Math.max(1, Number(project?.target_count) || agentDefaultCount(type));
+  return type === 'institution_pack' ? Math.max(agentDefaultCount(type), configured) : configured;
+}
+
+function agentMvpCollectError(data) {
+  if (String(data?.capture?.status || '').toLowerCase() !== 'failed') return '';
+  return `自主采集失败：${data.capture.stop_reason || '未知原因'}`;
+}
+
+function agentResolveDraftContent(editorValue, draft) {
+  return editorValue === undefined || editorValue === null
+    ? String(draft?.content || '')
+    : String(editorValue);
+}
+
+function agentBuildExportPayload(draftId, content, evidenceIds) {
+  return {draft_id: draftId, content, evidence_ids: evidenceIds};
+}
+
+function agentNormalizePreflight(response) {
+  const raw = response?.preflight || response || {};
+  const checks = Array.isArray(raw.checks) ? raw.checks.map((check, index) => ({
+    id: String(check?.id || check?.name || `check_${index + 1}`),
+    ok: check?.ok === true,
+    label: String(check?.label || check?.name || check?.id || `检查 ${index + 1}`),
+    detail: String(check?.detail || check?.message || '未提供详情'),
+  })) : [];
+  const ok = raw.ok === true && checks.length > 0 && checks.every(check => check.ok);
+  const declaredStatus = String(raw.status || (ok ? 'ready' : 'blocked'));
+  const status = !ok && ['ready', 'passed', 'ok'].includes(declaredStatus.toLowerCase())
+    ? 'blocked'
+    : declaredStatus;
+  const failures = checks.filter(check => !check.ok).map(check => `${check.label}：${check.detail}`);
+  if (!checks.length) failures.push('预检响应：后端未返回检查项');
+  return {
+    ok,
+    status,
+    checks,
+    failures,
+  };
+}
+
+function agentCurrentReportType() {
+  return agentCurrentProject?.report_type
+    || document.getElementById('agentReportType')?.value
+    || 'institution_pack';
+}
+
+function agentIsInstitutionPack() {
+  return agentCurrentReportType() === 'institution_pack';
+}
+
+function agentSyncActionButtons() {
+  const busy = agentLoading || agentMvpRunning;
+  document.querySelectorAll?.('[data-agent-action], .agent-editor-panel .agent-actions button').forEach(button => {
+    button.disabled = busy;
+  });
+  const runButton = document.getElementById('agentMvpRunBtn');
+  if (!runButton) return;
+  const enabledForType = agentIsInstitutionPack();
+  runButton.hidden = !enabledForType;
+  runButton.disabled = busy || !enabledForType;
+  runButton.setAttribute('aria-busy', agentMvpRunning ? 'true' : 'false');
+  runButton.textContent = agentMvpRunning ? 'MVP 闭环运行中…' : '⚡ 一键跑通 MVP';
+}
+
+function agentSyncReportTypeUi(reportType, {syncSelect = false} = {}) {
+  const type = reportType || agentCurrentReportType();
+  const select = document.getElementById('agentReportType');
+  if (syncSelect && select && [...select.options].some(option => option.value === type)) {
+    select.value = type;
+  }
+  const hint = document.getElementById('agentReportTypeHint');
+  if (hint) hint.textContent = agentReportTypeLabel(type);
+  const createButton = document.getElementById('agentCreateProjectBtn');
+  if (createButton) createButton.textContent = `创建${agentReportTypeLabel(type)}`;
+  const productionTitle = document.getElementById('agentProductionTitle');
+  if (productionTitle) {
+    productionTitle.textContent = `${agentReportTypeLabel(agentCurrentProject?.report_type || type)}生产台`;
+  }
+  agentRenderMvpPreflight();
+  agentRenderReviewRadar();
+  agentSyncActionButtons();
+}
+
+function agentInvalidateMvpPreflight(message = '') {
+  agentMvpPreflightState = null;
+  if (agentMvpRunning) {
+    agentRenderMvpPreflight();
+    return;
+  }
+  if (message && agentIsInstitutionPack()) {
+    agentMvpRunState = {status: 'idle', message, steps: []};
+  } else {
+    agentMvpRunState = null;
+  }
+  agentRenderMvpPreflight();
+}
+
+function agentMvpSetStep(id, label, status, detail = '') {
+  const run = agentMvpRunState || {status: 'running', message: '', steps: []};
+  const steps = [...(run.steps || [])];
+  const index = steps.findIndex(step => step.id === id);
+  const next = {id, label, status, detail};
+  if (index >= 0) steps[index] = next;
+  else steps.push(next);
+  agentMvpRunState = {...run, status: run.status === 'failed' ? 'failed' : 'running', steps};
+  agentRenderMvpPreflight();
+}
+
+function agentMvpStepsHtml(steps) {
+  return (steps || []).map(step => `<li class="${escHtml(step.status)}">
+    <span aria-hidden="true">${step.status === 'done' ? '✓' : (step.status === 'failed' ? '!' : '…')}</span>
+    <div><strong>${escHtml(step.label)}</strong>${step.detail ? `<small>${escHtml(step.detail)}</small>` : ''}</div>
+  </li>`).join('');
+}
+
+function agentRenderMvpPreflight() {
+  const box = document.getElementById('agentMvpPreflight');
+  if (!box) return;
+  const isMvp = agentIsInstitutionPack();
+  box.hidden = !isMvp;
+  if (!isMvp) return;
+  box.classList.remove('ok', 'warn', 'running');
+
+  if (agentMvpPreflightState) {
+    const result = agentMvpPreflightState;
+    box.classList.add(result.ok ? 'ok' : 'warn');
+    const checks = result.checks.map(check => `<li class="${check.ok ? 'ok' : 'warn'}">
+      <span aria-hidden="true">${check.ok ? '✓' : '!'}</span>
+      <div><strong>${escHtml(check.label)}</strong><small>${escHtml(check.detail)}</small></div>
+    </li>`).join('');
+    const steps = agentMvpStepsHtml(agentMvpRunState?.steps);
+    box.innerHTML = `<div class="agent-mvp-preflight-head">
+        <div><span>后端真实预检</span><strong>${result.ok ? '可交付' : '已阻断'}</strong></div>
+        <button type="button" class="agent-secondary-btn" data-agent-action onclick="agentRunPreflight()">重新预检</button>
+      </div>
+      <p>状态：${escHtml(result.status)}</p>
+      <ul class="agent-mvp-checks">${checks || '<li class="warn"><span>!</span><div><strong>预检无检查项</strong><small>后端未返回 checks</small></div></li>'}</ul>
+      ${steps ? `<div class="agent-mvp-step-title">闭环步骤</div><ul class="agent-mvp-steps">${steps}</ul>` : ''}`;
+    return;
+  }
+
+  const run = agentMvpRunState;
+  if (run?.status === 'running' || run?.status === 'failed') {
+    box.classList.add(run.status === 'running' ? 'running' : 'warn');
+    const steps = agentMvpStepsHtml(run.steps);
+    box.innerHTML = `<div class="agent-mvp-preflight-head"><div><span>MVP 闭环</span><strong>${run.status === 'failed' ? '已停止' : '运行中'}</strong></div></div>
+      ${run.message ? `<p>${escHtml(run.message)}</p>` : ''}
+      <ul class="agent-mvp-steps">${steps}</ul>`;
+    return;
+  }
+
+  box.innerHTML = `<div class="agent-mvp-preflight-head"><div><span>后端真实预检</span><strong>尚未运行</strong></div></div>
+    <p>${escHtml(run?.message || '一键闭环完成草稿后将调用后端检查；机构包导出前也会强制复检。')}</p>`;
 }
 
 function agentExtractRequestedCount(text) {
@@ -129,6 +315,11 @@ function agentRenderReviewRadar() {
   const box = document.getElementById('agentReviewRadar');
   if (!box) return;
   const stats = agentDraftStats();
+  const mvp = agentIsInstitutionPack();
+  const deliveryOk = mvp ? agentMvpPreflightState?.ok === true : stats.exportOk;
+  const deliveryText = mvp
+    ? (agentMvpPreflightState ? (deliveryOk ? '后端通过' : '后端阻断') : '未预检')
+    : (deliveryOk ? '可导出' : '待完善');
   box.innerHTML = `<div class="agent-radar-card ${stats.hasDraft ? 'ok' : ''}">
       <strong>${stats.roughWords || 0}</strong><span>${stats.target ? `目标 ${stats.target}` : '当前字数'}</span>
     </div>
@@ -138,8 +329,8 @@ function agentRenderReviewRadar() {
     <div class="agent-radar-card ${stats.sections >= 3 ? 'ok' : 'warn'}">
       <strong>${stats.sections}</strong><span>章节层级</span>
     </div>
-    <div class="agent-radar-card ${stats.exportOk ? 'ok' : 'warn'}">
-      <strong>${stats.exportOk ? '可导出' : '待完善'}</strong><span>交付预检</span>
+    <div class="agent-radar-card ${deliveryOk ? 'ok' : 'warn'}">
+      <strong>${deliveryText}</strong><span>${mvp ? '后端交付预检' : '交付预检'}</span>
     </div>`;
 }
 
@@ -159,7 +350,7 @@ function agentUpdateProjectCounts() {
 }
 
 function agentUpsertProjectSummary(project) {
-  if (!project?.project_id || project.report_type !== 'strategic') return;
+  if (!project?.project_id || !agentIsVisibleReportType(project.report_type)) return;
   agentProjects = [project, ...agentProjects.filter(p => p.project_id !== project.project_id)];
   agentRenderProjects();
 }
@@ -170,11 +361,11 @@ async function agentLoadProjects() {
   try {
     const resp = await apiFetch('/api/agent/projects', {}, {toast: false});
     const data = await resp.json();
-    agentProjects = (data.projects || []).filter(p => p.report_type === 'strategic');
+    agentProjects = (data.projects || []).filter(project => agentIsVisibleReportType(project.report_type));
     const remembered = (() => {
       try { return localStorage.getItem(AGENT_LAST_PROJECT_KEY) || ''; } catch(e) { return ''; }
     })();
-    if (agentCurrentProject && agentCurrentProject.report_type !== 'strategic') {
+    if (agentCurrentProject && !agentIsVisibleReportType(agentCurrentProject.report_type)) {
       agentCurrentProject = null;
       agentEvidence = [];
       agentEvidenceMeta = null;
@@ -191,6 +382,7 @@ async function agentLoadProjects() {
     } else {
       agentRenderEvidence();
       agentRenderDraft();
+      agentSyncReportTypeUi('institution_pack', {syncSelect: true});
     }
   } catch(e) {
     if (list) list.innerHTML = `<div class="agent-empty">加载失败：${escHtml(e.message)}</div>`;
@@ -224,28 +416,38 @@ function agentNewProjectDraft() {
   agentDrafts = [];
   agentSelectedEvidence = new Set();
   agentActiveDraft = null;
+  agentMvpPreflightState = null;
+  agentMvpRunState = null;
   agentRememberProject('');
   ['agentRequest', 'agentTopic', 'agentOutlineText', 'agentReviewInput', 'agentDraftText'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
+  const type = document.getElementById('agentReportType');
+  if (type) type.value = 'institution_pack';
   const count = document.getElementById('agentTargetCount');
-  if (count) count.value = agentDefaultCount('strategic');
+  if (count) count.value = agentDefaultCount('institution_pack');
   const req = document.getElementById('agentRequest');
   if (req) req.focus();
   agentRenderProjects();
   agentRenderEvidence();
   agentRenderDraft();
+  agentSyncReportTypeUi('institution_pack', {syncSelect: true});
 }
 
-async function agentCreateProject() {
+async function agentCreateProject({quiet = false} = {}) {
   const requestText = document.getElementById('agentRequest')?.value.trim() || '';
   const title = document.getElementById('agentTitle')?.value.trim() || '';
   const topic = document.getElementById('agentTopic')?.value.trim() || '';
   const reportType = document.getElementById('agentReportType')?.value || 'strategic';
   const targetCount = agentExtractRequestedCount(requestText)
     || parseInt(document.getElementById('agentTargetCount').value || agentDefaultCount(reportType), 10);
-  if (!requestText && !title) { showToast('请输入客户需求，例如：帮我做一个台海军力平衡报告'); return; }
+  if (!requestText && !title) {
+    const error = new Error('请输入客户需求，例如：帮我做一个台海军力平衡报告');
+    if (quiet) throw error;
+    showToast(error.message);
+    return null;
+  }
   try {
     const resp = await apiFetch('/api/agent/projects', {
       method: 'POST',
@@ -263,12 +465,18 @@ async function agentCreateProject() {
     agentDrafts = [];
     agentSelectedEvidence = new Set();
     agentActiveDraft = null;
+    agentMvpPreflightState = null;
+    if (!agentMvpRunning) agentMvpRunState = null;
     agentRenderEvidence();
     agentRenderDraft();
+    agentSyncReportTypeUi(data.project?.report_type || reportType, {syncSelect: true});
     agentUpdateProjectCounts();
-    showToast('已创建报告项目');
+    if (!quiet) showToast('已创建报告项目');
+    return data;
   } catch(e) {
+    if (quiet) throw e;
     showToast('创建失败：' + e.message);
+    return null;
   }
 }
 
@@ -284,16 +492,21 @@ async function agentOpenProject(projectId) {
     agentSelectedEvidence = new Set(agentEvidence.map(e => e.evidence_id));
     agentActiveDraft = agentDrafts[0] || null;
     agentNewspaper = data.newspaper || null;
+    agentMvpPreflightState = null;
+    agentMvpRunState = null;
     agentRememberProject(projectId);
     const requestEl = document.getElementById('agentRequest');
     const topicEl = document.getElementById('agentTopic');
     const countEl = document.getElementById('agentTargetCount');
+    const typeEl = document.getElementById('agentReportType');
     if (requestEl) requestEl.value = agentCurrentProject.client_request || '';
     if (topicEl) topicEl.value = agentCurrentProject.topic || '';
     if (countEl) countEl.value = agentCurrentProject.target_count || agentDefaultCount(agentCurrentProject.report_type);
+    if (typeEl) typeEl.value = agentCurrentProject.report_type || 'strategic';
     agentRenderProjects();
     agentRenderEvidence();
     agentRenderDraft();
+    agentSyncReportTypeUi(agentCurrentProject.report_type, {syncSelect: true});
   } catch(e) {
     showToast('打开项目失败：' + e.message);
   }
@@ -319,26 +532,34 @@ async function agentCollectEvidence() {
     agentEvidence = data.evidence || [];
     agentEvidenceMeta = data.meta || null;
     agentSelectedEvidence = new Set(agentEvidence.map(e => e.evidence_id));
+    agentInvalidateMvpPreflight('证据池已更新，请重新运行预检。');
     agentRenderEvidence();
     agentRenderDraft();
     showToast(`已汇总 ${agentEvidence.length} 条信息源/证据`);
+    return data;
   } catch(e) {
     showToast('收集失败：' + e.message);
     agentRenderDraft();
+    return null;
   } finally {
     agentSetLoading(false);
   }
 }
 
-async function agentAutonomousCollect() {
-  if (!agentCurrentProject) { showToast('请先创建或选择项目'); return; }
+async function agentAutonomousCollect({quiet = false} = {}) {
+  if (!agentCurrentProject) {
+    const error = new Error('请先创建或选择项目');
+    if (quiet) throw error;
+    showToast(error.message);
+    return null;
+  }
   agentSetLoading(true, 'Agent正在自主联网检索并归档公开信源（可能耗时）…');
   try {
     const resp = await apiFetch(`/api/agent/projects/${encodeURIComponent(agentCurrentProject.project_id)}/autonomous_collect`, {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
-        target: agentCurrentProject.target_count || 8,
+        target: agentMvpCollectionTarget(agentCurrentProject),
         max_rounds: 6
       })
     }, {toast: false});
@@ -346,12 +567,18 @@ async function agentAutonomousCollect() {
     agentCurrentProject = data.project || agentCurrentProject;
     agentEvidence = data.evidence || agentEvidence;
     agentSelectedEvidence = new Set(agentEvidence.map(e => e.evidence_id));
+    agentInvalidateMvpPreflight('证据池已更新，请重新运行预检。');
     agentRenderEvidence();
-    showToast(data.gap
-      ? `自主扩池：新增 ${data.imported_count} 条；${data.gap_note}`
-      : `自主扩池完成：新增 ${data.imported_count} 条，已达目标`);
+    if (!quiet) {
+      showToast(data.gap
+        ? `自主扩池：新增 ${data.imported_count} 条；${data.gap_note}`
+        : `自主扩池完成：新增 ${data.imported_count} 条，已达目标`);
+    }
+    return data;
   } catch(e) {
+    if (quiet) throw e;
     showToast('自主扩池失败：' + e.message);
+    return null;
   } finally {
     agentSetLoading(false);
   }
@@ -360,6 +587,7 @@ async function agentAutonomousCollect() {
 function agentToggleEvidence(evidenceId) {
   if (agentSelectedEvidence.has(evidenceId)) agentSelectedEvidence.delete(evidenceId);
   else agentSelectedEvidence.add(evidenceId);
+  agentInvalidateMvpPreflight('证据选择已变化，请重新运行预检。');
   agentRenderEvidence();
 }
 
@@ -539,10 +767,20 @@ function agentRefreshPreview() {
   agentRenderReviewRadar();
 }
 
-async function agentGenerateOutline() {
-  if (!agentCurrentProject) { showToast('请先选择项目'); return; }
+async function agentGenerateOutline({quiet = false} = {}) {
+  if (!agentCurrentProject) {
+    const error = new Error('请先选择项目');
+    if (quiet) throw error;
+    showToast(error.message);
+    return null;
+  }
   const ids = agentCurrentEvidenceIds();
-  if (!ids.length) { showToast('请先收集证据'); return; }
+  if (!ids.length) {
+    const error = new Error('请先收集证据');
+    if (quiet) throw error;
+    showToast(error.message);
+    return null;
+  }
   agentSetLoading(true, '正在生成报告大纲…');
   try {
   const resp = await apiFetch(`/api/agent/projects/${encodeURIComponent(agentCurrentProject.project_id)}/outline`, {
@@ -551,15 +789,20 @@ async function agentGenerateOutline() {
       body: JSON.stringify({evidence_ids: ids, voice: 'strategic_analysis'})
     }, {toast: false});
     const data = await resp.json();
+    if (!data.draft) throw new Error('生成未返回目录提纲');
     agentActiveDraft = data.draft;
     agentDrafts.unshift(data.draft);
     const outlineArea = document.getElementById('agentOutlineText');
     if (outlineArea) outlineArea.value = data.outline || data.draft?.content || '';
+    agentInvalidateMvpPreflight();
     agentRenderDraft();
-    showToast('目录提纲已生成');
+    if (!quiet) showToast('目录提纲已生成');
+    return data;
   } catch(e) {
+    if (quiet) throw e;
     showToast('生成失败：' + e.message);
     agentRenderDraft();
+    return null;
   } finally {
     agentSetLoading(false);
   }
@@ -584,10 +827,20 @@ async function agentPollDraftJob(projectId, jobId, {intervalMs = 2500, maxAttemp
   throw new Error('生成超时，请稍后重新打开项目查看草稿');
 }
 
-async function agentGenerateDraft() {
-  if (!agentCurrentProject) { showToast('请先选择项目'); return; }
+async function agentGenerateDraft({quiet = false} = {}) {
+  if (!agentCurrentProject) {
+    const error = new Error('请先选择项目');
+    if (quiet) throw error;
+    showToast(error.message);
+    return null;
+  }
   const ids = agentCurrentEvidenceIds();
-  if (!ids.length) { showToast('请先收集证据'); return; }
+  if (!ids.length) {
+    const error = new Error('请先收集证据');
+    if (quiet) throw error;
+    showToast(error.message);
+    return null;
+  }
   const outline = document.getElementById('agentOutlineText')?.value.trim() || '';
   const reviewNotes = document.getElementById('agentReviewInput')?.value.trim() || '';
   const projectId = agentCurrentProject.project_id;
@@ -609,22 +862,34 @@ async function agentGenerateDraft() {
         // 数据保护：扩写阶段失败，但首版草稿已落盘，照常展示 + 提示
         agentActiveDraft = data.draft;
         agentDrafts.unshift(data.draft);
+        agentInvalidateMvpPreflight();
         agentRenderDraft();
-        showToast('扩写阶段失败，已保留首版草稿' + (data.job.error ? '：' + data.job.error : ''));
+        if (!quiet) showToast('扩写阶段失败，已保留首版草稿' + (data.job.error ? '：' + data.job.error : ''));
       } else {
-        showToast('生成失败：' + (data.job.error || '未知错误'));
+        if (!quiet) showToast('生成失败：' + (data.job.error || '未知错误'));
         agentRenderDraft();
       }
-      return;
+      if (quiet) throw new Error(data.job.error || '草稿生成失败');
+      return data;
     }
-    if (!data.draft) { showToast('生成未返回草稿'); agentRenderDraft(); return; }
+    if (!data.draft) {
+      const error = new Error('生成未返回草稿');
+      if (!quiet) showToast(error.message);
+      agentRenderDraft();
+      if (quiet) throw error;
+      return null;
+    }
     agentActiveDraft = data.draft;
     agentDrafts.unshift(data.draft);
+    agentInvalidateMvpPreflight();
     agentRenderDraft();
-    showToast('完整报告已生成');
+    if (!quiet) showToast('完整报告已生成');
+    return data;
   } catch(e) {
+    if (quiet) throw e;
     showToast('生成失败：' + e.message);
     agentRenderDraft();
+    return null;
   } finally {
     agentSetLoading(false);
   }
@@ -646,6 +911,7 @@ async function agentReviseDraft() {
     agentActiveDraft = data.draft;
     agentDrafts.unshift(data.draft);
     document.getElementById('agentReviewInput').value = '';
+    agentInvalidateMvpPreflight('草稿已修订，请重新运行预检。');
     agentRenderDraft();
     showToast('修订已完成');
   } catch(e) {
@@ -656,14 +922,154 @@ async function agentReviseDraft() {
   }
 }
 
+function agentPreflightFailureMessage(result) {
+  return result?.failures?.length
+    ? result.failures.join('；')
+    : `后端预检状态：${result?.status || 'blocked'}`;
+}
+
+async function agentRunPreflight({quiet = false} = {}) {
+  if (!agentCurrentProject || !agentActiveDraft) {
+    const error = new Error('暂无可预检的完整草稿');
+    if (quiet) throw error;
+    showToast(error.message);
+    return null;
+  }
+  if (agentCurrentProject.report_type !== 'institution_pack') {
+    return {ok: true, status: 'not_required', checks: [], failures: []};
+  }
+  const draftArea = document.getElementById('agentDraftText');
+  const content = agentResolveDraftContent(draftArea?.value, agentActiveDraft);
+  agentSetLoading(true, '正在调用后端执行机构包交付预检…');
+  try {
+    const resp = await apiFetch(`/api/agent/projects/${encodeURIComponent(agentCurrentProject.project_id)}/preflight`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        draft_id: agentActiveDraft.draft_id,
+        content,
+        evidence_ids: agentCurrentEvidenceIds(),
+      })
+    }, {toast: false});
+    const data = await resp.json();
+    const result = agentNormalizePreflight(data);
+    agentMvpPreflightState = result;
+    agentRenderMvpPreflight();
+    agentRenderReviewRadar();
+    if (!quiet) {
+      showToast(result.ok ? '后端交付预检通过' : `预检未通过：${agentPreflightFailureMessage(result)}`);
+    }
+    return result;
+  } catch(e) {
+    agentMvpPreflightState = null;
+    agentMvpRunState = {
+      status: 'failed',
+      message: `预检调用失败：${e.message}`,
+      steps: agentMvpRunState?.steps || [],
+    };
+    agentRenderMvpPreflight();
+    agentRenderReviewRadar();
+    if (quiet) throw e;
+    showToast('预检调用失败：' + e.message);
+    return null;
+  } finally {
+    agentSetLoading(false);
+  }
+}
+
+async function agentRunMvp() {
+  if (agentMvpRunning) return;
+  const requestedType = agentCurrentProject?.report_type
+    || document.getElementById('agentReportType')?.value
+    || '';
+  if (requestedType !== 'institution_pack') {
+    showToast('“一键跑通 MVP”仅用于机构开源情报整编包');
+    return;
+  }
+
+  agentMvpRunning = true;
+  agentMvpPreflightState = null;
+  agentMvpRunState = {status: 'running', message: '按顺序执行：建项 → 采集 → 提纲 → 草稿 → 后端预检', steps: []};
+  agentSyncActionButtons();
+  agentRenderMvpPreflight();
+  let activeStep = null;
+
+  try {
+    if (!agentCurrentProject) {
+      activeStep = {id: 'project', label: '创建机构包项目'};
+      agentMvpSetStep(activeStep.id, activeStep.label, 'running');
+      const created = await agentCreateProject({quiet: true});
+      if (!created?.project) throw new Error('项目创建未返回有效结果');
+      agentMvpSetStep(activeStep.id, activeStep.label, 'done', created.project.title || '项目已落盘');
+    }
+
+    activeStep = {id: 'collect', label: '自主采集公开来源'};
+    agentMvpSetStep(activeStep.id, activeStep.label, 'running');
+    const collected = await agentAutonomousCollect({quiet: true});
+    const collectError = agentMvpCollectError(collected);
+    if (collectError) throw new Error(collectError);
+    const sourceGate = agentMvpSourceGate(agentEvidence);
+    if (!sourceGate.ok) {
+      throw new Error(`来源仅 ${sourceGate.count} 条，至少需要 ${sourceGate.required} 条，仍缺 ${sourceGate.gap} 条`);
+    }
+    agentMvpSetStep(activeStep.id, activeStep.label, 'done', `已归集 ${sourceGate.count} 条来源`);
+
+    activeStep = {id: 'outline', label: '生成目录提纲'};
+    agentMvpSetStep(activeStep.id, activeStep.label, 'running');
+    await agentGenerateOutline({quiet: true});
+    agentMvpSetStep(activeStep.id, activeStep.label, 'done', '提纲已保存');
+
+    activeStep = {id: 'draft', label: '生成完整草稿'};
+    agentMvpSetStep(activeStep.id, activeStep.label, 'running');
+    await agentGenerateDraft({quiet: true});
+    agentMvpSetStep(activeStep.id, activeStep.label, 'done', '草稿已保存');
+
+    activeStep = {id: 'preflight', label: '后端交付预检'};
+    agentMvpSetStep(activeStep.id, activeStep.label, 'running');
+    const preflight = await agentRunPreflight({quiet: true});
+    if (!preflight?.ok) throw new Error(agentPreflightFailureMessage(preflight));
+    agentMvpSetStep(activeStep.id, activeStep.label, 'done', `状态 ${preflight.status}`);
+    agentMvpRunState = {...agentMvpRunState, status: 'complete', message: 'MVP 闭环已跑通，可导出机构包。'};
+    agentRenderMvpPreflight();
+    showToast('MVP 闭环已跑通，可导出机构包');
+  } catch(e) {
+    if (activeStep) agentMvpSetStep(activeStep.id, activeStep.label, 'failed', e.message);
+    agentMvpRunState = {...(agentMvpRunState || {}), status: 'failed', message: `闭环已停止：${e.message}`};
+    agentRenderMvpPreflight();
+    showToast('MVP 闭环已停止：' + e.message);
+  } finally {
+    agentMvpRunning = false;
+    agentSetLoading(false);
+    agentSyncActionButtons();
+    agentRenderMvpPreflight();
+  }
+}
+
 async function agentExportDocx() {
   if (!agentCurrentProject || !agentActiveDraft) { showToast('暂无可导出的草稿'); return; }
   const content = document.getElementById('agentDraftText').value;
   try {
+    if (agentCurrentProject.report_type === 'institution_pack') {
+      let preflight;
+      try {
+        preflight = await agentRunPreflight({quiet: true});
+      } catch(e) {
+        showToast('导出已阻断：预检调用失败：' + e.message);
+        return;
+      }
+      if (!preflight?.ok) {
+        showToast('导出已阻断：' + agentPreflightFailureMessage(preflight));
+        return;
+      }
+    }
     const resp = await apiFetch(`/api/agent/projects/${encodeURIComponent(agentCurrentProject.project_id)}/export_docx`, {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({draft_id: agentActiveDraft.draft_id, content})
+      body: JSON.stringify(agentBuildExportPayload(
+        agentActiveDraft.draft_id,
+        content,
+        agentCurrentEvidenceIds(),
+      ))
     }, {toast: false});
     await downloadResponseBlob(resp, '防务报告.docx', '.docx');
     showToast('Word已下载');
@@ -673,18 +1079,27 @@ async function agentExportDocx() {
 }
 
 document.addEventListener('input', e => {
-  if (e.target?.id === 'agentDraftText') agentRefreshPreview();
+  if (e.target?.id === 'agentDraftText') {
+    agentInvalidateMvpPreflight('正文已编辑，请重新运行预检。');
+    agentRefreshPreview();
+  } else if (e.target?.id === 'agentOutlineText') {
+    agentInvalidateMvpPreflight('提纲已编辑，请重新运行预检。');
+  }
 });
 document.addEventListener('change', e => {
   if (e.target?.id === 'agentReportType') {
     const count = document.getElementById('agentTargetCount');
     if (count) count.value = agentDefaultCount(e.target.value);
+    agentSyncReportTypeUi(e.target.value);
   }
 });
 
 const _origShowTabAgent = window.showTab;
 window.showTab = function(name, ...rest) {
   if (typeof _origShowTabAgent === 'function') _origShowTabAgent(name, ...rest);
-  if (name === 'agent' && !agentProjects.length) agentLoadProjects();
+  if (name === 'agent') {
+    if (!agentProjects.length) agentLoadProjects();
+    else agentSyncReportTypeUi(agentCurrentReportType(), {syncSelect: !!agentCurrentProject});
+  }
 };
 

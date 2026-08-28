@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from v9.errors import PermissionDenied
-from v9.publication import apply_document_changes, new_document
+from v9.publication import apply_document_changes, build_document_docx, new_document
 
 
 def _service(tmp_path):
@@ -68,6 +68,14 @@ def _member_context(service, owner, role):
     }
 
 
+def test_visible_document_editor_disables_the_generic_brief_kind():
+    html = (Path(__file__).resolve().parents[1] / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert '<option value="brief" disabled>要讯（使用下方专用流程）</option>' in html
+
+
 def test_document_requires_cited_fact_checked_paragraphs_before_approval(tmp_path):
     service, owner = _service(tmp_path)
     evidence = _evidence(service, owner)
@@ -101,6 +109,57 @@ def test_document_requires_cited_fact_checked_paragraphs_before_approval(tmp_pat
             expected_version=item["version"],
             status="pending_approval",
         )
+
+
+def test_v9_generic_document_cannot_release_or_export_unvalidated_brief_text():
+    content = new_document(
+        {
+            "kind": "brief",
+            "title": "测试要讯",
+            "paragraphs": [
+                {
+                    "heading": "正文",
+                    "text": "事件时间：近期。有关单位开展行动。",
+                    "evidence_ids": ["evidence-1"],
+                    "source_status": "verified",
+                    "fact_check": "passed",
+                }
+            ],
+        }
+    )
+
+    assert content["validation"]["ready"] is False
+    assert any("要讯专用" in error for error in content["validation"]["errors"])
+    with pytest.raises(ValueError, match="禁止生成DOCX"):
+        build_document_docx(content, [])
+
+
+def test_v9_export_rechecks_validation_before_building_files(monkeypatch):
+    from v9.service import V9Service
+
+    content = new_document(
+        {
+            "kind": "brief",
+            "title": "测试要讯",
+            "paragraphs": [
+                {
+                    "text": "事件时间：近期。有关单位开展行动。",
+                    "evidence_ids": ["evidence-1"],
+                    "source_status": "verified",
+                    "fact_check": "passed",
+                }
+            ],
+        }
+    )
+    service = object.__new__(V9Service)
+    monkeypatch.setattr(
+        service,
+        "_record_with_hash",
+        lambda *_args, **_kwargs: {"content": content},
+    )
+
+    with pytest.raises(ValueError, match="禁止导出"):
+        service.export_document({}, "document-1", "docx")
 
 
 def test_forged_stored_validation_cannot_bypass_release_gate(tmp_path):

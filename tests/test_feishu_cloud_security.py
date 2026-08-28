@@ -3,6 +3,9 @@ import importlib
 import json
 import sys
 
+import pytest
+import requests
+
 
 def _load_feishu_cloud(monkeypatch):
     monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
@@ -122,7 +125,7 @@ def test_feishu_webhook_enforces_signature_when_present(monkeypatch):
 
 
 def test_feishu_webhook_deduplicates_message(monkeypatch):
-    cloud = _load_feishu_cloud(monkeypatch)
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
     cloud.app.config["TESTING"] = True
     cloud._seen_msg_ids.clear()
     submitted = []
@@ -134,7 +137,10 @@ def test_feishu_webhook_deduplicates_message(monkeypatch):
     monkeypatch.setattr(cloud, "_worker_pool", FakePool())
 
     payload = {
-        "header": {"event_type": "im.message.receive_v1"},
+        "header": {
+            "event_type": "im.message.receive_v1",
+            "token": "verify_secret_xyz",
+        },
         "event": {
             "message": {
                 "chat_id": "oc_test",
@@ -154,3 +160,66 @@ def test_feishu_webhook_deduplicates_message(monkeypatch):
     assert second.status_code == 200
     assert len(submitted) == 1
     assert submitted[0][0] == "_process_async"
+
+
+def test_feishu_webhook_fails_closed_without_verify_token(monkeypatch):
+    cloud = _load_feishu_cloud(monkeypatch)
+    cloud.app.config["TESTING"] = True
+    submitted = _fake_pool(monkeypatch, cloud)
+
+    response = cloud.app.test_client().post(
+        "/api/feishu/webhook", json=_text_webhook_payload()
+    )
+
+    assert response.status_code == 503
+    assert submitted == []
+
+
+def test_feishu_url_verification_requires_matching_token(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    client = cloud.app.test_client()
+
+    rejected = client.post(
+        "/api/feishu/webhook",
+        json={"type": "url_verification", "token": "wrong", "challenge": "abc"},
+    )
+    accepted = client.post(
+        "/api/feishu/webhook",
+        json={
+            "type": "url_verification",
+            "token": "verify_secret_xyz",
+            "challenge": "abc",
+        },
+    )
+
+    assert rejected.status_code == 403
+    assert accepted.status_code == 200
+    assert accepted.get_json() == {"challenge": "abc"}
+
+
+def test_feishu_cloud_rejects_private_connected_peer(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    response = requests.Response()
+    response.status_code = 200
+    response._content = b""
+    response._content_consumed = True
+    monkeypatch.setattr(cloud, "_connected_peer_ip", lambda _response: "10.0.0.8")
+
+    with pytest.raises(requests.RequestException, match="重绑定到私有地址"):
+        cloud._validate_connected_peer(response)
+
+
+def test_legacy_history_endpoint_does_not_expose_items(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    cloud._history[:] = [{"brief_preview": "sensitive"}]
+
+    response = cloud.app.test_client().get("/api/history")
+
+    assert response.status_code == 404
+    assert "sensitive" not in response.get_data(as_text=True)
+
+
+def test_legacy_sessions_are_memory_only(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+
+    assert cloud._SESSION_STORE == ""

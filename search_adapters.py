@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import re
+import ipaddress
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from io import BytesIO
@@ -911,8 +913,9 @@ def _read_limited_response(resp: requests.Response, max_bytes: int) -> bytes:
 
 # ── SSRF 防护 ────────────────────────────────────────────────────────
 # search_adapters 不能 import app（循环依赖），由 app.py 启动时注入
-# set_ssrf_check(_is_ssrf_safe)。注入后 extract_url / extract_url_rendered 对
-# 首跳及每个重定向/子资源目标都复检，杜绝 302 / DNS rebinding 型 SSRF。
+# set_ssrf_check(_is_ssrf_safe)。注入后 extract_url 对首跳及每个重定向目标
+# 做 DNS 预检，并在连接建立后核验真实 peer IP；浏览器渲染兜底因无法核验
+# Chromium 的实际 peer IP 而 fail closed。
 _SSRF_CHECK: "Callable[[str], tuple] | None" = None
 MAX_EXTRACT_REDIRECTS = 5
 
@@ -935,6 +938,53 @@ _EXTRACT_HEADERS = {
 }
 
 
+_SSRF_HTTP_LOCAL = threading.local()
+
+
+def _ssrf_http_session() -> requests.Session:
+    session = getattr(_SSRF_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        _SSRF_HTTP_LOCAL.session = session
+    return session
+
+
+def _connected_peer_ip(resp: requests.Response) -> str:
+    raw = getattr(resp, "raw", None)
+    candidates = [
+        getattr(getattr(raw, "_connection", None), "sock", None),
+        getattr(
+            getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None),
+            "_sock",
+            None,
+        ),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            peer = candidate.getpeername()
+            if peer and peer[0]:
+                return str(peer[0])
+        except (AttributeError, OSError, TypeError):
+            continue
+    raise RuntimeError("无法核验远端连接地址")
+
+
+def _validate_connected_peer(resp: requests.Response) -> None:
+    peer = ipaddress.ip_address(_connected_peer_ip(resp))
+    if (
+        peer.is_loopback or peer.is_private or peer.is_link_local
+        or peer.is_multicast or peer.is_reserved or peer.is_unspecified
+    ):
+        try:
+            resp.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"连接被重绑定到私有地址: {peer}")
+
+
 def _safe_stream_get(url, headers, timeout, ssrf_check):
     """逐跳 SSRF 复检 + 禁用自动重定向的流式 GET（对齐 app.py:_safe_get_once）。"""
     current = url
@@ -942,8 +992,18 @@ def _safe_stream_get(url, headers, timeout, ssrf_check):
         ok, reason = ssrf_check(current)
         if not ok:
             raise RuntimeError(f"URL不安全: {reason}")
-        resp = requests.get(current, timeout=timeout, stream=True,
-                            allow_redirects=False, headers=headers)
+        resp = _ssrf_http_session().get(
+            current, timeout=timeout, stream=True,
+            allow_redirects=False, headers=headers,
+        )
+        try:
+            _validate_connected_peer(resp)
+        except Exception:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            raise
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location")
             resp.close()
@@ -960,10 +1020,9 @@ def _safe_stream_get(url, headers, timeout, ssrf_check):
 def extract_url(url: str, timeout: int = 10, max_chars: int = 60000, ssrf_check=None, **kwargs) -> dict:
     max_bytes = int(kwargs.get("max_bytes") or 18 * 1024 * 1024)
     check = _resolve_ssrf_check(ssrf_check)
-    if check is not None:
-        resp = _safe_stream_get(url, _EXTRACT_HEADERS, timeout, check)
-    else:
-        resp = requests.get(url, timeout=timeout, stream=True, headers=_EXTRACT_HEADERS)
+    if check is None:
+        raise RuntimeError("SSRF校验器未配置，拒绝联网归档")
+    resp = _safe_stream_get(url, _EXTRACT_HEADERS, timeout, check)
     # 用 try/finally 确保流式响应在任何异常路径（raise_for_status/超限/解析失败）都被关闭，
     # 否则大批量采集时未读完的连接会悬挂到 GC，耗尽连接池/句柄。
     try:
@@ -989,46 +1048,5 @@ def extract_url(url: str, timeout: int = 10, max_chars: int = 60000, ssrf_check=
 
 
 def extract_url_rendered(url: str, timeout: int = 8, max_chars: int = 60000, ssrf_check=None, **kwargs) -> dict:
-    """Render a public page with a headless browser, then extract text from the final DOM."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("playwright 未安装，无法启用浏览器渲染兜底") from exc
-    check = _resolve_ssrf_check(ssrf_check)
-    if check is not None:
-        ok, reason = check(url)
-        if not ok:
-            raise RuntimeError(f"URL不安全: {reason}")
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        try:
-            page = browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 DefenseTrackerSourceAgent/1.1"
-                )
-            )
-            if check is not None:
-                def _ssrf_route_guard(route):
-                    req_url = route.request.url or ""
-                    scheme = req_url.split(":", 1)[0].lower()
-                    if scheme not in ("http", "https"):
-                        route.continue_()  # data:/blob:/about: 不触网，放行
-                        return
-                    try:
-                        allowed, _ = check(req_url)
-                    except Exception:
-                        allowed = False
-                    route.continue_() if allowed else route.abort()
-                page.route("**/*", _ssrf_route_guard)
-            page.goto(url, wait_until="domcontentloaded", timeout=max(5000, int(timeout or 8) * 1000))
-            html = page.content()
-        finally:
-            browser.close()
-    doc = extract_html_document(url, html, max_chars=max_chars)
-    doc.update({
-        "content_type": "text/html; rendered=1",
-        "raw_bytes": html.encode("utf-8", errors="ignore"),
-        "raw_html": html[:max_chars],
-    })
-    return doc
+    """Fail closed until the browser transport can prove the connected peer IP."""
+    raise RuntimeError("浏览器渲染兜底已禁用：无法核验实际连接地址")

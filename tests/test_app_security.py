@@ -36,6 +36,13 @@ def test_api_is_open_without_access_token(client):
     assert "cached_articles" in resp.get_json()
 
 
+def test_static_mjs_uses_javascript_mime_type(client):
+    response = client.get("/static/js/vendor/v9-supabase-auth.mjs")
+
+    assert response.status_code == 200
+    assert response.mimetype in {"application/javascript", "text/javascript"}
+
+
 def test_runtime_bind_defaults_to_loopback(monkeypatch):
     monkeypatch.delenv("DEFENSE_TRACKER_BIND_HOST", raising=False)
 
@@ -706,28 +713,38 @@ def test_fetch_rechecks_redirect_target(monkeypatch):
         "_is_ssrf_safe",
         lambda url: (False, "blocked") if "169.254.169.254" in url else (True, ""),
     )
-    monkeypatch.setattr(
-        tracker.requests,
-        "get",
-        lambda *args, **kwargs: _response(
-            302, headers={"Location": "http://169.254.169.254/latest/meta-data"}
-        ),
+    response = _response(
+        302, headers={"Location": "http://169.254.169.254/latest/meta-data"}
     )
+    monkeypatch.setattr(
+        tracker, "_ssrf_http_session",
+        lambda: type("FakeSession", (), {"get": lambda self, *args, **kwargs: response})(),
+    )
+    monkeypatch.setattr(tracker, "_validate_connected_peer", lambda _response: None)
     with pytest.raises(requests.RequestException, match="URL不安全"):
         tracker._fetch_with_retry("http://example.test/start", timeout=1, retries=0)
 
 
 def test_fetch_rejects_large_content_length(monkeypatch):
     monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda url: (True, ""))
-    monkeypatch.setattr(
-        tracker.requests,
-        "get",
-        lambda *args, **kwargs: _response(
-            200, headers={"Content-Length": str(tracker.MAX_FETCH_BYTES + 1)}
-        ),
+    response = _response(
+        200, headers={"Content-Length": str(tracker.MAX_FETCH_BYTES + 1)}
     )
+    monkeypatch.setattr(
+        tracker, "_ssrf_http_session",
+        lambda: type("FakeSession", (), {"get": lambda self, *args, **kwargs: response})(),
+    )
+    monkeypatch.setattr(tracker, "_validate_connected_peer", lambda _response: None)
     with pytest.raises(requests.RequestException, match="响应体过大"):
         tracker._fetch_with_retry("http://example.test/feed", timeout=1, retries=0)
+
+
+def test_fetch_rejects_private_connected_peer(monkeypatch):
+    response = _response(200)
+    monkeypatch.setattr(tracker, "_connected_peer_ip", lambda _response: "169.254.169.254")
+
+    with pytest.raises(requests.RequestException, match="重绑定到私有地址"):
+        tracker._validate_connected_peer(response)
 
 
 def test_fetch_feed_rejects_unsafe_source_url(monkeypatch):

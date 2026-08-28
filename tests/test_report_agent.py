@@ -1,10 +1,13 @@
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+import re
 
 import pytest
 
 import report_agent
+
+_RETIRED_USER_MARKER = "131" + "4520"
 
 if report_agent.DOCX_AVAILABLE:
     from docx import Document
@@ -27,6 +30,49 @@ def _candidate(title="台海方向联合演训值得警惕"):
         "brief_hits": ["PLA备战", "对华威胁"],
     }
 
+
+def _institution_pack_evidence(count=7):
+    return [
+        {
+            "evidence_id": f"evidence-{idx}",
+            "title": f"机构原文{idx}",
+            "source": f"Institution {idx}",
+            "link": f"https://sources.example.test/report-{idx}",
+            "source_type": "已抓取公开报告/原文",
+            "payload": {
+                "asset_status": "archived",
+                "asset_id": f"asset-{idx}",
+                "text": f"这是第{idx}份可引用公开原文正文。",
+            },
+        }
+        for idx in range(1, count + 1)
+    ]
+
+def _institution_pack_draft(citation_count=7):
+    citations = "\n".join(
+        f"{idx}. 机构信息要点{idx} [{idx}]" for idx in range(1, citation_count + 1)
+    )
+    return {
+        "payload": {},
+        "content": (
+            "# 机构开源情报整编包\n\n"
+            "## 信息清单\n"
+            f"{citations}\n\n"
+            "## 短消息\n"
+            "### 短消息一\n已核实事实：第一项动态已由原文支持。[1]\n\n"
+            "### 短消息二\n来源陈述：第二项动态仍需持续观察。[2]\n\n"
+            "### 短消息三\n分析推断：多项公开信号具有联动性。[3]\n\n"
+            "## 专题报告\n围绕能力、部署与规则影响展开专题分析。[4][5]\n\n"
+            "## 事实来源追溯表\n"
+            "| 事实 | 事实层级 | 来源 |\n|---|---|---|\n"
+            "| 动态一 | 已核实事实 | [6] |\n\n"
+            "## 不确定性与观察指标\n证据边界是公开材料时效有限；观察指标为后续正式披露。[7]\n\n"
+            "## 诚实边界\n"
+            "1. 本包不能验证未公开的内部意图。\n"
+            "2. 本包不能把单一机构判断当作既成事实。\n"
+            "3. 本包不能替代后续原文复核与动态更新。\n"
+        ),
+    }
 
 @pytest.fixture()
 def agent_db(monkeypatch, tmp_path):
@@ -64,6 +110,374 @@ def test_create_project_uses_report_type_defaults_and_records_event(agent_db):
     assert bundle["project"]["project_id"] == project["project_id"]
     assert bundle["events"][0]["event_type"] == "project_created"
 
+
+def test_institution_pack_defaults_and_public_sod_path(agent_db):
+    project = report_agent.create_project(
+        title="机构开源情报整编包",
+        report_type="institution_pack",
+        topic="印太防务态势",
+    )
+
+    assert project["target_count"] == 8
+    assert project["time_window_days"] == 30
+    assert report_agent.REPORT_TYPE_DEFAULTS["institution_pack"]["label"] == "机构开源情报整编包"
+
+    candidates = [Path(path) for path in report_agent._writing_spec_candidates()]
+    assert candidates[0].name == "defensetracker_sod_writing.md"
+    assert candidates[0].parent.name == "docs"
+    assert any(path.name == "report_agent_sod_writing.md" for path in candidates)
+    assert _RETIRED_USER_MARKER not in "\n".join(str(path) for path in candidates)
+
+
+def test_evidence_lines_use_stable_bracketed_citation_numbers():
+    evidence = _institution_pack_evidence(3)
+
+    rendered = report_agent._evidence_lines(evidence)
+
+    assert rendered.count("[1]") == 1
+    assert rendered.count("[2]") == 1
+    assert rendered.count("[3]") == 1
+    assert "1. 【" not in rendered
+
+@pytest.mark.parametrize("builder", [report_agent.build_outline_messages, report_agent.build_draft_messages])
+def test_institution_pack_prompts_require_closed_loop_delivery(builder):
+    project = {
+        "report_type": "institution_pack",
+        "title": "机构开源情报整编包",
+        "topic": "印太防务态势",
+        "client_request": "形成今日可交付闭环",
+        "target_count": 8,
+    }
+
+    prompt = "\n".join(message["content"] for message in builder(project, _institution_pack_evidence()))
+
+    for requirement in (
+        "7—10条",
+        "恰好3篇短消息",
+        "1篇专题",
+        "事实来源追溯表",
+        "事实分级",
+        "不确定性",
+        "观察指标",
+        "来源索引",
+        "至少3条诚实边界",
+        "不得编造",
+        "不得越界引用",
+    ):
+        assert requirement in prompt
+
+def test_institution_pack_delivery_preflight_accepts_closed_loop_package():
+    project = {"report_type": "institution_pack"}
+
+    result = report_agent.build_delivery_preflight(
+        project,
+        _institution_pack_draft(),
+        _institution_pack_evidence(),
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "ready"
+    assert all(check["ok"] for check in result["checks"])
+    assert all({"id", "ok", "label", "detail"} <= set(check) for check in result["checks"])
+    assert result["counts"]["evidence"] == 7
+    assert result["counts"]["short_messages"] == 3
+    assert result["counts"]["honest_boundaries"] == 3
+    assert result["blocked_domains"] == []
+    assert result["missing_citations"] == []
+    assert result["out_of_range_citations"] == []
+
+@pytest.mark.parametrize(
+    ("mutation", "failed_check", "detail_fragment"),
+    [
+        ("too_few_sources", "sources", "7—10"),
+        ("non_http_link", "source_links", "HTTP"),
+        ("malformed_link", "source_links", "HTTP"),
+        ("backslash_authority", "source_links", "HTTP"),
+        ("userinfo_authority", "source_links", "HTTP"),
+        ("blocked_subdomain", "source_policy", "zhihu.com"),
+        ("missing_original", "content", "原文"),
+        ("directory_seed_with_text", "content", "原文"),
+        ("missing_section", "sections", "专题报告"),
+        ("too_few_short_messages", "short_messages", "3篇"),
+        ("too_many_short_messages", "short_messages", "恰好3篇"),
+        ("generic_short_message_children", "short_messages", "恰好3篇"),
+        ("missing_fact_level", "fact_levels", "事实分级"),
+        ("missing_citation", "citations", "[7]"),
+        ("out_of_range_citation", "citation_range", "[8]"),
+        ("too_few_boundaries", "honest_boundaries", "3条"),
+    ],
+)
+def test_institution_pack_delivery_preflight_fails_closed_with_specific_gap(
+    mutation, failed_check, detail_fragment
+):
+    project = {"report_type": "institution_pack"}
+    evidence = _institution_pack_evidence()
+    draft = _institution_pack_draft()
+
+    if mutation == "too_few_sources":
+        evidence = evidence[:6]
+        draft = _institution_pack_draft(6)
+    elif mutation == "non_http_link":
+        evidence[0]["link"] = "file:///private/source.pdf"
+    elif mutation == "malformed_link":
+        evidence[0]["link"] = "https://[invalid"
+    elif mutation == "backslash_authority":
+        evidence[0]["link"] = r"https://zhihu.com\@evil.com/report"
+    elif mutation == "userinfo_authority":
+        evidence[0]["link"] = "https://reader@example.test/report"
+    elif mutation == "blocked_subdomain":
+        evidence[0]["link"] = "https://column.zhihu.com/p/123"
+    elif mutation == "missing_original":
+        evidence[0]["payload"] = {"asset_status": "partial"}
+    elif mutation == "directory_seed_with_text":
+        evidence[0]["source_type"] = "智库/报告源"
+        evidence[0]["payload"] = {"text": "这只是目录 seed 的描述文本，不是已抓取原文。"}
+    elif mutation == "missing_section":
+        draft["content"] = draft["content"].replace("## 专题报告", "## 综合研判")
+    elif mutation == "too_few_short_messages":
+        draft["content"] = draft["content"].replace(
+            "### 短消息三\n分析推断：多项公开信号具有联动性。[3]\n\n", ""
+        )
+    elif mutation == "too_many_short_messages":
+        draft["content"] = draft["content"].replace(
+            "## 专题报告",
+            "### 短消息四\n已核实事实：补充消息仍引用既有来源。[4]\n\n## 专题报告",
+        )
+    elif mutation == "generic_short_message_children":
+        for source, replacement in (
+            ("### 短消息一", "### 背景"),
+            ("### 短消息二", "### 态势"),
+            ("### 短消息三", "### 结论"),
+        ):
+            draft["content"] = draft["content"].replace(source, replacement)
+    elif mutation == "missing_fact_level":
+        for term in ("已核实事实", "来源陈述", "分析推断", "事实层级"):
+            draft["content"] = draft["content"].replace(term, "研判")
+    elif mutation == "missing_citation":
+        draft["content"] = draft["content"].replace("[7]", "")
+    elif mutation == "out_of_range_citation":
+        draft["content"] += "\n越界来源[8]。"
+    elif mutation == "too_few_boundaries":
+        draft["content"] = draft["content"].replace(
+            "3. 本包不能替代后续原文复核与动态更新。\n", ""
+        )
+
+    result = report_agent.build_delivery_preflight(project, draft, evidence)
+    check = next(item for item in result["checks"] if item["id"] == failed_check)
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert check["ok"] is False
+    assert detail_fragment in check["detail"]
+
+def test_institution_pack_preflight_accepts_fetched_original_body_without_archive_asset():
+    evidence = _institution_pack_evidence()
+    evidence[0].pop("source_type")
+    evidence[0]["payload"] = {
+        "source_type": "已抓取公开报告/原文",
+        "text": "这是已抓取并转入的公开报告正文。",
+    }
+
+    result = report_agent.build_delivery_preflight(
+        {"report_type": "institution_pack"},
+        _institution_pack_draft(),
+        evidence,
+    )
+
+    assert result["ok"] is True
+
+def test_institution_pack_preflight_blocks_citations_only_in_information_list():
+    draft = _institution_pack_draft()
+    info_list, remainder = draft["content"].split("## 短消息", 1)
+    draft["content"] = info_list + "## 短消息" + re.sub(r"\[(\d+)\]", "", remainder)
+
+    result = report_agent.build_delivery_preflight(
+        {"report_type": "institution_pack"},
+        draft,
+        _institution_pack_evidence(),
+    )
+    check = next(item for item in result["checks"] if item["id"] == "section_citations")
+
+    assert result["missing_citations"] == []
+    assert result["ok"] is False
+    assert check["ok"] is False
+    assert "短消息一" in check["detail"]
+    assert "专题报告" in check["detail"]
+    assert "事实来源追溯表" in check["detail"]
+
+@pytest.mark.parametrize(
+    ("trace", "detail_fragment"),
+    [
+        (f"制作说明：遵循{_RETIRED_USER_MARKER} SOD/SOP。", "SOD/SOP"),
+        (r"工作底稿：F:\private\draft.md", "本地绝对路径"),
+        ("本文由AI生成并整理。", "AI制作痕迹"),
+        ("作为AI语言模型，我依据提示词完成本稿。", "AI制作痕迹"),
+        ("本报告由生成式人工智能协助起草。", "AI制作痕迹"),
+        ("本稿在ChatGPT帮助下形成。", "AI制作痕迹"),
+        ("本文采用大模型协助起草。", "AI制作痕迹"),
+    ],
+)
+def test_institution_pack_delivery_preflight_blocks_production_traces(trace, detail_fragment):
+    draft = _institution_pack_draft()
+    draft["content"] += f"\n{trace}\n"
+
+    result = report_agent.build_delivery_preflight(
+        {"report_type": "institution_pack"},
+        draft,
+        _institution_pack_evidence(),
+    )
+    check = next(item for item in result["checks"] if item["id"] == "trace_hygiene")
+
+    assert result["ok"] is False
+    assert check["ok"] is False
+    assert detail_fragment in check["detail"]
+
+def test_institution_pack_trace_hygiene_allows_source_backed_ai_subject_matter():
+    draft = _institution_pack_draft()
+    draft["content"] += "\n本文分析AI生成图像对舆论环境的影响，并以来源[1]为依据。\n"
+
+    result = report_agent.build_delivery_preflight(
+        {"report_type": "institution_pack"},
+        draft,
+        _institution_pack_evidence(),
+    )
+    check = next(item for item in result["checks"] if item["id"] == "trace_hygiene")
+
+    assert check["ok"] is True
+
+def test_institution_pack_trace_hygiene_allows_operational_sop_subject_matter():
+    draft = _institution_pack_draft()
+    draft["content"] += "\n已核实事实：部队修订 SOP 后开展训练。[1]\n"
+
+    result = report_agent.build_delivery_preflight(
+        {"report_type": "institution_pack"},
+        draft,
+        _institution_pack_evidence(),
+    )
+    check = next(item for item in result["checks"] if item["id"] == "trace_hygiene")
+
+    assert check["ok"] is True
+
+def test_delivery_preflight_and_export_remain_backward_compatible_for_other_types():
+    project = {"report_type": "strategic", "client_request": ""}
+    draft = {"payload": {}, "content": "普通战略报告正文。"}
+
+    result = report_agent.build_delivery_preflight(project, draft, [])
+    quality = report_agent.assert_report_exportable(draft, project, evidence=[])
+
+    assert result["ok"] is True
+    assert result["status"] == "not_required"
+    assert quality["target_word_count"] == 0
+
+def test_institution_pack_export_error_names_first_concrete_gap():
+    project = {"report_type": "institution_pack", "client_request": ""}
+
+    with pytest.raises(ValueError, match="证据数量.*7—10"):
+        report_agent.assert_report_exportable(
+            _institution_pack_draft(),
+            project,
+            evidence=[],
+        )
+
+@pytest.mark.skipif(not report_agent.DOCX_AVAILABLE, reason="python-docx 未安装")
+def test_build_report_docx_passes_institution_pack_evidence_to_preflight():
+    buf = report_agent.build_report_docx(
+        {"report_type": "institution_pack", "title": "机构开源情报整编包", "client_request": ""},
+        _institution_pack_draft(),
+        _institution_pack_evidence(),
+    )
+
+    assert buf.getvalue().startswith(b"PK")
+    doc = Document(BytesIO(buf.getvalue()))
+    visible_text = [p.text for p in doc.paragraphs]
+    visible_text.extend(
+        cell.text for table in doc.tables for row in table.rows for cell in row.cells
+    )
+    visible_text.extend(
+        p.text for section in doc.sections for p in section.header.paragraphs
+    )
+    combined = "\n".join(visible_text)
+    assert _RETIRED_USER_MARKER not in combined
+    assert "SOD/SOP" not in combined
+    assert "FACT-DATA-CITE" not in combined
+
+@pytest.mark.skipif(not report_agent.DOCX_AVAILABLE, reason="python-docx 未安装")
+def test_institution_pack_docx_tables_use_fixed_geometry_and_real_headers():
+    buf = report_agent.build_report_docx(
+        {"report_type": "institution_pack", "title": "机构开源情报整编包", "client_request": ""},
+        _institution_pack_draft(),
+        _institution_pack_evidence(),
+    )
+    doc = Document(BytesIO(buf.getvalue()))
+    section = doc.sections[-1]
+    printable_width = int(
+        section.page_width.twips - section.left_margin.twips - section.right_margin.twips
+    )
+
+    assert len(doc.tables) >= 3
+    for table in doc.tables:
+        tbl_pr = table._tbl.tblPr
+        tbl_width = tbl_pr.find(qn("w:tblW"))
+        tbl_indent = tbl_pr.find(qn("w:tblInd"))
+        tbl_layout = tbl_pr.find(qn("w:tblLayout"))
+        assert tbl_width is not None and tbl_width.get(qn("w:type")) == "dxa"
+        assert tbl_indent is not None and tbl_indent.get(qn("w:type")) == "dxa"
+        assert tbl_layout is not None and tbl_layout.get(qn("w:type")) == "fixed"
+        width = int(tbl_width.get(qn("w:w")))
+        indent = int(tbl_indent.get(qn("w:w")))
+        assert indent + width <= printable_width
+        grid = [int(col.get(qn("w:w"))) for col in table._tbl.tblGrid]
+        assert sum(grid) == width
+
+        start_margins = set()
+        for row in table.rows:
+            cell_widths = []
+            for cell in row.cells:
+                tc_pr = cell._tc.get_or_add_tcPr()
+                tc_width = tc_pr.find(qn("w:tcW"))
+                cell_widths.append(int(tc_width.get(qn("w:w"))))
+                start_margin = tc_pr.find(qn("w:tcMar"))
+                assert start_margin is not None
+                start_node = start_margin.find(qn("w:start"))
+                assert start_node is not None
+                start_margins.add(int(start_node.get(qn("w:w"))))
+            assert cell_widths == grid
+        assert len(start_margins) == 1
+        assert indent == next(iter(start_margins))
+
+    for table in doc.tables[1:]:
+        header = table.rows[0]._tr.get_or_add_trPr().find(qn("w:tblHeader"))
+        assert header is not None and header.get(qn("w:val")) in ("1", "true")
+
+@pytest.mark.skipif(not report_agent.DOCX_AVAILABLE, reason="python-docx 未安装")
+def test_fixed_table_geometry_rejects_merged_cells():
+    doc = Document()
+    table = doc.add_table(rows=1, cols=3)
+    table.cell(0, 0).merge(table.cell(0, 1))
+
+    with pytest.raises(ValueError, match="合并单元格"):
+        report_agent._apply_table_geometry(doc, table, [1, 1, 1], cell_margin=140)
+
+    doc = Document()
+    table = doc.add_table(rows=2, cols=3)
+    table.cell(0, 0).merge(table.cell(1, 0))
+
+    with pytest.raises(ValueError, match="合并单元格"):
+        report_agent._apply_table_geometry(doc, table, [1, 1, 1], cell_margin=140)
+
+@pytest.mark.skipif(not report_agent.DOCX_AVAILABLE, reason="python-docx 未安装")
+def test_fixed_table_geometry_reduces_margin_for_many_columns():
+    doc = Document()
+    table = doc.add_table(rows=1, cols=40)
+    report_agent._apply_table_geometry(doc, table, [1] * 40, cell_margin=140)
+
+    for cell in table.rows[0].cells:
+        tc_pr = cell._tc.get_or_add_tcPr()
+        width = int(tc_pr.find(qn("w:tcW")).get(qn("w:w")))
+        margins = tc_pr.find(qn("w:tcMar"))
+        start = int(margins.find(qn("w:start")).get(qn("w:w")))
+        end = int(margins.find(qn("w:end")).get(qn("w:w")))
+        assert start + end < width
 
 def test_create_project_from_client_request_derives_strategy_title(agent_db):
     project = report_agent.create_project(

@@ -28,6 +28,7 @@ import base64, hashlib, hmac, ipaddress, json, logging, os, re, socket, sys, thr
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
 from io import BytesIO
 from urllib.parse import urlparse, urljoin
 
@@ -172,51 +173,19 @@ _pending_filenames: dict = {}  # chat_id → 下次生成要讯时自动使用�
 _sessions_lock = threading.Lock()
 _SESSION_TTL = 1800  # 30 minutes inactive → expire
 
-# 会话持久化：优先用 SESSION_STORE_PATH 环境变量，否则尝试 Railway Volume /data，
-# 最后降级到同目录文件（容器重启会丢）。要跨部署保留，需在 Railway 挂 Volume → /data。
-_SESSION_STORE = os.environ.get("SESSION_STORE_PATH") or (
-    "/data/sessions.json" if os.path.isdir("/data") else "sessions.json"
-)
+# 会话可能包含用户素材、提示词和完整成稿，只在内存中保存并按 TTL 清理。
+# 不提供明文磁盘持久化开关，避免聊天标识和正文落入运行卷。
+_SESSION_STORE = ""
 
 
 def _sessions_persist_locked():
-    """在 _sessions_lock 已持有时调用。原子写入磁盘（包含 pending 文件名）。"""
-    if not _SESSION_STORE:
-        return
-    try:
-        d = os.path.dirname(_SESSION_STORE)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        payload = {"sessions": _chat_sessions, "pending_filenames": _pending_filenames}
-        tmp = _SESSION_STORE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, _SESSION_STORE)
-    except Exception as e:
-        logger.warning("会话持久化失败: %s", e)
+    """Privacy boundary: full-text chat sessions are intentionally memory-only."""
+    return
 
 
 def _sessions_load():
-    """启动时从磁盘恢复未过期的会话和 pending 文件名。"""
-    if not _SESSION_STORE or not os.path.exists(_SESSION_STORE):
-        return
-    try:
-        with open(_SESSION_STORE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # 兼容旧格式（直接是 sessions dict）和新格式（含 sessions + pending_filenames）
-        sessions = data.get("sessions", data) if isinstance(data, dict) and "sessions" in data else data
-        pendings = data.get("pending_filenames", {}) if isinstance(data, dict) else {}
-        now = time.time()
-        kept = 0
-        for chat_id, sess in (sessions or {}).items():
-            if isinstance(sess, dict) and now - sess.get("last_active", 0) < _SESSION_TTL:
-                _chat_sessions[chat_id] = sess
-                kept += 1
-        _pending_filenames.update(pendings or {})
-        logger.info("从 %s 恢复 %d 会话 + %d pending文件名",
-                    _SESSION_STORE, kept, len(_pending_filenames))
-    except Exception as e:
-        logger.warning("会话加载失败: %s", e)
+    """Privacy boundary: no full-text session data is loaded from disk."""
+    return
 
 
 def _cache_get(url: str):
@@ -225,14 +194,19 @@ def _cache_get(url: str):
             entry = _result_cache[url]
             if time.time() - entry["time"] < _CACHE_TTL:
                 _result_cache.move_to_end(url)
-                return entry["result"], entry["source_info"]
+                return entry["result"], entry["source_info"], entry.get("evidence")
             del _result_cache[url]
-    return None, None
+    return None, None, None
 
 
-def _cache_set(url: str, result: str, source_info: dict):
+def _cache_set(url: str, result: str, source_info: dict, evidence: dict | None = None):
     with _cache_lock:
-        _result_cache[url] = {"result": result, "source_info": source_info, "time": time.time()}
+        _result_cache[url] = {
+            "result": result,
+            "source_info": source_info,
+            "evidence": evidence,
+            "time": time.time(),
+        }
         while len(_result_cache) > _CACHE_MAX:
             _result_cache.popitem(last=False)
 
@@ -327,12 +301,12 @@ def _is_new_message(msg_id: str) -> bool:
 
 
 def _verify_signature(timestamp: str, nonce: str, body: bytes) -> bool:
-    token = FEISHU_CONFIG.get("verify_token", "")
-    if not token:
-        return True
+    token = str(FEISHU_CONFIG.get("verify_token") or "").strip()
+    incoming = request.headers.get("X-Lark-Signature", "")
+    if not all((token, timestamp, nonce, incoming)):
+        return False
     key = (timestamp + nonce + token).encode("utf-8") + body
     sig = hashlib.sha256(key).hexdigest()
-    incoming = request.headers.get("X-Lark-Signature", "")
     return hmac.compare_digest(sig, incoming)
 
 
@@ -506,14 +480,64 @@ def _read_limited_response(resp: requests.Response, max_bytes: int = MAX_FETCH_B
         resp.close()
 
 
+_SSRF_HTTP_LOCAL = threading.local()
+
+
+def _ssrf_http_session() -> requests.Session:
+    """One direct, proxy-free Session per worker thread for untrusted URLs."""
+    session = getattr(_SSRF_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        _SSRF_HTTP_LOCAL.session = session
+    return session
+
+
+def _connected_peer_ip(resp: requests.Response) -> str:
+    raw = getattr(resp, "raw", None)
+    candidates = [
+        getattr(getattr(raw, "_connection", None), "sock", None),
+        getattr(
+            getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None),
+            "_sock",
+            None,
+        ),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            peer = candidate.getpeername()
+            if peer and peer[0]:
+                return str(peer[0])
+        except (AttributeError, OSError, TypeError):
+            continue
+    raise requests.RequestException("无法核验远端连接地址")
+
+
+def _validate_connected_peer(resp: requests.Response) -> None:
+    try:
+        peer_ip = _connected_peer_ip(resp)
+        blocked, blocked_addr = _is_blocked_addr(peer_ip)
+    except Exception:
+        resp.close()
+        raise
+    if blocked:
+        resp.close()
+        raise requests.RequestException(f"连接被重绑定到私有地址: {blocked_addr}")
+
+
 def _safe_get_once(url: str, headers: dict, timeout: int, max_bytes: int = MAX_FETCH_BYTES) -> requests.Response:
     current = url
     for redirect_idx in range(MAX_REDIRECTS + 1):
         safe, reason = _is_ssrf_safe(current)
         if not safe:
             raise requests.RequestException(f"URL不安全: {reason}")
-        resp = requests.get(current, headers=headers, timeout=timeout,
-                            allow_redirects=False, stream=True)
+        resp = _ssrf_http_session().get(
+            current, headers=headers, timeout=timeout,
+            allow_redirects=False, stream=True,
+        )
+        _validate_connected_peer(resp)
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location")
             resp.close()
@@ -759,7 +783,12 @@ def _extract_text_file(file_bytes: bytes) -> str:
     return file_bytes.decode("utf-8", errors="replace")[:8000]
 
 
-def _call_ai_with_image(image_b64: str, media_type: str, prompt: str) -> str:
+def _call_ai_with_image(
+    image_b64: str,
+    media_type: str,
+    prompt: str,
+    system_prompt: str = "",
+) -> str:
     """调用多模态 AI（图片+文字），支持 Anthropic 和 OpenAI 格式"""
     if not AI_CONFIG["api_key"]:
         raise ValueError("AI API Key 未配置")
@@ -782,6 +811,8 @@ def _call_ai_with_image(image_b64: str, media_type: str, prompt: str) -> str:
                 ]
             }],
         }
+        if system_prompt:
+            payload["system"] = system_prompt
         url = AI_CONFIG["base_url"].rstrip("/") + "/v1/messages"
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
@@ -792,17 +823,21 @@ def _call_ai_with_image(image_b64: str, media_type: str, prompt: str) -> str:
     else:
         # OpenAI 兼容格式
         headers = {"Authorization": f"Bearer {AI_CONFIG['api_key']}", "Content-Type": "application/json"}
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_b64}"}},
+                {"type": "text", "text": prompt},
+            ],
+        })
         payload = {
             "model": AI_CONFIG["model"],
             "max_tokens": AI_CONFIG["max_tokens"],
             "temperature": 0.4,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_b64}"}},
-                    {"type": "text", "text": prompt},
-                ]
-            }],
+            "messages": messages,
         }
         base = AI_CONFIG["base_url"].rstrip("/")
         url = base + "/v1/chat/completions" if not base.endswith("/v1") else base + "/chat/completions"
@@ -827,7 +862,7 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 【核心文风要求】中文军事媒体机关行文体
 ════════════════════════════════════════
 必用军语词汇（自然嵌入行文）：
-• 开头句式："据XX报道""据XX网站X月X日报道""XX近日报道"
+• 开头句式：统一使用"据XX报道，"；XX必须与信息来源行一致，不在"报道"前添加日期，禁用"近日""近期"
 • 研判用语："值得警惕""值得关注""须警惕""研判""着力""亟需""显著提升""根本性威胁""现实压力"
 • 建议用语："建议持续跟踪""加强""积极参与""着力构建""针对性加强""掌握战略主动""争取战略主动"
 • 战略词汇："战略制高点""战略间隙""战略主动""战略支援""战略意图""根本性威胁""颠覆性威胁"
@@ -842,40 +877,43 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 ════════════════════════════════════════
 【输出格式】严格按此六部分输出（参照素材1-5通用模板）
 ════════════════════════════════════════
-第一行：事件时间：YYYY年M月D日
-第二行：价 值 点：<一句话，60字内，指出核心研判与战略意义>
+第一行：事件时间：YYYY年M月D日（必须是原文明确对应的具体事件日期，不得写"近日""近期"）
+第二行：价 值 点：<一句话，60字内，指出核心研判与战略意义；不得复制标题，去掉标题末尾警示词后也不得近乎原样复述>
 第三行：（空行）
-第四行：<标题：8-20字，主语明确，必须以"值得警惕""值得关注""威胁"或"压力"等警示词收尾>
+第四行：<标题：8-15字，主语明确，不得含中文逗号"，"或英文逗号","，只能以"值得警惕"或"值得关注"收尾>
 第五行：（空行）
 第六行开始：<正文：单段成文，250-350字，结构如下>
-     据<具体信息源>报道，<背景：时间+主体+动作+装备数量+地点+目的，80-120字>。（1）<影响一：对我战略/装备/力量的直接影响，35-55字>；（2）<影响二：对区域态势/盟体/对手的影响，35-55字>；（3）<影响三：深层意图/长远威胁研判，35-55字>。建议持续跟踪<对象>的<要素一>、<要素二>及<要素三>，针对性加强<能力一>、<能力二>及<能力三>能力建设。
+     据<与信息来源行第一条一致的具体信源>报道，<帽段：用3-4行、约80-120字简述时间+主体+动作+装备数量+地点+目的，且必须出现与事件时间一致的M月D日>。（1）<影响一：对我战略/装备/力量的直接影响，35-55字>。（2）<影响二：对区域态势/盟体/对手的影响，35-55字>。（3）<影响三：深层意图/长远威胁研判，35-55字>。建议持续跟踪<对象>的<要素一>、<要素二>及<要素三>，针对性加强<能力一>、<能力二>及<能力三>能力建设。
+     也可不用编号，写成：<帽段>。<层意一>；<层意二>；<层意三>。建议……。不用编号时各层之间使用中文分号。
 （空行）
-倒数第二行：（信息来源：<原报道来源网站>X月X日发文《<原报道标题>》）
+倒数第二行：（信息来源：<来源一>M月D日发文《<原报道标题>》；<来源二>M月D日发文《<原报道标题>》）
 末行：报送人：           电话：
+
+信源处理要求：正文"据XX报道，"中的XX必须与信息来源行第一条名称完全一致。若公众号转述外网消息，优先采用素材中可核验的外网第一信源；无法找到第一信源时，写"据XX公众号报道，"，不得添加报道日期。凡实际引用的来源均须在信息来源行写全，包括"路透社称""XX指出"等二次来源；每条严格采用"XX M月D日发文《标题》"格式，多个来源之间使用中文分号"；"。
 
 ════════════════════════════════════════
 【示范样本】参考此风格、用词、节奏
 ════════════════════════════════════════
 样本1（标准(1)(2)(3)格式）：
 事件时间：2026年3月24日
-价 值 点：俄太空核武器研发加速，我在轨战略资产面临颠覆性威胁，美欧协调失序形成战略间隙，须研判美方双重意图，掌握战略主动。
+价 值 点：俄方推进低轨核能力研发，可能削弱我卫星导航与通信中继体系韧性，须持续研判技术进展及美方借题施压意图。
 
-俄太空核武器研发加速威胁我战略资产值得警惕
+俄低轨核爆风险值得警惕
 
-据美防务一号网站报道，美参议院军事委员会听证会上，美战略及太空司令部领导人证实，俄罗斯正公开推进太空核武器研发，一旦于低轨引爆，将无差别摧毁各国近地轨道航天资产，美欧因"核保护伞"可信度分歧亦出现明显裂痕。（1）太空核武器一旦实战化，将对我卫星导航、侦察预警、通信中继等战略支援能力构成根本性威胁；（2）美欧盟体协调失序，客观上为我战略运筹提供窗口期；（3）需警惕美方借此向国会争取经费、对俄施压的双重意图，须辩证研判其信息真实性与战略目的。建议持续跟踪俄太空核武器研发动态及部署进展，加强我太空资产抗毁性与快速补网能力建设。
+据美防务一号网站报道，3月24日，美参议院军事委员会举行听证会，美战略及太空司令部领导人证实俄罗斯正推进太空核能力研发。相关武器若在低轨引爆，可能无差别毁伤近地轨道航天资产。美欧围绕"核保护伞"可信度亦存在明显分歧。（1）该武器一旦实战化，将对我卫星导航、侦察预警、通信中继等战略支援能力构成根本性威胁。（2）美欧盟体协调失序，客观上为我战略运筹提供窗口期。（3）需警惕美方借此向国会争取经费、对俄施压的双重意图，须辩证研判其信息真实性与战略目的。建议持续跟踪俄太空核能力研发动态及部署进展，针对性加强我太空资产抗毁性与快速补网能力建设。
 
 （信息来源：美防务一号网站3月26日发文《参院军事委员会主席：美国国防战略在核与太空威胁问题上"存在不足"》）
 报送人：           电话：
 
 样本2（前沿部署类）：
 事件时间：2026年3月28日
-价 值 点：美军以F-35A替换F-16进驻三泽，实质性提升第一岛链隐形打击与态势感知能力，对我东北亚方向防空反隐形体系构成直接现实压力。
+价 值 点：美军以F-35A替换F-16进驻三泽，第一岛链隐形打击与态势感知能力上升，将加大我东北亚方向防空反隐形压力。
 
-美向日本部署F-35A隐形战机威胁我周边空中安全值得关注
+美军隐形战机前沿部署值得关注
 
-据比利时陆军防务网报道，3月28日美军首批F-35A隐形战斗机抵达日本三泽空军基地，取代F-16，投入超100亿美元用于基础设施升级，该机具备隐形、传感器融合及多任务能力，可执行防空压制、精确打击及盟军协同作战。（1）F-35A前沿部署将显著压缩我防空识别区反应时间，增大我周边空中安全压力；（2）三泽成为美日共用F-35平台前沿基地，明显提升美在东北亚的隐形打击与态势感知能力；（3）美方明确称此举针对中国在东海等地日益常态化的军事活动，遏华意图凸显。建议持续跟踪该机在三泽的部署规模及训练强度，针对性加强反隐形侦察、区域防空及电子对抗能力建设。
+据比利时陆军防务网报道，3月28日，美军首批F-35A隐形战斗机抵达日本三泽空军基地并开始替换F-16。美方投入超100亿美元升级相关基础设施。该机具备隐形、传感器融合及多任务能力，可执行防空压制、精确打击和盟军协同作战。（1）F-35A前沿部署将显著压缩我防空识别区反应时间，增大我周边空中安全压力。（2）三泽成为美日共用F-35平台前沿基地，明显提升美在东北亚的隐形打击与态势感知能力。（3）美方明确称此举针对中国在东海等地日益常态化的军事活动，遏华意图凸显。建议持续跟踪该机在三泽的部署规模及训练强度，针对性加强反隐形侦察、区域防空及电子对抗能力建设。
 
-（信息来源：比利时陆军防务网网站3月30日发文《美国向日本部署F-35A隐形战斗机，取代F-16以应对中国威胁》）
+（信息来源：比利时陆军防务网3月30日发文《美国向日本部署F-35A隐形战斗机，取代F-16以应对中国威胁》）
 报送人：           电话：
 
 ════════════════════════════════════════
@@ -914,39 +952,39 @@ SYSTEM_PROMPT_BRIEF_WRITE = """你是一名资深中文防务资讯编辑，长�
 【硬性红线】违反任一条重写
 ════════════════════════════════════════
 1. 必须严格六部分输出（事件时间/价值点/标题/正文/信息来源/报送人电话行），不得增减
-2. 正文必须单段成文，使用（1）（2）（3）三点分列影响
-3. 正文总字数控制在250-350字
-4. 标题必须以警示词（值得警惕/值得关注/威胁/压力）收尾
-5. 不得使用任何markdown符号（#、*、-、**等）
-6. 必须保持PLA机关军语文风，不得口语化
-7. 不得脱离原文编造事实数据
-8. 建议必须严格采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"范式
-9. 末行必须输出"报送人：           电话："（留空待填）
-10. 正文"据XX报道"中的XX必须是中文媒体名称，严禁出现英文域名或英文媒体名
-11. 信息来源行《》内的文章标题必须翻译为中文，严禁保留英文原标题"""
+2. 事件时间必须是原文明确支持的实际事件日期并具体到年月日，不得使用"近日""近期"，不得用来源发布日期或系统今日日期兜底
+3. 价值点必须另行提炼战略意义，不得复制标题；去掉标题末尾"值得警惕/值得关注"后，也不得近乎原样复述标题主体
+4. 标题必须为8-15字，不得含中英文逗号，只能以"值得警惕"或"值得关注"收尾
+5. 正文必须单段成文；开头帽段用3-4行、约80-120字简述基本情况，并写出与事件时间一致的M月D日
+6. 使用（1）（2）（3）分层时各层之间必须用句号；不用编号时写成"帽段。层意一；层意二；层意三。建议……"，各层之间用中文分号
+7. 正文总字数控制在250-350字
+8. 正文"据XX报道，"中的XX必须与信息来源第一条一致且使用中文媒体名称，严禁出现英文域名或英文媒体名
+9. 公众号转述外网消息时优先采用可核验的外网第一信源；找不到时写"据XX公众号报道，"且不加日期
+10. 信息来源每条必须写成"XX M月D日发文《标题》"，实际引用的来源全部列全，含"路透社称""XX指出"等二次来源；多个来源用中文分号分隔
+11. 不得使用任何markdown符号（#、*、-、**等）
+12. 必须保持PLA机关军语文风，不得口语化
+13. 不得脱离原文编造事实数据、来源或日期
+14. 建议必须严格采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"范式
+15. 末行必须输出"报送人：           电话："（留空待填）
+16. 信息来源行《》内的文章标题必须翻译为中文，严禁保留英文原标题"""
 
 
 def _build_user_prompt(title: str, body: str, source: str = "", url: str = "", pub_date: str = "") -> str:
     now = datetime.now()
     today_cn = f"{now.year:04d}年{now.month:02d}月{now.day:02d}日"
-    date_cn = today_cn
-    pub_md = f"{now.month:02d}月{now.day:02d}日"
-    if pub_date:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
-            try:
-                dt = datetime.strptime(pub_date[:19], fmt)
-                date_cn = f"{dt.year:04d}年{dt.month:02d}月{dt.day:02d}日"
-                pub_md = f"{dt.month:02d}月{dt.day:02d}日"
-                break
-            except ValueError:
-                continue
-    source_label = source if source else "境外媒体"
+    date_cn = "未提供"
+    pub_md = "未提供"
+    dt = _brief_parse_date_value(pub_date)
+    if dt:
+        date_cn = f"{dt.year:04d}年{dt.month:02d}月{dt.day:02d}日"
+        pub_md = f"{dt.month:02d}月{dt.day:02d}日"
+    source_label = source if source else "素材中明确标注的来源"
     return f"""请根据以下导入素材，撰写一份PLA机关军语要讯（情报简报）：
 
 ════════ 导入素材 ════════
 【素材标题】{title}
 【信息来源】{source_label}
-【日期】{date_cn}
+【来源发布日期】{date_cn}
 【素材正文】
 {body}
 【原文链接】{url if url else "（用户导入）"}
@@ -956,14 +994,16 @@ def _build_user_prompt(title: str, body: str, source: str = "", url: str = "", p
 
 ════════ 写作任务 ════════
 请输出一份要讯，严格遵循以下要求：
-1. 事件时间填写：{date_cn}
-2. 正文开头使用"据【中文媒体名】报道"或"据【中文媒体名】{pub_md}报道"——若来源"{source_label}"是英文域名或英文名，必须按对照表译为中文，严禁直接写英文
-3. 末尾信息来源填写：（信息来源：【中文媒体名】{pub_md}发文《【中文标题】》）——《》内的文章标题无论原文是否为英文，必须翻译为中文
-4. 必须单段成文、（1）（2）（3）三点分列影响、250-350字；结尾建议必须采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"的范式
-5. 标题以"值得警惕/值得关注/威胁/压力"收尾
-6. 使用PLA机关军语，必须出现"研判/建议/着力/加强/威胁/值得警惕"等词
-7. 从素材提炼对我军/对华影响，不得编造素材未提及的具体数据
-8. 素材为外文时，正文/标题/价值点/信息来源行全部写中文，不保留任何英文原词（专有名词如武器型号可保留）
+1. 事件时间只能填写素材原文明确支持的实际事件日期，必须具体到年月日，不得写"近日""近期"，不得把来源发布日期{date_cn}或今日日期{today_cn}当作事件时间兜底；原文未给实际事件日期时必须先核实，不得臆造
+2. 价值点必须另行提炼核心研判和战略意义，不得复制标题；去掉标题末尾"值得警惕/值得关注"后，也不得近乎原样复述标题主体
+3. 标题控制在8-15字，不得含中文逗号"，"或英文逗号","，只能以"值得警惕"或"值得关注"收尾
+4. 正文统一以"据【中文媒体名】报道，"开头，媒体名必须与信息来源第一条一致，不得在"报道"前添加日期。若来源"{source_label}"是英文域名或英文名，必须按对照表译为中文，严禁直接写英文
+5. 若素材来自公众号且转述外网消息，优先采用素材中可核验的外网第一信源；无法找到第一信源时写"据XX公众号报道，"，不加日期
+6. 正文必须单段成文、250-350字；开头帽段用3-4行、约80-120字简述时间、主体、动作、装备数量、地点和目的，并写出与事件时间一致的M月D日
+7. 使用（1）（2）（3）分层时各层之间用句号；不用编号时写成"帽段。层意一；层意二；层意三。建议……"并以中文分号分层；结尾建议必须采用"建议持续跟踪X的要素一、要素二、要素三，针对性加强能力一、能力二、能力三能力建设"的范式
+8. 末尾信息来源每条严格填写为"XX M月D日发文《标题》"；当前来源日期线索为{pub_md}，须与原文核对后使用；凡实际引用的来源全部写全，含"路透社称""XX指出"等二次来源，多个来源之间使用中文分号"；"
+9. 《》内文章标题无论原文是否为英文均须翻译为中文；素材为外文时，正文、标题、价值点和信息来源行全部写中文，专有名词如武器型号可保留
+10. 使用PLA机关军语，从素材提炼对我军/对华影响，不得编造素材未提及的具体数据、来源或日期
 
 直接输出要讯全文，不要任何解释说明。"""
 
@@ -972,7 +1012,487 @@ def _build_user_prompt(title: str, body: str, source: str = "", url: str = "", p
 # 卡片构建
 # ════════════════════════════════════════════════════════════
 
-def _build_brief_card(brief_text: str, source_info: dict) -> dict:
+_BRIEF_RELATIVE_EVENT_WORDS = (
+    "近期", "近日", "日前", "最近", "当前", "本月", "上月", "本周", "上周",
+    "今年", "去年", "今日", "昨日", "昨天", "明日",
+)
+
+_BRIEF_TITLE_ENDINGS = ("值得警惕", "值得关注")
+
+_BRIEF_EVENT_DATE_RE = re.compile(
+    r"(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
+)
+
+_BRIEF_SOURCE_ENTRY_RE = re.compile(
+    r"^(?P<name>.+?)\s*(?P<month>\d{1,2})月(?P<day>\d{1,2})日发文《(?P<title>[^》]+)》$"
+)
+
+_BRIEF_BODY_ATTRIBUTION_RE = re.compile(r"据(?P<label>[^，,。；;]{1,80}?)报道")
+
+_BRIEF_SECONDARY_SOURCE_RE = re.compile(
+    r"(?:^|[，,。；;！？!?）)])(?:同时|另据|此外|而|但)?"
+    r"(?P<name>[\u4e00-\u9fffA-Za-z0-9·]{0,24}?"
+    r"(?:广播公司|通讯社|电视台|研究院|研究所|新闻网|公众号|网站|周刊|杂志|媒体|智库|中心|网|报|社))"
+    r"(?:称|指出|表示|披露|证实|认为|报道(?:称)?|援引)"
+)
+
+_BRIEF_CONTEXT_SOURCE_RE = re.compile(
+    r"(?:另据|根据|援引|据)(?P<name>[^，,。；;]{2,40}?)"
+    r"(?:的)?(?:报道|消息|声明|数据|报告)(?:显示|称|指出|披露|证实|，|,|。|；|;|$)"
+)
+
+_BRIEF_RECIPIENT_SOURCE_RE = re.compile(
+    r"(?:消息人士|官员|知情人士|发言人)向(?P<name>[^，,。；;]{2,40}?)(?:表示|透露|称)"
+)
+
+_BRIEF_ATTRIBUTION_DATE_SUFFIX_RE = re.compile(
+    r"(?P<date>[（(]?(?:(?:\d{4}\s*年\s*)?\d{1,2}\s*月\s*\d{1,2}\s*[日号]|"
+    r"(?:\d{4}\s*[-/.]\s*)?\d{1,2}\s*[-/.]\s*\d{1,2})[）)]?)$"
+)
+
+def _brief_compact(text: str) -> str:
+    return re.sub(r"[\s，,。；;：:！？!?（）()《》“”\"'、]", "", text or "")
+
+_BRIEF_MEDIA_ALIAS_GROUPS = (
+    ("美国防务新闻", "防务新闻", "Defense News", "defensenews.com"),
+    ("美防务一号网站", "防务一号", "Defense One", "defenseone.com"),
+    ("美突破防务网", "突破防务", "Breaking Defense", "breakingdefense.com"),
+    ("美海军学会新闻网", "USNI News", "news.usni.org", "usni.org"),
+    ("路透社", "Reuters", "reuters.com"),
+    ("美联社", "AP", "Associated Press", "apnews.com"),
+    ("彭博社", "Bloomberg", "bloomberg.com"),
+    ("英国广播公司", "BBC", "bbc.com", "bbc.co.uk"),
+    ("香港南华早报", "南华早报", "South China Morning Post", "scmp.com"),
+    ("日本共同社", "共同社", "Kyodo News", "kyodonews.net"),
+    ("韩联社", "Yonhap", "yna.co.kr"),
+    ("日本经济新闻", "Nikkei", "Nikkei Asia", "nikkei.com"),
+    ("英国金融时报", "金融时报", "Financial Times", "ft.com"),
+)
+
+_BRIEF_ENGLISH_MONTHS = (
+    (1, "January", "Jan"), (2, "February", "Feb"), (3, "March", "Mar"),
+    (4, "April", "Apr"), (5, "May", "May"), (6, "June", "Jun"),
+    (7, "July", "Jul"), (8, "August", "Aug"), (9, "September", "Sep", "Sept"),
+    (10, "October", "Oct"), (11, "November", "Nov"), (12, "December", "Dec"),
+)
+
+def _brief_parse_date_value(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    normalized = re.sub(r"\s+", " ", raw)
+    for fmt in (
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日",
+        "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    match = re.search(r"(?P<year>\d{4})[-/.年](?P<month>\d{1,2})[-/.月](?P<day>\d{1,2})(?:日)?", raw)
+    if match:
+        try:
+            return datetime(int(match.group("year")), int(match.group("month")), int(match.group("day")))
+        except ValueError:
+            return None
+    return None
+
+def _brief_month_day_supported(text: str, month: int, day: int) -> bool:
+    haystack = str(text or "")
+    if re.search(rf"(?<!\d)0?{month}\s*月\s*0?{day}\s*[日号](?!\d)", haystack):
+        return True
+    if re.search(rf"(?<!\d)0?{month}\s*[-/.]\s*0?{day}(?!\d)", haystack):
+        return True
+    for number, *names in _BRIEF_ENGLISH_MONTHS:
+        if number != month:
+            continue
+        month_names = "|".join(map(re.escape, names))
+        if re.search(rf"\b(?:{month_names})\.?\s+0?{day}(?:st|nd|rd|th)?\b", haystack, re.I):
+            return True
+        if re.search(rf"\b0?{day}(?:st|nd|rd|th)?\s+(?:{month_names})\.?\b", haystack, re.I):
+            return True
+    return False
+
+def _brief_event_date_supported(text: str, year: int, month: int, day: int,
+                                publication_year: int | None = None) -> bool:
+    haystack = str(text or "")
+    if re.search(rf"(?<!\d){year}\s*年\s*0?{month}\s*月\s*0?{day}\s*[日号](?!\d)", haystack):
+        return True
+    if re.search(rf"(?<!\d){year}\s*[-/.]\s*0?{month}\s*[-/.]\s*0?{day}(?!\d)", haystack):
+        return True
+    for number, *names in _BRIEF_ENGLISH_MONTHS:
+        if number != month:
+            continue
+        month_names = "|".join(map(re.escape, names))
+        if re.search(rf"\b(?:{month_names})\.?\s+0?{day}(?:st|nd|rd|th)?,?\s+{year}\b", haystack, re.I):
+            return True
+        if re.search(rf"\b0?{day}(?:st|nd|rd|th)?\s+(?:{month_names})\.?,?\s+{year}\b", haystack, re.I):
+            return True
+    year_is_supported = publication_year == year or re.search(rf"(?<!\d){year}(?!\d)", haystack)
+    return bool(year_is_supported and _brief_month_day_supported(haystack, month, day))
+
+def _brief_source_aliases(name: str, url: str = "") -> set[str]:
+    aliases = {str(name or "").strip()}
+    host = (urlparse(url).hostname or "") if url else ""
+    compact_name = _brief_compact(name).casefold()
+    for group in _BRIEF_MEDIA_ALIAS_GROUPS:
+        compact_group = {_brief_compact(item).casefold() for item in group}
+        domains = {item.casefold() for item in group if "." in item}
+        if compact_name in compact_group or any(host.casefold().endswith(domain) for domain in domains):
+            aliases.update(group)
+    return {item for item in aliases if item}
+
+def _brief_name_supported_in_material(name: str, material_text: str) -> bool:
+    material = _brief_compact(material_text).casefold()
+    return any(
+        _brief_compact(alias).casefold() in material
+        for alias in _brief_source_aliases(name)
+        if _brief_compact(alias)
+    )
+
+def _brief_evidence(*, material_text: str, source_name: str = "", source_title: str = "",
+                    publication_date="", publication_date_verified: bool = False,
+                    url: str = "") -> dict:
+    parsed_publication_date = _brief_parse_date_value(publication_date)
+    return {
+        "material_text": str(material_text or ""),
+        "source_name": str(source_name or "").strip(),
+        "source_aliases": sorted(_brief_source_aliases(source_name, url)),
+        "source_title": str(source_title or "").strip(),
+        "publication_date": parsed_publication_date.isoformat() if parsed_publication_date else "",
+        "publication_date_verified": bool(publication_date_verified and parsed_publication_date),
+        "url": str(url or ""),
+    }
+
+def _brief_char_count(text: str) -> int:
+    return len(re.sub(r"\s", "", text or ""))
+
+def _parse_brief_for_validation(brief: str) -> dict:
+    """严格解析六部分要讯；不使用DOCX解析器的自动填充兜底。"""
+    lines = [line.rstrip() for line in (brief or "").strip().splitlines()]
+    parsed = {
+        "event_time": "", "value_point": "", "title": "",
+        "body": "", "source": "", "reporter": "", "unexpected_lines": [],
+    }
+    title_lines, body_lines = [], []
+    state = "meta"
+    for line in lines:
+        text = line.strip()
+        if not text:
+            if state == "meta":
+                state = "title"
+            elif state == "title" and title_lines:
+                state = "body"
+            continue
+        if text.startswith("事件时间"):
+            parsed["event_time"] = (
+                text.split("：", 1)[1].strip()
+                if "：" in text else text.replace("事件时间", "", 1).strip()
+            )
+            state = "meta"
+            continue
+        if text.startswith("价 值 点") or text.startswith("价值点"):
+            parsed["value_point"] = text.split("：", 1)[1].strip() if "：" in text else ""
+            state = "meta"
+            continue
+        if text.startswith("（信息来源") or text.startswith("(信息来源"):
+            if parsed["source"]:
+                parsed["unexpected_lines"].append(text)
+            else:
+                parsed["source"] = text
+            state = "done"
+            continue
+        if text.startswith("报送人"):
+            if state != "done" or parsed["reporter"]:
+                parsed["unexpected_lines"].append(text)
+            else:
+                parsed["reporter"] = text
+            state = "reported"
+            continue
+        if state in ("done", "reported"):
+            parsed["unexpected_lines"].append(text)
+            continue
+        if state == "title":
+            title_lines.append(text)
+        elif state in ("meta", "body"):
+            state = "body"
+            body_lines.append(text)
+    parsed["title"] = "".join(title_lines)
+    parsed["body"] = "".join(body_lines)
+    return parsed
+
+def _parse_brief_source_entries(source: str) -> tuple[list[dict], list[str], str]:
+    raw = (source or "").strip()
+    raw = re.sub(r"^[（(]?\s*信息来源\s*[:：]\s*", "", raw)
+    raw = re.sub(r"\s*[）)]\s*$", "", raw)
+    parts = [part.strip() for part in re.split(r"[；;]", raw) if part.strip()]
+    entries, invalid = [], []
+    for part in parts:
+        match = _BRIEF_SOURCE_ENTRY_RE.fullmatch(part)
+        if not match:
+            invalid.append(part)
+            continue
+        month, day = int(match.group("month")), int(match.group("day"))
+        try:
+            datetime(2000, month, day)
+        except ValueError:
+            invalid.append(part)
+            continue
+        entries.append({"name": match.group("name").strip(), "month": month, "day": day})
+    return entries, invalid, raw
+
+def _brief_body_attributions(body: str) -> list[dict]:
+    attributions = []
+    for match in _BRIEF_BODY_ATTRIBUTION_RE.finditer(body or ""):
+        label = match.group("label").strip()
+        date_match = _BRIEF_ATTRIBUTION_DATE_SUFFIX_RE.search(label)
+        if date_match:
+            name = label[:date_match.start()].strip()
+            date = date_match.group("date")
+        else:
+            name, date = label, ""
+        attributions.append({
+            "name": name,
+            "date": date,
+            "has_relative_date": any(word in label for word in _BRIEF_RELATIVE_EVENT_WORDS),
+        })
+    return attributions
+
+def _validate_brief_text(brief: str, evidence: dict | None = None) -> dict:
+    """执行独立云端飞书发送前的轻量机械规则校验。"""
+    parsed = _parse_brief_for_validation(brief)
+    errors = []
+    event_time = parsed["event_time"]
+    value_point = parsed["value_point"]
+    title = parsed["title"]
+    body = parsed["body"]
+    source = parsed["source"]
+    reporter = parsed["reporter"]
+    event_month_day = None
+    event_ymd = None
+
+    for field, label in (
+        (event_time, "事件时间"), (value_point, "价值点"), (title, "标题"),
+        (body, "正文"), (source, "信息来源"), (reporter, "报送人电话行"),
+    ):
+        if not field:
+            errors.append(f"缺少{label}")
+
+    if event_time:
+        if any(word in event_time for word in _BRIEF_RELATIVE_EVENT_WORDS):
+            errors.append("事件时间不得使用相对表述")
+        date_match = _BRIEF_EVENT_DATE_RE.fullmatch(event_time.strip())
+        if not date_match:
+            errors.append("事件时间必须写成有效的YYYY年M月D日")
+        else:
+            try:
+                year = int(date_match.group("year"))
+                month = int(date_match.group("month"))
+                day = int(date_match.group("day"))
+                datetime(
+                    year, month, day,
+                )
+                event_month_day = (month, day)
+                event_ymd = (year, month, day)
+            except ValueError:
+                errors.append("事件时间不是有效日期")
+
+    if title and value_point:
+        compact_title = _brief_compact(title)
+        title_core = title
+        for ending in _BRIEF_TITLE_ENDINGS:
+            if title_core.endswith(ending):
+                title_core = title_core[:-len(ending)]
+                break
+        compact_core = _brief_compact(title_core)
+        compact_value = _brief_compact(value_point)
+        similarity = SequenceMatcher(None, compact_core, compact_value, autojunk=False).ratio() if compact_core else 0.0
+        if (
+            compact_title and compact_title in compact_value
+            or compact_core and compact_value == compact_core
+            or compact_core and compact_value.startswith(compact_core) and len(compact_value) - len(compact_core) < 8
+            or compact_core and len(compact_value) <= len(compact_core) + 6 and similarity >= 0.85
+        ):
+            errors.append("价值点不得复制标题")
+
+    if title:
+        if not 8 <= len(title) <= 15:
+            errors.append("标题必须控制在8-15字")
+        if re.search(r"[，,]", title):
+            errors.append("标题不得含中英文逗号")
+        if not title.endswith(_BRIEF_TITLE_ENDINGS):
+            errors.append("标题必须以值得警惕或值得关注收尾")
+
+    body_chars = _brief_char_count(body)
+    if body and not 250 <= body_chars <= 350:
+        errors.append("正文必须控制在250-350字")
+
+    numbered_body = body.replace("(1)", "（1）").replace("(2)", "（2）").replace("(3)", "（3）")
+    markers = ("（1）", "（2）", "（3）")
+    marker_counts = [numbered_body.count(marker) for marker in markers]
+    hat = ""
+    if body and any(marker_counts):
+        if not all(count == 1 for count in marker_counts):
+            errors.append("编号正文必须完整使用（1）（2）（3）分层")
+        else:
+            point_one = numbered_body.index("（1）")
+            point_two = numbered_body.index("（2）")
+            point_three = numbered_body.index("（3）")
+            if not point_one < point_two < point_three:
+                errors.append("正文（1）（2）（3）分层顺序错误")
+            elif (
+                not numbered_body[:point_two].rstrip().endswith("。")
+                or not numbered_body[:point_three].rstrip().endswith("。")
+            ):
+                errors.append("编号各层之间必须使用句号")
+            point_three_text = numbered_body[point_three + len("（3）"):]
+            if "建议" in point_three_text and "。建议" not in point_three_text:
+                errors.append("第（3）层与建议句之间必须使用句号")
+            hat = numbered_body[:point_one].strip()
+    elif body:
+        suggest_start = body.rfind("。建议")
+        layer_separators = [
+            match.start() for match in re.finditer("；", body[:suggest_start])
+        ] if suggest_start >= 0 else []
+        first_layer_separator = layer_separators[-2] if len(layer_separators) >= 2 else -1
+        hat_end = body.rfind("。", 0, first_layer_separator) if first_layer_separator >= 0 else -1
+        if hat_end < 0 or suggest_start <= hat_end:
+            errors.append("无编号正文须写成帽段。层意一；层意二；层意三。建议…")
+        else:
+            hat = body[:hat_end + 1].strip()
+            unnumbered_analysis = body[hat_end + 1:suggest_start]
+            unnumbered_layers = [part.strip() for part in unnumbered_analysis.split("；")]
+            if (
+                len(unnumbered_layers) < 3
+                or not all(unnumbered_layers)
+                or ";" in unnumbered_analysis
+            ):
+                errors.append("无编号正文各层之间必须使用中文分号")
+
+    if hat:
+        if not 80 <= _brief_char_count(hat) <= 120:
+            errors.append("帽段必须控制在80-120字")
+        if event_month_day:
+            month, day = event_month_day
+            if not re.search(rf"(?<!\d)0?{month}月0?{day}日", hat):
+                errors.append("帽段必须出现与事件时间一致的M月D日")
+    elif body:
+        errors.append("无法识别帽段")
+
+    if body and not all(
+        phrase in body for phrase in ("建议持续跟踪", "针对性加强", "能力建设")
+    ):
+        errors.append("建议句未采用固定范式")
+
+    source_entries, invalid_source_entries, source_raw = _parse_brief_source_entries(source)
+    if parsed["unexpected_lines"]:
+        errors.append("信息来源须全部写在同一行")
+    if source and (invalid_source_entries or not source_entries):
+        errors.append("信息来源须逐条完整填写")
+    if ";" in source_raw:
+        errors.append("多个信息来源须使用中文分号")
+
+    attributions = _brief_body_attributions(body)
+    secondary_sources = set()
+    for pattern in (
+        _BRIEF_SECONDARY_SOURCE_RE,
+        _BRIEF_CONTEXT_SOURCE_RE,
+        _BRIEF_RECIPIENT_SOURCE_RE,
+    ):
+        secondary_sources.update(
+            match.group("name").strip() for match in pattern.finditer(body or "")
+        )
+    if body and not re.match(r"^据[^，,。；;]{1,80}?报道[，,]", body):
+        errors.append("正文必须以据XX报道开头")
+    source_names = {entry["name"].strip() for entry in source_entries}
+    if attributions and source_entries:
+        if attributions[0]["name"].strip() != source_entries[0]["name"].strip():
+            errors.append("帽段据XX报道须与信息来源第一条一致")
+    for attribution in attributions:
+        if attribution["date"] or attribution["has_relative_date"]:
+            errors.append("据XX报道归属中不得添加发文日期或相对时间")
+        if source_names and attribution["name"].strip() not in source_names:
+            errors.append("正文来源与信息来源行不一致")
+    if source_names and any(name not in source_names for name in secondary_sources):
+        errors.append("正文二次来源须全部列入信息来源行")
+    if body and not attributions:
+        errors.append("正文缺少据XX报道来源归属")
+
+    if evidence is not None:
+        material_text = str(evidence.get("material_text") or "")
+        publication_date = _brief_parse_date_value(evidence.get("publication_date"))
+        publication_verified = bool(evidence.get("publication_date_verified"))
+        publication_year = publication_date.year if publication_verified and publication_date else None
+        if event_ymd and not _brief_event_date_supported(
+            material_text, *event_ymd, publication_year=publication_year,
+        ):
+            errors.append("事件时间未在原始素材中获得对应日期证据")
+        if source_entries:
+            first_entry = source_entries[0]
+            first_name_key = _brief_compact(first_entry["name"]).casefold()
+            expected_aliases = {
+                _brief_compact(alias).casefold()
+                for alias in evidence.get("source_aliases") or []
+                if _brief_compact(alias)
+            }
+            primary_matches_expected = bool(expected_aliases and first_name_key in expected_aliases)
+            if not (
+                primary_matches_expected
+                or _brief_name_supported_in_material(first_entry["name"], material_text)
+            ):
+                errors.append("信息来源第一条名称未在输入来源或原始素材中获得支持")
+            if primary_matches_expected:
+                if not publication_verified:
+                    errors.append("输入来源缺少可核实的发文日期，不能生成信息来源行")
+                elif (
+                    first_entry["month"] != publication_date.month
+                    or first_entry["day"] != publication_date.day
+                ):
+                    errors.append("信息来源第一条发文日期与输入来源发布日期不一致")
+            elif not _brief_month_day_supported(
+                material_text, first_entry["month"], first_entry["day"]
+            ):
+                errors.append("第一信源发文日期未在原始素材中获得支持")
+            unsupported_sources = [
+                entry["name"]
+                for entry in source_entries[1:]
+                if not (
+                    _brief_name_supported_in_material(entry["name"], material_text)
+                    and _brief_month_day_supported(material_text, entry["month"], entry["day"])
+                )
+            ]
+            if unsupported_sources:
+                errors.append("以下引用来源缺少名称和发文日期证据：" + "、".join(unsupported_sources[:5]))
+    if reporter and not re.fullmatch(r"报送人：\s*电话：\s*", reporter):
+        errors.append("报送人和电话必须留空待填")
+
+    return {"valid": not errors, "errors": list(dict.fromkeys(errors)), "parsed": parsed}
+
+def _brief_validation_error_text(validation: dict) -> str:
+    errors = validation.get("errors") or ["格式不完整"]
+    shown = errors[:3]
+    suffix = f"；另有{len(errors) - len(shown)}项" if len(errors) > len(shown) else ""
+    return f"要讯校验未通过：{'；'.join(shown)}{suffix}"
+
+def _validate_brief_before_send(chat_id: str, brief: str, evidence: dict | None = None) -> bool:
+    validation = _validate_brief_text(brief, evidence=evidence)
+    if validation["valid"]:
+        return True
+    logger.warning("要讯发送被机械校验阻断: %s", " | ".join(validation["errors"]))
+    send_text(chat_id, _brief_validation_error_text(validation))
+    return False
+
+def _build_brief_card(brief_text: str, source_info: dict,
+                      evidence: dict | None = None) -> dict:
+    validation = _validate_brief_text(brief_text, evidence=evidence)
+    if not validation["valid"]:
+        raise ValueError(_brief_validation_error_text(validation))
     title = (source_info.get("title") or "防务要讯")[:60]
     source = source_info.get("source", "")
     url = source_info.get("url", "")
@@ -1088,11 +1608,10 @@ def _add_para(doc, align=None, left_indent=None, first_indent=None):
 
 
 def _parse_brief_sections(text: str) -> dict:
-    """解析 AI 输出为六部分结构，带健壮的 fallback。
-    即使 AI 输出格式不规范（缺少标签行、段落混乱），也能尽量提取可用内容。"""
+    """解析已通过门禁的六部分要讯；缺项时失败关闭。"""
     lines = text.strip().split('\n')
     sec = {'event_time': '', 'value_point': '', 'title': '',
-           'body': '', 'source': '', 'reporter': '报送人：           电话：'}
+           'body': '', 'source': '', 'reporter': ''}
     remaining = []
     for line in lines:
         s = line.strip()
@@ -1116,25 +1635,16 @@ def _parse_brief_sections(text: str) -> dict:
         title_parts = [non_empty[i] for i in range(len(non_empty)) if i != longest_idx]
         sec['title'] = ''.join(title_parts)
 
-    # ── Fallback 兜底：如果关键字段缺失，用可用内容填补 ──
-    if not sec['event_time']:
-        now = time.localtime()
-        sec['event_time'] = f"事件时间：{now.tm_year:04d}年{now.tm_mon:02d}月{now.tm_mday:02d}日"
-        logger.warning("AI 输出缺少'事件时间'行，已自动填充今日日期")
-    if not sec['title'] and sec['body']:
-        # 从正文截取前 20 字作为标题
-        sec['title'] = sec['body'][:20].rstrip('，。、；') + "值得关注"
-        logger.warning("AI 输出缺少标题，已从正文截取")
-    if not sec['body']:
-        # 极端情况：所有内容都被分类到结构字段，正文为空
-        sec['body'] = text.strip()[:500]
-        logger.warning("AI 输出无法解析正文段落，已将全文作为正文")
-    if not sec['source']:
-        logger.warning("AI 输出缺少'信息来源'行")
+    missing = [name for name, value in sec.items() if not value]
+    if missing:
+        raise ValueError("要讯结构不完整，不能生成DOCX：" + "、".join(missing))
     return sec
 
 
-def _generate_brief_docx(brief_text: str) -> bytes:
+def _generate_brief_docx(brief_text: str, evidence: dict | None = None) -> bytes:
+    validation = _validate_brief_text(brief_text, evidence=evidence)
+    if not validation["valid"]:
+        raise ValueError(_brief_validation_error_text(validation))
     sec = _parse_brief_sections(brief_text)
     doc = DocxDocument()
     section = doc.sections[0]
@@ -1278,18 +1788,25 @@ def _process_async(chat_id: str, text: str):
 
         if url:
             # 缓存命中 → 直接返回（省钱）
-            cached_result, cached_info = _cache_get(url)
-            if cached_result:
+            cached_result, cached_info, cached_evidence = _cache_get(url)
+            if cached_result and cached_evidence:
+                if not _validate_brief_before_send(chat_id, cached_result, cached_evidence):
+                    return
                 send_text(chat_id, "（命中缓存，秒回）")
-                send_card(chat_id, _build_brief_card(cached_result, cached_info))
+                send_card(chat_id, _build_brief_card(cached_result, cached_info, cached_evidence))
                 _session_set(chat_id, {
                     "source_info": cached_info,
+                    "evidence": cached_evidence,
                     "current_draft": cached_result,
                     "messages": [
                         {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
                         {"role": "user", "content": _build_user_prompt(
-                            title=cached_info.get("title", ""), body="（缓存命中，原始正文不可用）",
-                            source=cached_info.get("source", ""), url=cached_info.get("url", ""))},
+                            title=cached_info.get("title", ""),
+                            body=cached_evidence.get("material_text", ""),
+                            source=cached_info.get("source", ""),
+                            url=cached_info.get("url", ""),
+                            pub_date=cached_info.get("pub_date", ""),
+                        )},
                         {"role": "assistant", "content": cached_result},
                     ],
                 })
@@ -1306,11 +1823,23 @@ def _process_async(chat_id: str, text: str):
             if not body or len(body) < 50:
                 send_card(chat_id, _build_error_card(f"无法提取页面正文（字符数：{len(body)}）\n链接：{url}"))
                 return
+            if not _brief_parse_date_value(extracted.get("pub_date")):
+                send_text(chat_id, "页面未提取到可核实的发文日期，无法生成完整信息来源行。")
+                return
             source_info = {
                 "title": extracted.get("title", url[:60]),
                 "source": extracted.get("source", ""),
                 "url": url,
+                "pub_date": extracted.get("pub_date", ""),
             }
+            evidence = _brief_evidence(
+                material_text="\n".join(filter(None, [extracted.get("title"), body])),
+                source_name=extracted.get("source", ""),
+                source_title=extracted.get("title", ""),
+                publication_date=extracted.get("pub_date", ""),
+                publication_date_verified=True,
+                url=url,
+            )
             prompt = _build_user_prompt(
                 title=extracted.get("title", ""),
                 body=body,
@@ -1323,7 +1852,8 @@ def _process_async(chat_id: str, text: str):
             url = None
             send_text(chat_id, "正在根据文本内容生成要讯，请稍候...")
             source_info = {"title": text[:40], "source": "用户导入", "url": ""}
-            prompt = _build_user_prompt(title=text[:40], body=text, source="用户导入")
+            evidence = _brief_evidence(material_text=text)
+            prompt = _build_user_prompt(title=text[:40], body=text)
 
         else:
             send_text(chat_id,
@@ -1341,11 +1871,14 @@ def _process_async(chat_id: str, text: str):
             ]
             result = _call_ai(messages)
 
-        send_card(chat_id, _build_brief_card(result, source_info))
+        if not _validate_brief_before_send(chat_id, result, evidence):
+            return
+        send_card(chat_id, _build_brief_card(result, source_info, evidence))
 
         # 保存交互会话（支持后续多轮优化）
         _session_set(chat_id, {
             "source_info": source_info,
+            "evidence": evidence,
             "current_draft": result,
             "original_prompt": prompt,
             "messages": [
@@ -1357,7 +1890,7 @@ def _process_async(chat_id: str, text: str):
 
         # 生成 DOCX 并发送
         try:
-            docx_bytes = _generate_brief_docx(result)
+            docx_bytes = _generate_brief_docx(result, evidence)
             title_short = (source_info.get("title") or "防务要讯")[:30]
             ts = time.strftime("%Y%m%d_%H%M")
             file_name = f"要讯_{title_short}_{ts}.docx"
@@ -1369,7 +1902,7 @@ def _process_async(chat_id: str, text: str):
 
         # 写入缓存 + 历史
         if url:
-            _cache_set(url, result, source_info)
+            _cache_set(url, result, source_info, evidence)
         _history_add(source_info.get("title", ""), source_info.get("source", ""),
                      source_info.get("url", ""), result)
 
@@ -1389,24 +1922,40 @@ def _process_image_async(chat_id: str, image_key: str):
         if img_bytes[:8] == b'\x89PNG\r\n\x1a\n':
             media_type = "image/png"
 
-        prompt = (
-            "这是一张防务/军事新闻截图。请：\n"
-            "1. 提取图片中的所有文字内容\n"
-            "2. 基于提取的内容，撰写一份PLA机关军语要讯\n"
-            "格式要求：事件时间/价值点/标题（警示词收尾）/正文（250-350字，(1)(2)(3)分列）/信息来源/报送人电话行\n"
-            "直接输出要讯全文。"
+        ocr_prompt = (
+            "逐字转录这张新闻截图中可见的全部文字，包括媒体名称、文章标题、发文日期和正文日期。"
+            "看不清的字符写[无法辨认]，不得补写、推断或概括。只输出转录文本。"
         )
         with _ai_semaphore:
-            result = _call_ai_with_image(img_b64, media_type, prompt)
+            ocr_text = _call_ai_with_image(
+                img_b64,
+                media_type,
+                ocr_prompt,
+                system_prompt="你是严格的OCR转录器，只记录图片中可见文字，不推断任何缺失内容。",
+            )
+        if len((ocr_text or "").strip()) < 30:
+            send_text(chat_id, "图片可核验文字不足，无法生成要讯。")
+            return
+        prompt = _build_user_prompt(title="图片新闻截图", body=ocr_text)
+        with _ai_semaphore:
+            result = _call_ai([
+                {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
+                {"role": "user", "content": prompt},
+            ])
 
         source_info = {"title": "图片识别生成", "source": "图片导入", "url": ""}
-        send_card(chat_id, _build_brief_card(result, source_info))
+        evidence = _brief_evidence(material_text=ocr_text)
+        if not _validate_brief_before_send(chat_id, result, evidence):
+            return
+        send_card(chat_id, _build_brief_card(result, source_info, evidence))
         _session_set(chat_id, {
             "source_info": source_info,
+            "evidence": evidence,
             "current_draft": result,
+            "original_prompt": prompt,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT_BRIEF_WRITE},
-                {"role": "user", "content": "（基于图片识别内容）请生成防务要讯"},
+                {"role": "user", "content": prompt},
                 {"role": "assistant", "content": result},
             ],
         })
@@ -1459,7 +2008,8 @@ def _process_file_async(chat_id: str, message_id: str, file_key: str, file_name:
             return
 
         source_info = {"title": file_name, "source": source_type, "url": ""}
-        prompt = _build_user_prompt(title=file_name, body=text, source=source_type)
+        evidence = _brief_evidence(material_text=text)
+        prompt = _build_user_prompt(title=file_name, body=text)
 
         with _ai_semaphore:
             messages = [
@@ -1468,9 +2018,12 @@ def _process_file_async(chat_id: str, message_id: str, file_key: str, file_name:
             ]
             result = _call_ai(messages)
 
-        send_card(chat_id, _build_brief_card(result, source_info))
+        if not _validate_brief_before_send(chat_id, result, evidence):
+            return
+        send_card(chat_id, _build_brief_card(result, source_info, evidence))
         _session_set(chat_id, {
             "source_info": source_info,
+            "evidence": evidence,
             "current_draft": result,
             "original_prompt": prompt,
             "messages": [
@@ -1513,15 +2066,21 @@ def _refine_async(chat_id: str, instruction: str):
     if not session:
         send_text(chat_id, "当前没有进行中的要讯会话，请先发送文章或链接生成要讯。")
         return
+    evidence = session.get("evidence")
+    if not evidence:
+        send_text(chat_id, "当前会话缺少原始素材证据，请重新发送文章、文件或图片后再调整。")
+        return
     try:
         send_text(chat_id, "正在按您的要求调整要讯，请稍候...")
         messages = session["messages"] + [{"role": "user", "content": instruction}]
         with _ai_semaphore:
             result = _call_ai(messages)
+        if not _validate_brief_before_send(chat_id, result, evidence):
+            return
         session["current_draft"] = result
         session["messages"] = messages + [{"role": "assistant", "content": result}]
         _session_set(chat_id, session)
-        send_card(chat_id, _build_brief_card(result, session["source_info"]))
+        send_card(chat_id, _build_brief_card(result, session["source_info"], evidence))
     except Exception as e:
         logger.error("细化要讯异常: %s", e, exc_info=True)
         send_card(chat_id, _build_error_card(f"调整失败：{str(e)[:120]}"))
@@ -1533,9 +2092,15 @@ def _export_docx_async(chat_id: str):
     if not session:
         send_text(chat_id, "当前没有进行中的要讯会话，请先发送文章或链接生成要讯。")
         return
+    evidence = session.get("evidence")
+    if not evidence:
+        send_text(chat_id, "当前会话缺少原始素材证据，已阻止导出；请重新生成要讯。")
+        return
     try:
         draft = session["current_draft"]
-        docx_bytes = _generate_brief_docx(draft)
+        if not _validate_brief_before_send(chat_id, draft, evidence):
+            return
+        docx_bytes = _generate_brief_docx(draft, evidence)
         custom = session.get("custom_filename")
         if custom:
             file_name = custom if custom.lower().endswith(".docx") else f"{custom}.docx"
@@ -1556,12 +2121,15 @@ def _regenerate_async(chat_id: str):
     if not session:
         send_text(chat_id, "当前没有进行中的要讯会话，请先发送文章或链接生成要讯。")
         return
+    evidence = session.get("evidence")
+    if not evidence:
+        send_text(chat_id, "当前会话缺少原始素材证据，请重新发送原始材料。")
+        return
     original_prompt = session.get("original_prompt")
     if not original_prompt:
         send_text(chat_id, "图片会话暂不支持重新生成，请重新发送图片。")
         return
     source_info = session["source_info"]
-    _session_clear(chat_id)
     try:
         send_text(chat_id, "正在重新生成要讯（丢弃所有修改历史）...")
         with _ai_semaphore:
@@ -1570,9 +2138,13 @@ def _regenerate_async(chat_id: str):
                 {"role": "user", "content": original_prompt},
             ]
             result = _call_ai(messages)
-        send_card(chat_id, _build_brief_card(result, source_info))
+        if not _validate_brief_before_send(chat_id, result, evidence):
+            return
+        _session_clear(chat_id)
+        send_card(chat_id, _build_brief_card(result, source_info, evidence))
         _session_set(chat_id, {
             "source_info": source_info,
+            "evidence": evidence,
             "current_draft": result,
             "original_prompt": original_prompt,
             "messages": [
@@ -1714,8 +2286,16 @@ def _rss_push_job():
                         continue
                     extracted = _extract_url_content(art["link"])
                     body = extracted.get("body", "")
-                    if len(body) < 50:
+                    if len(body) < 50 or not _brief_parse_date_value(extracted.get("pub_date")):
                         continue
+                    evidence = _brief_evidence(
+                        material_text="\n".join(filter(None, [extracted.get("title"), body])),
+                        source_name=extracted.get("source", art["source"]),
+                        source_title=extracted.get("title", art["title"]),
+                        publication_date=extracted.get("pub_date", ""),
+                        publication_date_verified=True,
+                        url=art["link"],
+                    )
                     prompt = _build_user_prompt(
                         title=extracted.get("title", art["title"]),
                         body=body,
@@ -1728,8 +2308,13 @@ def _rss_push_job():
                         {"role": "user", "content": prompt},
                     ]
                     result = _call_ai(messages)
-                    source_info = {"title": art["title"], "source": art["source"], "url": art["link"]}
-                    send_card(chat_id, _build_brief_card(result, source_info))
+                    source_info = {
+                        "title": art["title"], "source": art["source"], "url": art["link"],
+                        "pub_date": extracted.get("pub_date", ""),
+                    }
+                    if not _validate_brief_before_send(chat_id, result, evidence):
+                        continue
+                    send_card(chat_id, _build_brief_card(result, source_info, evidence))
                     with _pushed_lock:
                         _pushed_urls.add(art["link"])
                     time.sleep(3)
@@ -1808,9 +2393,8 @@ def health():
 
 @app.route("/api/history")
 def api_history():
-    """查看生成历史（最近 100 条）"""
-    with _history_lock:
-        return jsonify({"count": len(_history), "items": list(reversed(_history))})
+    """历史正文不通过未认证 HTTP 接口公开。"""
+    return jsonify({"error": "history endpoint disabled"}), 404
 
 
 @app.route("/api/cache/stats")
@@ -1825,9 +2409,17 @@ def feishu_webhook():
     """飞书事件订阅回调入口"""
     raw_body = request.get_data()
     data = request.get_json(silent=True) or {}
+    verify_token = str(FEISHU_CONFIG.get("verify_token") or "").strip()
+    if not verify_token:
+        logger.error("webhook verification token is not configured")
+        return jsonify({"code": 1, "msg": "webhook verification not configured"}), 503
 
     # URL 验证（首次注册 webhook 时飞书发来）
     if data.get("type") == "url_verification":
+        incoming_token = str(data.get("token") or "")
+        if not hmac.compare_digest(verify_token, incoming_token):
+            logger.warning("URL verification token invalid")
+            return jsonify({"code": 1, "msg": "invalid token"}), 403
         logger.info("URL verification OK")
         return jsonify({"challenge": data.get("challenge", "")})
 
@@ -1846,12 +2438,10 @@ def feishu_webhook():
     event_type = header.get("event_type", "")
 
     # Verification Token 校验（飞书在 header.token 中传入）
-    verify_token = FEISHU_CONFIG.get("verify_token", "")
-    if verify_token:
-        incoming_token = header.get("token", "")
-        if not hmac.compare_digest(verify_token, incoming_token):
-            logger.warning("Verification Token 校验失败，请求被拒绝")
-            return jsonify({"code": 1, "msg": "invalid token"}), 403
+    incoming_token = str(header.get("token") or "")
+    if not hmac.compare_digest(verify_token, incoming_token):
+        logger.warning("Verification Token 校验失败，请求被拒绝")
+        return jsonify({"code": 1, "msg": "invalid token"}), 403
     event = data.get("event", {})
 
     if event_type != "im.message.receive_v1":
@@ -2009,7 +2599,16 @@ def feishu_webhook():
             _worker_pool.submit(_export_docx_async, chat_id)
             return jsonify({"code": 0})
         elif text in ["查看", "预览", "show", "preview"]:
-            send_card(chat_id, _build_brief_card(session["current_draft"], session["source_info"]))
+            evidence = session.get("evidence")
+            if not evidence:
+                send_text(chat_id, "当前会话缺少原始素材证据，已阻止预览；请重新生成要讯。")
+                return jsonify({"code": 0})
+            if not _validate_brief_before_send(chat_id, session["current_draft"], evidence):
+                return jsonify({"code": 0})
+            send_card(
+                chat_id,
+                _build_brief_card(session["current_draft"], session["source_info"], evidence),
+            )
             return jsonify({"code": 0})
         elif text in ["重新生成", "重写", "重来", "regenerate", "重置"]:
             _worker_pool.submit(_regenerate_async, chat_id)

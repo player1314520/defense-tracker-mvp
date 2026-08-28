@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
+
+from v9.orchestration import new_agent_job, transition_agent_job
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _service(tmp_path):
@@ -37,6 +43,34 @@ def _control(service, context, job, action, **value):
     return service.list_agent_jobs(context)[0] | {
         "transition": result["transition"]
     }
+
+
+def test_generic_agent_job_cannot_bypass_dedicated_brief_writer():
+    with pytest.raises(ValueError, match="要讯专用"):
+        new_agent_job(
+            {
+                "template": "brief_draft",
+                "title": "不得绕过",
+                "evidence_ids": ["evidence-1"],
+            }
+        )
+    with pytest.raises(ValueError, match="要讯专用"):
+        transition_agent_job(
+            {
+                "template": "brief_draft",
+                "state": "queued",
+                "phase": "collect",
+            },
+            "start",
+        )
+
+
+def test_visible_agent_template_routes_briefs_to_the_dedicated_writer():
+    html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+
+    assert 'data-job-template="brief_draft"' not in html
+    assert "showTab('brief')" in html
+    assert "进入要讯专用生成与来源校验" in html
 
 
 def test_agent_job_persists_phases_and_both_human_gates(tmp_path):

@@ -1,7 +1,19 @@
 from datetime import datetime, timezone
 
+import pytest
+
 import app as tracker
 import report_agent
+
+
+@pytest.fixture(autouse=True)
+def _reset_request_rate_state():
+    """Keep API tests independent from requests made by earlier test modules."""
+    with tracker._rate_lock:
+        tracker._rate_store.clear()
+    yield
+    with tracker._rate_lock:
+        tracker._rate_store.clear()
 
 
 def _login_cookies(client, csrf="csrf-test-token"):
@@ -24,6 +36,61 @@ def _candidate():
         "quality_reasons": ["高权威信源"],
         "brief_hits": ["PLA备战"],
     }
+
+
+def _institution_candidate(index, domain):
+    return {
+        "article_id": f"institution-source-{index}",
+        "title": f"机构公开来源 {index}",
+        "summary": f"第 {index} 条可追溯公开来源摘要。",
+        "source": f"Institution {index}",
+        "source_cn": f"机构来源 {index}",
+        "link": f"https://{domain}/reports/source-{index}",
+        "date": datetime.now(timezone.utc).isoformat(),
+        "quality_score": 90,
+        "quality_level": "S",
+        "quality_reasons": ["机构公开来源"],
+        "asset_status": "archived",
+        "asset_id": f"asset-{index}",
+        "text": f"第 {index} 条已归档、可引用的公开原文正文。",
+    }
+
+
+def _ready_institution_content():
+    return """# 机构开源情报整编包
+
+## 信息清单
+- 来源一 [1]
+- 来源二 [2]
+- 来源三 [3]
+- 来源四 [4]
+- 来源五 [5]
+- 来源六 [6]
+- 来源七 [7]
+
+## 专题报告
+### 短消息一
+已核实事实：公开材料显示相关能力建设持续推进 [1][2]。
+
+### 短消息二
+多源印证：机构报告对部署节奏给出一致观察 [3][4]。
+
+### 短消息三
+分析判断：现有证据支持继续跟踪训练与保障活动 [5][6][7]。
+
+## 事实来源追溯表
+- 已核实事实对应来源 [1][2][3]
+- 多源印证对应来源 [4][5]
+- 分析判断对应来源 [6][7]
+
+## 不确定性与证据边界
+公开材料存在时间差，后续变化仍需持续核验。
+
+## 诚实边界
+1. 不能替代非公开情报核验。
+2. 不能证明未披露的内部决策。
+3. 不能保证公开网页后续持续可访问。
+"""
 
 
 def test_agent_project_create_requires_csrf_and_accepts_valid(monkeypatch, tmp_path):
@@ -355,6 +422,176 @@ def test_agent_draft_job_keeps_first_draft_when_expansion_fails(monkeypatch, tmp
     assert len(report_agent.get_project_drafts(project["project_id"])) >= 1
 
 
+def test_agent_preflight_requires_csrf(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    _login_cookies(client)
+    project = report_agent.create_project("台海交付预检", "strategic")
+
+    blocked = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={},
+    )
+
+    assert blocked.status_code == 403
+    assert "CSRF" in blocked.get_json()["error"]
+
+
+def test_agent_preflight_returns_ready_payload(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("机构公开源情报整编包", "institution_pack")
+    domains = [
+        "defense.gov",
+        "congress.gov",
+        "gao.gov",
+        "rand.org",
+        "csis.org",
+        "iiss.org",
+        "sipri.org",
+    ]
+    evidence = report_agent.upsert_project_evidence(
+        project["project_id"],
+        [_institution_candidate(i, domain) for i, domain in enumerate(domains, 1)],
+    )
+    draft = report_agent.save_draft(
+        project["project_id"], "draft", "待替换的旧正文", model="unit-model"
+    )
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={
+            "draft_id": draft["draft_id"],
+            "content": _ready_institution_content(),
+            "evidence_ids": [item["evidence_id"] for item in evidence],
+        },
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    data = resp.get_json()
+
+    assert resp.status_code == 200
+    assert data["ok"] is True
+    assert data["preflight"]["ok"] is True
+    assert data["preflight"]["status"] == "ready"
+    assert all(check["ok"] for check in data["preflight"]["checks"])
+
+
+def test_agent_preflight_defaults_to_latest_non_outline_draft(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    captured = {}
+
+    def fake_preflight(project, draft, evidence):
+        captured.update({"project": project, "draft": draft, "evidence": evidence})
+        return {"ok": True, "status": "ready", "checks": []}
+
+    monkeypatch.setattr(report_agent, "build_delivery_preflight", fake_preflight, raising=False)
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("台海交付预检", "strategic")
+    evidence = report_agent.upsert_project_evidence(project["project_id"], [_candidate()])
+    report_draft = report_agent.save_draft(
+        project["project_id"], "draft", "可交付正文", model="unit-model"
+    )
+    report_agent.save_draft(project["project_id"], "outline", "最新大纲", model="unit-model")
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={"evidence_ids": [evidence[0]["evidence_id"]]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert resp.status_code == 200
+    assert captured["draft"]["draft_id"] == report_draft["draft_id"]
+    assert captured["evidence"][0]["evidence_id"] == evidence[0]["evidence_id"]
+
+
+def test_agent_preflight_returns_blocked_status_for_missing_sources(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("机构公开源情报整编包", "institution_pack")
+    draft = report_agent.save_draft(
+        project["project_id"], "draft", _ready_institution_content(), model="unit-model"
+    )
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={"draft_id": draft["draft_id"]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    data = resp.get_json()
+    checks = {check["id"]: check for check in data["preflight"]["checks"]}
+
+    assert resp.status_code == 200
+    assert data["ok"] is True
+    assert data["preflight"]["ok"] is False
+    assert data["preflight"]["status"] == "blocked"
+    assert checks["sources"]["ok"] is False
+
+
+def test_agent_preflight_returns_blocked_status_for_missing_body(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("机构公开源情报整编包", "institution_pack")
+    domains = [
+        "defense.gov",
+        "congress.gov",
+        "gao.gov",
+        "rand.org",
+        "csis.org",
+        "iiss.org",
+        "sipri.org",
+    ]
+    candidates = [_institution_candidate(i, domain) for i, domain in enumerate(domains, 1)]
+    candidates[0].update({"asset_status": "metadata_only", "asset_id": "", "text": ""})
+    evidence = report_agent.upsert_project_evidence(project["project_id"], candidates)
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={
+            "content": _ready_institution_content(),
+            "evidence_ids": [item["evidence_id"] for item in evidence],
+        },
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    data = resp.get_json()
+    checks = {check["id"]: check for check in data["preflight"]["checks"]}
+
+    assert resp.status_code == 200
+    assert data["ok"] is True
+    assert data["preflight"]["ok"] is False
+    assert data["preflight"]["status"] == "blocked"
+    assert checks["content"]["ok"] is False
+
+
+def test_agent_preflight_rejects_draft_from_another_project(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("当前项目", "strategic")
+    other_project = report_agent.create_project("其他项目", "strategic")
+    other_draft = report_agent.save_draft(
+        other_project["project_id"], "draft", "其他项目正文", model="unit-model"
+    )
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={"draft_id": other_draft["draft_id"]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert resp.status_code == 400
+    assert "草稿不属于当前项目" in resp.get_json()["error"]
+
+
 def test_agent_export_docx_requires_draft_and_downloads(monkeypatch, tmp_path):
     monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
     tracker.app.config["TESTING"] = True
@@ -379,6 +616,167 @@ def test_agent_export_docx_requires_draft_and_downloads(monkeypatch, tmp_path):
     assert ok.status_code == 200
     assert ok.mimetype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     assert ok.data[:2] == b"PK"
+
+
+def test_agent_export_docx_uses_selected_institution_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("机构公开源情报整编包", "institution_pack")
+    domains = [
+        "defense.gov",
+        "congress.gov",
+        "gao.gov",
+        "rand.org",
+        "csis.org",
+        "iiss.org",
+        "sipri.org",
+        "army.mil",
+    ]
+    evidence = report_agent.upsert_project_evidence(
+        project["project_id"],
+        [_institution_candidate(i, domain) for i, domain in enumerate(domains, 1)],
+    )
+    draft = report_agent.save_draft(
+        project["project_id"], "draft", _ready_institution_content(), model="unit-model"
+    )
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/export_docx",
+        json={
+            "draft_id": draft["draft_id"],
+            "evidence_ids": [item["evidence_id"] for item in evidence[:7]],
+        },
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert resp.status_code == 200
+    assert resp.mimetype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    assert resp.data[:2] == b"PK"
+
+
+def test_agent_empty_evidence_selection_stays_empty_for_preflight_and_export(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("机构公开源情报整编包", "institution_pack")
+    domains = [
+        "defense.gov",
+        "congress.gov",
+        "gao.gov",
+        "rand.org",
+        "csis.org",
+        "iiss.org",
+        "sipri.org",
+    ]
+    report_agent.upsert_project_evidence(
+        project["project_id"],
+        [_institution_candidate(i, domain) for i, domain in enumerate(domains, 1)],
+    )
+    draft = report_agent.save_draft(
+        project["project_id"], "draft", _ready_institution_content(), model="unit-model"
+    )
+
+    preflight = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={"draft_id": draft["draft_id"], "evidence_ids": []},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    export = client.post(
+        f"/api/agent/projects/{project['project_id']}/export_docx",
+        json={"draft_id": draft["draft_id"], "evidence_ids": []},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    preflight_data = preflight.get_json()
+
+    assert preflight.status_code == 200
+    assert preflight_data["preflight"]["status"] == "blocked"
+    assert preflight_data["preflight"]["counts"]["evidence"] == 0
+    assert export.status_code == 400
+    assert "证据数量为0条" in export.get_json()["error"]
+
+
+def test_agent_missing_evidence_ids_keeps_legacy_full_set_for_preflight_and_export(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("机构公开源情报整编包", "institution_pack")
+    domains = [
+        "defense.gov",
+        "congress.gov",
+        "gao.gov",
+        "rand.org",
+        "csis.org",
+        "iiss.org",
+        "sipri.org",
+    ]
+    report_agent.upsert_project_evidence(
+        project["project_id"],
+        [_institution_candidate(i, domain) for i, domain in enumerate(domains, 1)],
+    )
+    draft = report_agent.save_draft(
+        project["project_id"], "draft", _ready_institution_content(), model="unit-model"
+    )
+
+    preflight = client.post(
+        f"/api/agent/projects/{project['project_id']}/preflight",
+        json={"draft_id": draft["draft_id"]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    export = client.post(
+        f"/api/agent/projects/{project['project_id']}/export_docx",
+        json={"draft_id": draft["draft_id"]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert preflight.status_code == 200
+    assert preflight.get_json()["preflight"]["status"] == "ready"
+    assert export.status_code == 200
+    assert export.data[:2] == b"PK"
+
+
+def test_agent_export_docx_rejects_unknown_evidence_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("台海日报", "daily")
+    draft = report_agent.save_draft(project["project_id"], "draft", "台海日报正文", model="unit-model")
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/export_docx",
+        json={"draft_id": draft["draft_id"], "evidence_ids": ["unknown-evidence-id"]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert resp.status_code == 404
+    assert "证据不存在或不属于当前项目" in resp.get_json()["error"]
+
+
+def test_agent_export_docx_rejects_evidence_from_another_project(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("当前项目", "daily")
+    other_project = report_agent.create_project("其他项目", "daily")
+    other_evidence = report_agent.upsert_project_evidence(other_project["project_id"], [_candidate()])
+    draft = report_agent.save_draft(project["project_id"], "draft", "当前项目正文", model="unit-model")
+
+    resp = client.post(
+        f"/api/agent/projects/{project['project_id']}/export_docx",
+        json={
+            "draft_id": draft["draft_id"],
+            "evidence_ids": [other_evidence[0]["evidence_id"]],
+        },
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert resp.status_code == 404
+    assert "证据不存在或不属于当前项目" in resp.get_json()["error"]
 
 
 def test_agent_export_docx_blocks_short_draft_when_target_word_count_is_large(monkeypatch, tmp_path):

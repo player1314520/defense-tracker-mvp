@@ -28,6 +28,7 @@ FORBIDDEN_PREFIXES = (
 )
 FORBIDDEN_RUNTIME_NAMES = {
     ".access_token",
+    ".brief_evidence.key",
     ".ai_config.json",
     ".ai_config.key",
     ".email_config.json",
