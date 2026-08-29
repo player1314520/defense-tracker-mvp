@@ -524,6 +524,55 @@ def test_docx_exports_reject_oversized_text_without_internal_error(endpoint):
     assert "16 KiB" in str(body)
 
 
+@pytest.mark.parametrize("endpoint", [
+    "/api/brief/export_docx",
+    "/api/brief/export_docx_compiled",
+    "/api/brief/validate",
+])
+def test_brief_endpoints_do_not_reflect_unexpected_validation_exception(
+    monkeypatch, endpoint
+):
+    private_detail = (
+        "validation failed at C:\\Users\\private\\brief.key "
+        "https://private.example.test/?token=secret\r\nTRACEBACK"
+    )
+
+    def reject_text(_brief):
+        raise ValueError(private_detail)
+
+    monkeypatch.setattr(tracker, "_enforce_brief_text_limits", reject_text)
+    monkeypatch.setattr(tracker, "_brief_open_source_evidence", lambda _value: {})
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = "brief-validation-exception-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+
+    payload = {"brief": "non-empty", "source_evidence": {}}
+    if endpoint.endswith("_compiled"):
+        payload = {"briefs": [payload]}
+
+    response = client.post(
+        endpoint,
+        json=payload,
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code == 422
+    if endpoint.endswith("_compiled"):
+        assert response.get_json() == {
+            "error": "要讯汇编校验未通过",
+            "invalid_items": [{"index": 1, "errors": ["请求参数无效"]}],
+        }
+    else:
+        assert response.get_json() == {
+            "error": "要讯校验未通过: 请求参数无效"
+        }
+    response_text = response.get_data(as_text=True)
+    assert private_detail not in response_text
+    assert "private.example.test" not in response_text
+    assert "TRACEBACK" not in response_text
+
+
 @pytest.mark.parametrize(
     "override,expected_error",
     [

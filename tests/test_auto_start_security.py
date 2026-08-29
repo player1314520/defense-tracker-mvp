@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -173,6 +174,34 @@ def test_ngrok_is_reverified_immediately_before_execution(
         auto_start.start_ngrok()
 
 
+def test_ngrok_reverification_rejects_same_size_replacement_with_restored_timestamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = _candidate(tmp_path)
+    original = trusted.read_bytes()
+    original_metadata = trusted.stat()
+    monkeypatch.setattr(auto_start.shutil, "which", lambda command: str(trusted))
+    monkeypatch.setattr(
+        auto_start,
+        "_file_identity",
+        lambda metadata: ("unchanged-metadata",),
+    )
+    auto_start._pin_ngrok_executable()
+
+    replacement = b"x" * len(original)
+    assert replacement != original
+    trusted.write_bytes(replacement)
+    os.utime(
+        trusted,
+        ns=(original_metadata.st_atime_ns, original_metadata.st_mtime_ns),
+    )
+
+    with pytest.raises(
+        auto_start.NgrokExecutableError, match="changed after resolution"
+    ):
+        auto_start._verified_ngrok_executable()
+
+
 def test_ngrok_swap_during_log_open_is_rejected_before_process_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -228,6 +257,38 @@ def test_ngrok_starts_with_the_pinned_absolute_executable(
     assert options[0]["shell"] is False
 
 
+def test_ngrok_domain_cannot_select_the_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = _candidate(tmp_path)
+    calls: list[list[str]] = []
+    options: list[dict[str, object]] = []
+
+    class Process:
+        pid = 123
+
+    monkeypatch.setattr(auto_start.shutil, "which", lambda command: str(trusted))
+    monkeypatch.setattr(auto_start, "NGROK_DOMAIN", "demo.example.test")
+    monkeypatch.setattr(auto_start, "open_log", lambda name: io.StringIO())
+    monkeypatch.setattr(
+        auto_start.subprocess,
+        "Popen",
+        lambda argv, **kwargs: (
+            calls.append(list(argv)),
+            options.append(dict(kwargs)),
+            Process(),
+        )[-1],
+    )
+
+    auto_start.start_ngrok()
+
+    assert calls == [
+        [str(trusted), "http", "5000", "--domain", "demo.example.test"]
+    ]
+    assert options[0]["executable"] == str(trusted)
+    assert options[0]["shell"] is False
+
+
 def test_ngrok_domain_remains_one_literal_argument(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -251,6 +312,14 @@ def test_ngrok_domain_remains_one_literal_argument(
         "https://demo.example.test",
         "demo.example.test/path",
         "UPPER.example.test",
+        "localhost",
+        "demo..example.test",
+        "-demo.example.test",
+        "demo-.example.test",
+        f"{'a' * 64}.example.test",
+        "demo.example.1test",
+        "demo.example.t",
+        f"demo.example.{'t' * 64}",
     ),
 )
 def test_ngrok_domain_rejects_non_dns_or_log_injection_values(
@@ -262,6 +331,27 @@ def test_ngrok_domain_rejects_non_dns_or_log_injection_values(
 
     with pytest.raises(auto_start.NgrokExecutableError, match="domain"):
         auto_start._ngrok_command()
+
+
+def test_ngrok_domain_accepts_the_maximum_dns_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = _candidate(tmp_path)
+    domain = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 61))
+    assert len(domain) == 253
+    monkeypatch.setattr(auto_start.shutil, "which", lambda command: str(trusted))
+    monkeypatch.setattr(auto_start, "NGROK_DOMAIN", domain)
+
+    assert auto_start._ngrok_command()[-1] == domain
+
+
+def test_ngrok_domain_rejects_values_over_the_dns_length_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auto_start, "NGROK_DOMAIN", "0." * 127 + "test")
+
+    with pytest.raises(auto_start.NgrokExecutableError, match="domain"):
+        auto_start._validated_ngrok_domain()
 
 
 def test_feishu_batch_uses_the_hardened_supervisor_instead_of_direct_ngrok():

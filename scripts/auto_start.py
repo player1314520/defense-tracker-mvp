@@ -9,7 +9,6 @@ import hmac
 import json
 import logging
 import os
-import re
 import secrets
 import shutil
 import signal
@@ -67,11 +66,6 @@ shutting_down = False
 _ngrok_executable = None
 _ngrok_identity = None
 _app_supervisor_secret = None
-_NGROK_DOMAIN_RE = re.compile(
-    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\Z"
-)
-
-
 class NgrokExecutableError(RuntimeError):
     """The ngrok executable could not be pinned to a safe local file."""
 
@@ -97,6 +91,14 @@ def _file_identity(metadata):
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as executable:
+        for chunk in iter(lambda: executable.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
 
 
 def _process_is_elevated():
@@ -158,6 +160,7 @@ def _validate_ngrok_executable(candidate):
             raise NgrokExecutableError(
                 "ngrok path must not contain a symlink or reparse point"
             )
+        content_digest = _file_sha256(path)
         after = os.lstat(path)
     except NgrokExecutableError:
         raise
@@ -166,7 +169,7 @@ def _validate_ngrok_executable(candidate):
 
     if _file_identity(before) != _file_identity(after):
         raise NgrokExecutableError("ngrok changed during validation")
-    return resolved, _file_identity(after)
+    return resolved, (*_file_identity(after), content_digest)
 
 
 def _pin_ngrok_executable():
@@ -195,11 +198,39 @@ def _verified_ngrok_executable():
 
 
 def _validated_ngrok_domain():
-    if not NGROK_DOMAIN:
+    domain = NGROK_DOMAIN
+    invalid_domain = "ngrok domain must be an exact lowercase DNS name"
+    if not isinstance(domain, str):
+        raise NgrokExecutableError(invalid_domain)
+    if not domain:
         return ""
-    if _NGROK_DOMAIN_RE.fullmatch(NGROK_DOMAIN) is None:
-        raise NgrokExecutableError("ngrok domain must be an exact lowercase DNS name")
-    return NGROK_DOMAIN
+    if len(domain) > 253:
+        raise NgrokExecutableError(invalid_domain)
+
+    labels = domain.split(".")
+    def is_ascii_alphanumeric(character):
+        return "a" <= character <= "z" or "0" <= character <= "9"
+
+    def is_valid_label(label):
+        return (
+            1 <= len(label) <= 63
+            and is_ascii_alphanumeric(label[0])
+            and is_ascii_alphanumeric(label[-1])
+            and all(
+                is_ascii_alphanumeric(character) or character == "-"
+                for character in label
+            )
+        )
+
+    if len(labels) < 2 or not all(is_valid_label(label) for label in labels[:-1]):
+        raise NgrokExecutableError(invalid_domain)
+
+    top_level_domain = labels[-1]
+    if not 2 <= len(top_level_domain) <= 63 or any(
+        not "a" <= character <= "z" for character in top_level_domain
+    ):
+        raise NgrokExecutableError(invalid_domain)
+    return domain
 
 
 def _ngrok_command():
@@ -333,14 +364,15 @@ def start_ngrok():
         raise
     log_file = open_log("ngrok.log")
     try:
-        command[0] = str(_verified_ngrok_executable())
+        verified_executable = str(_verified_ngrok_executable())
+        command[0] = verified_executable
     except NgrokExecutableError as exc:
         log_file.close()
         log.error("ngrok security check failed; refusing to start: %s", exc)
         raise
     ngrok_proc = subprocess.Popen(
         command,
-        executable=command[0],
+        executable=verified_executable,
         shell=False,
         stdout=log_file,
         stderr=subprocess.STDOUT,

@@ -116,6 +116,58 @@ def test_agent_project_create_requires_csrf_and_accepts_valid(monkeypatch, tmp_p
     assert data["project"]["target_count"] == 12
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_error"),
+    [
+        (KeyError("项目不存在"), 404, "项目不存在"),
+        (ValueError("无效报告类型"), 400, "无效报告类型"),
+        (
+            KeyError(
+                "/restricted/private-user/config.private https://secret.example "
+                "token=token-value TRACEBACK"
+            ),
+            404,
+            "报告资源不存在",
+        ),
+        (
+            ValueError(
+                "/restricted/private-user/config.private https://secret.example "
+                "token=token-value TRACEBACK"
+            ),
+            400,
+            "请求参数无效",
+        ),
+    ],
+)
+def test_agent_project_errors_only_return_enumerated_public_messages(
+    monkeypatch, failure, expected_status, expected_error
+):
+    def reject_project(**_kwargs):
+        raise failure
+
+    monkeypatch.setattr(report_agent, "create_project", reject_project)
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+
+    response = client.post(
+        "/api/agent/projects",
+        json={"request": "生成一份公开来源报告"},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == expected_status
+    assert response.get_json() == {"error": expected_error}
+    for private_fragment in (
+        "private-user",
+        "secret.example",
+        "token-value",
+        "TRACEBACK",
+    ):
+        assert private_fragment not in body
+
+
 def test_agent_collect_imports_quality_candidates(monkeypatch, tmp_path):
     monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
     monkeypatch.setattr(tracker, "select_quality_candidates", lambda **kwargs: ([_candidate()], {"total_scored": 1}))

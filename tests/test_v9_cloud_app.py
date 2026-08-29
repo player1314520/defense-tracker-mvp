@@ -191,6 +191,42 @@ def test_cloud_app_rejects_environment_database_path_outside_fixed_volume(
     assert not injected.parent.exists()
 
 
+@pytest.mark.parametrize(
+    "configured",
+    ["/data/v9-cloud.sqlite3", "/data/portal.sqlite3"],
+)
+def test_cloud_database_env_selects_preconstructed_allowlisted_path(
+    configured, monkeypatch
+):
+    import v9_cloud
+
+    monkeypatch.setenv("V9_CLOUD_DB_PATH", configured)
+
+    selected = v9_cloud._cloud_database_path(None, production_mode=True)
+
+    assert selected is v9_cloud._DEPLOYMENT_DATABASE_PATHS[configured]
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "/data/../data/v9-cloud.sqlite3",
+        "/data//v9-cloud.sqlite3",
+        "/data/v9-cloud.sqlite3 ",
+        "/data/v9-cloud.sqlite3/../portal.sqlite3",
+    ],
+)
+def test_cloud_database_env_rejects_nonexact_allowlist_variants(
+    configured, monkeypatch
+):
+    import v9_cloud
+
+    monkeypatch.setenv("V9_CLOUD_DB_PATH", configured)
+
+    with pytest.raises(ValueError, match="fixed deployment path"):
+        v9_cloud._cloud_database_path(None, production_mode=True)
+
+
 def test_development_database_path_preserves_the_only_legacy_database(
     tmp_path, monkeypatch
 ):

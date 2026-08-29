@@ -920,6 +920,7 @@ def test_consult_archive_failure_hides_internal_exception_text(monkeypatch):
     [
         (ValueError("invalid path C:\\Users\\private\\config\r\nINJECTED"), 400, "请求参数无效"),
         (KeyError("private-session-identifier"), 404, "资源不存在"),
+        (RuntimeError("secret at https://private.example.test/token"), 500, "防务咨询Agent处理失败"),
     ],
 )
 def test_consult_error_response_does_not_reflect_exception_text(
@@ -932,6 +933,75 @@ def test_consult_error_response_does_not_reflect_exception_text(
     assert status == expected_status
     assert response.get_json() == {"error": expected_message}
     assert str(error) not in response.get_data(as_text=True)
+
+
+def test_consult_error_response_preserves_enumerated_public_value_error():
+    tracker.app.config["TESTING"] = True
+    with tracker.app.app_context():
+        response, status = tracker._consult_error_response(ValueError("缺少可用证据"))
+
+    assert status == 400
+    assert response.get_json() == {"error": "缺少可用证据"}
+
+
+@pytest.mark.parametrize(
+    "endpoint,expected_message",
+    [
+        ("search", "实时搜索请求失败"),
+        ("web_search", "联网搜索请求失败"),
+    ],
+)
+def test_consult_search_does_not_reflect_upstream_http_error(
+    monkeypatch, tmp_path, endpoint, expected_message
+):
+    private_detail = (
+        "upstream failure C:\\Users\\private\\search.env "
+        "https://private.example.test/?token=secret\r\nTRACEBACK"
+    )
+    upstream_response = tracker.requests.Response()
+    upstream_response.status_code = 503
+    upstream_response._content = private_detail.encode("utf-8")
+    upstream_response.url = "https://private.example.test/?token=secret"
+    upstream_error = tracker.requests.exceptions.HTTPError(
+        private_detail, response=upstream_response
+    )
+
+    monkeypatch.setattr(
+        consulting_agent,
+        "CONSULTING_AGENT_DB_FILE",
+        str(tmp_path / "consult.sqlite3"),
+    )
+    monkeypatch.setattr(
+        tracker,
+        "_masked_search_config_status",
+        lambda: {
+            "online_search_enabled": True,
+            "web_search_enabled": True,
+            "message": "联网搜索已启用",
+        },
+    )
+
+    def fail_search(*_args, **_kwargs):
+        raise upstream_error
+
+    monkeypatch.setattr(tracker.search_adapters, "search_web_multi", fail_search)
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    session = consulting_agent.create_session("搜集1份台海无人系统报告")
+
+    response = client.post(
+        f"/api/consult/sessions/{session['session_id']}/{endpoint}",
+        json={"target_count": 1},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": expected_message}
+    response_text = response.get_data(as_text=True)
+    assert private_detail not in response_text
+    assert "private.example.test" not in response_text
+    assert "TRACEBACK" not in response_text
 
 
 def test_consult_capture_job_does_not_persist_internal_exception_text(monkeypatch):

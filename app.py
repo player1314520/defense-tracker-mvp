@@ -2415,6 +2415,20 @@ SYSTEM_PROMPT_FREEQA = """你是一位资深防务情报分析师，精通全球
 用户会基于当前防务新闻库提出问题，请用中文专业作答。
 当前新闻库概况将作为上下文提供。回答要专业、有深度、有数据支撑。"""
 
+
+def _ai_public_value_error_message(error: ValueError) -> str:
+    """Return only fixed messages for the AI errors safe to expose publicly."""
+    if error.args == ("云端 AI 凭据尚未在当前设备激活",):
+        return "云端 AI 凭据尚未在当前设备激活"
+    if error.args == ("AI API Key 未配置",):
+        return "AI API Key 未配置"
+    if error.args == ("AI endpoint does not match the fixed provider registry",):
+        return "AI 服务配置无效"
+    if error.args == ("AI 返回格式异常：缺少 choices 字段",):
+        return "AI 返回格式异常"
+    return "AI 请求参数无效"
+
+
 @app.route("/api/ai/analyze", methods=["POST"])
 @require_auth
 @require_ai_rate
@@ -2477,7 +2491,8 @@ def api_ai_analyze():
     except requests.exceptions.HTTPError as e:
         return jsonify({"error": f"AI API 请求失败: {e.response.status_code}"}), 502
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        logger.info("AI analyze request rejected error_type=%s", type(e).__name__)
+        return jsonify({"error": _ai_public_value_error_message(e)}), 400
     except Exception as e:
         logger.error("AI analyze error_type=%s", type(e).__name__)
         return jsonify({"error": "分析失败"}), 500
@@ -2550,7 +2565,8 @@ def api_ai_stream():
                 except json.JSONDecodeError:
                     continue
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)[:200]}, ensure_ascii=False)}\n\n"
+            logger.error("AI stream error_type=%s", type(e).__name__)
+            yield f"data: {json.dumps({'error': 'AI 流式分析失败'}, ensure_ascii=False)}\n\n"
         finally:
             if resp is not None:
                 resp.close()
@@ -3443,6 +3459,34 @@ def _enforce_brief_text_limits(brief: str) -> None:
         raise ValueError("要讯文本超过 16 KiB 字符限制")
     if any(len(line) > MAX_BRIEF_LINE_CHARS for line in brief.splitlines()):
         raise ValueError("要讯文本单行超过 4 KiB 字符限制")
+
+
+def _brief_public_value_error_message(error: ValueError) -> str:
+    """Map known validation failures to fixed public messages."""
+    message = str(error)
+    if message == "要讯文本必须是字符串":
+        return "要讯文本必须是字符串"
+    if message == "要讯文本超过 16 KiB 字符限制":
+        return "要讯文本超过 16 KiB 字符限制"
+    if message == "要讯文本单行超过 4 KiB 字符限制":
+        return "要讯文本单行超过 4 KiB 字符限制"
+    if message == "要讯字段必须使用对象格式":
+        return "要讯字段必须使用对象格式"
+    if message == "要讯字段必须是字符串":
+        return "要讯字段必须是字符串"
+    if message == "缺少服务器签发的原始素材证据":
+        return "缺少服务器签发的原始素材证据"
+    if message == "原始素材证据格式无效":
+        return "原始素材证据格式无效"
+    if message == "原始素材证据已失效或被修改，请从原文重新生成":
+        return "原始素材证据已失效或被修改，请从原文重新生成"
+    return "请求参数无效"
+
+
+def _brief_value_error_response(error: ValueError):
+    logger.warning("要讯请求校验失败 error_type=%s", type(error).__name__)
+    public_message = _brief_public_value_error_message(error)
+    return jsonify({"error": f"要讯校验未通过: {public_message}"}), 422
 
 
 def _validate_brief_text(brief: str, *, source_context: dict | None = None) -> dict:
@@ -4443,7 +4487,7 @@ def api_brief_export_docx():
     try:
         _enforce_brief_text_limits(raw_brief)
     except ValueError as error:
-        return jsonify({"error": f"要讯校验未通过: {error}"}), 422
+        return _brief_value_error_response(error)
     brief = raw_brief.strip()
     if not brief:
         return jsonify({"error": "缺少brief文本"}), 400
@@ -4457,7 +4501,7 @@ def api_brief_export_docx():
                 parsed[key] = value
         validation = _validate_brief(parsed, source_context=source_context)
     except ValueError as error:
-        return jsonify({"error": f"要讯校验未通过: {error}"}), 422
+        return _brief_value_error_response(error)
     if validation.get("valid") is not True:
         return jsonify({
             "error": _brief_validation_error_text(validation),
@@ -4485,7 +4529,7 @@ def api_brief_validate():
         source_context = _brief_open_source_evidence(data.get("source_evidence"))
         validation = _validate_brief_text(brief, source_context=source_context)
     except ValueError as error:
-        return jsonify({"error": f"要讯校验未通过: {error}"}), 422
+        return _brief_value_error_response(error)
     public_validation = _public_brief_validation(validation)
     if validation.get("valid") is not True:
         return jsonify({
@@ -4514,7 +4558,11 @@ def api_brief_export_docx_compiled():
             source_context = _brief_open_source_evidence(source_evidence)
             parsed = _parse_brief_text(text)
         except ValueError as error:
-            invalid_items.append({"index": index, "errors": [str(error)]})
+            logger.warning("要讯汇编请求校验失败 error_type=%s", type(error).__name__)
+            invalid_items.append({
+                "index": index,
+                "errors": [_brief_public_value_error_message(error)],
+            })
             continue
         validation = _validate_brief(
             parsed,
@@ -4775,35 +4823,52 @@ def api_translate():
         return jsonify({"error": "翻译失败", "code": "ai_error"}), 502
 
 
-_CONSULT_PUBLIC_VALUE_ERRORS = frozenset({
-    "AI API Key 未配置",
-    "云端 AI 凭据尚未在当前设备激活",
-    "缺少可用证据，请先执行检索或选择证据",
-    "客户指令超过 4096 字符限制",
-    "缺少客户指令",
-    "无效原文资产状态",
-    "缺少 evidence_id，无法归档原文",
-    "缺少URL，无法归档原文",
-    "抓取结果没有可提取正文",
-    "缺少 evidence_id，无法记录失败",
-    "报告内容为空",
-    "无效报告版本类型",
-    "资料资产不属于当前任务",
-    "evidence_ids必须是字符串数组",
-    "缺少可用证据",
-    "unsupported output kind",
-    "invalid document name",
-})
+def _consult_public_value_error_message(error: ValueError) -> str:
+    """Return only enumerated literals; exception text never becomes response data."""
+    message = str(error)
+    if message == "AI API Key 未配置":
+        return "AI API Key 未配置"
+    if message == "云端 AI 凭据尚未在当前设备激活":
+        return "云端 AI 凭据尚未在当前设备激活"
+    if message == "缺少可用证据，请先执行检索或选择证据":
+        return "缺少可用证据，请先执行检索或选择证据"
+    if message == "客户指令超过 4096 字符限制":
+        return "客户指令超过 4096 字符限制"
+    if message == "缺少客户指令":
+        return "缺少客户指令"
+    if message == "无效原文资产状态":
+        return "无效原文资产状态"
+    if message == "缺少 evidence_id，无法归档原文":
+        return "缺少 evidence_id，无法归档原文"
+    if message == "缺少URL，无法归档原文":
+        return "缺少URL，无法归档原文"
+    if message == "抓取结果没有可提取正文":
+        return "抓取结果没有可提取正文"
+    if message == "缺少 evidence_id，无法记录失败":
+        return "缺少 evidence_id，无法记录失败"
+    if message == "报告内容为空":
+        return "报告内容为空"
+    if message == "无效报告版本类型":
+        return "无效报告版本类型"
+    if message == "资料资产不属于当前任务":
+        return "资料资产不属于当前任务"
+    if message == "evidence_ids必须是字符串数组":
+        return "evidence_ids必须是字符串数组"
+    if message == "缺少可用证据":
+        return "缺少可用证据"
+    if message == "unsupported output kind":
+        return "unsupported output kind"
+    if message == "invalid document name":
+        return "invalid document name"
+    return "请求参数无效"
 
 
 def _consult_error_response(e: Exception):
     if isinstance(e, KeyError):
         return jsonify({"error": "资源不存在"}), 404
     if isinstance(e, ValueError):
-        message = str(e)
-        if message not in _CONSULT_PUBLIC_VALUE_ERRORS:
-            message = "请求参数无效"
-        return jsonify({"error": message}), 400
+        logger.info("Consulting agent request rejected error_type=%s", type(e).__name__)
+        return jsonify({"error": _consult_public_value_error_message(e)}), 400
     logger.error("Consulting agent error_type=%s", type(e).__name__)
     return jsonify({"error": "防务咨询Agent处理失败"}), 500
 
@@ -5737,7 +5802,11 @@ def api_consult_session_search(session_id):
             "model": _consult_model_info(),
         })
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"实时搜索请求失败: {e.response.status_code} - {e.response.text[:160]}"}), 502
+        logger.warning(
+            "Consulting agent combined search upstream failure status=%s",
+            getattr(e.response, "status_code", None),
+        )
+        return jsonify({"error": "实时搜索请求失败"}), 502
     except Exception as e:
         return _consult_error_response(e)
 
@@ -5824,7 +5893,11 @@ def api_consult_session_web_search(session_id):
             "model": _consult_model_info(),
         })
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"联网搜索请求失败: {e.response.status_code} - {e.response.text[:160]}"}), 502
+        logger.warning(
+            "Consulting agent web search upstream failure status=%s",
+            getattr(e.response, "status_code", None),
+        )
+        return jsonify({"error": "联网搜索请求失败"}), 502
     except Exception as e:
         return _consult_error_response(e)
 
@@ -6547,13 +6620,78 @@ def api_consult_session_revise(session_id):
         return _consult_error_response(e)
 
 
+def _agent_public_key_error_message(error: KeyError) -> str:
+    """Map expected report resource misses to fixed public literals."""
+    if error.args == ("项目不存在",):
+        return "项目不存在"
+    if error.args == ("草稿不存在",):
+        return "草稿不存在"
+    if error.args == ("草稿任务不存在",):
+        return "草稿任务不存在"
+    if error.args == ("证据不存在或不属于当前项目",):
+        return "证据不存在或不属于当前项目"
+    return "报告资源不存在"
+
+
+def _agent_public_value_error_message(error: ValueError) -> str:
+    """Return only enumerated report validation messages, never exception text."""
+    message = (
+        error.args[0]
+        if len(error.args) == 1 and isinstance(error.args[0], str)
+        else ""
+    )
+    if message == "项目标题过长":
+        return "项目标题过长"
+    if message == "研究主题过长":
+        return "研究主题过长"
+    if message == "客户需求超过 4096 字符限制":
+        return "客户需求超过 4096 字符限制"
+    if message == "无效报告类型":
+        return "无效报告类型"
+    if message == "缺少项目标题或客户需求":
+        return "缺少项目标题或客户需求"
+    if message == "无效草稿类型":
+        return "无效草稿类型"
+    if message == "草稿内容为空":
+        return "草稿内容为空"
+    if message == "报告文本超过 2 MiB 字符限制":
+        return "报告文本超过 2 MiB 字符限制"
+    if message == "报告文本单行超过 32 KiB 字符限制":
+        return "报告文本单行超过 32 KiB 字符限制"
+    if message == "evidence_ids必须是字符串数组":
+        return "evidence_ids必须是字符串数组"
+    if message == "缺少可用证据":
+        return "缺少可用证据"
+    if message == "draft_id必须是字符串":
+        return "draft_id必须是字符串"
+    if message == "草稿不属于当前项目":
+        return "草稿不属于当前项目"
+    if message == "content必须是字符串":
+        return "content必须是字符串"
+    if message == "报告仍包含禁止使用的涉密等级字眼，已阻断导出":
+        return "报告仍包含禁止使用的涉密等级字眼，已阻断导出"
+    if message.startswith("当前正文约") and "低于目标字数" in message:
+        return "当前正文低于目标字数要求，请继续生成或扩写后再导出"
+    if (
+        message.startswith("机构开源情报整编包交付预检未通过：")
+        and "证据数量为0条" in message
+    ):
+        return "机构开源情报整编包交付预检未通过：证据数量为0条"
+    if message.startswith("机构开源情报整编包交付预检未通过："):
+        return "机构开源情报整编包交付预检未通过"
+    return "请求参数无效"
+
+
 def _agent_error_response(e: Exception):
     if isinstance(e, KeyError):
-        return jsonify({"error": str(e).strip("'")}), 404
+        logger.info("Report agent resource not found error_type=%s", type(e).__name__)
+        return jsonify({"error": _agent_public_key_error_message(e)}), 404
     if isinstance(e, ValueError):
-        return jsonify({"error": str(e)}), 400
+        logger.info("Report agent request rejected error_type=%s", type(e).__name__)
+        return jsonify({"error": _agent_public_value_error_message(e)}), 400
     logger.error("Report agent error_type=%s", type(e).__name__)
     return jsonify({"error": "报告Agent处理失败"}), 500
+
 
 def _agent_selected_evidence(project_id: str, data: dict, allow_empty: bool = False) -> list[dict]:
     if "evidence_ids" not in data:

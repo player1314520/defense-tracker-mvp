@@ -154,8 +154,8 @@ def _default_readiness_probe(url: str, publishable_key: str) -> bool:
 
 
 _DEPLOYMENT_DATABASE_PATHS = {
-    "/data/v9-cloud.sqlite3",
-    "/data/portal.sqlite3",
+    "/data/v9-cloud.sqlite3": Path("/data/v9-cloud.sqlite3"),
+    "/data/portal.sqlite3": Path("/data/portal.sqlite3"),
 }
 
 
@@ -202,9 +202,11 @@ def _cloud_database_path(
         return Path(database_path)
     configured = os.getenv("V9_CLOUD_DB_PATH")
     if configured:
-        if configured not in _DEPLOYMENT_DATABASE_PATHS:
-            raise ValueError("V9_CLOUD_DB_PATH must use the fixed deployment path")
-        return Path(configured)
+        if configured == "/data/v9-cloud.sqlite3":
+            return _DEPLOYMENT_DATABASE_PATHS["/data/v9-cloud.sqlite3"]
+        if configured == "/data/portal.sqlite3":
+            return _DEPLOYMENT_DATABASE_PATHS["/data/portal.sqlite3"]
+        raise ValueError("V9_CLOUD_DB_PATH must use the fixed deployment path")
     if production_mode:
         raise ValueError("V9_CLOUD_DB_PATH is required in production")
     legacy_path, hardened_path = _development_database_paths()

@@ -1265,6 +1265,68 @@ def test_ai_stream_closes_upstream_response(monkeypatch, client):
     assert upstream.closed is True
 
 
+def test_ai_stream_does_not_reflect_upstream_exception_details(monkeypatch, client):
+    private_error = (
+        "/restricted/private-user/config.private https://secret.example "
+        "token=token-value TRACEBACK"
+    )
+
+    def reject_stream(*_args, **_kwargs):
+        raise RuntimeError(private_error)
+
+    monkeypatch.setattr(tracker, "_ai_is_enabled", lambda: True)
+    monkeypatch.setattr(tracker, "_call_ai", reject_stream)
+    csrf = _csrf_cookie(client)
+
+    response = client.post(
+        "/api/ai/stream",
+        json={"mode": "freeqa", "question": "ping"},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert '"error": "AI 流式分析失败"' in body
+    for private_fragment in (
+        "private-user",
+        "secret.example",
+        "token-value",
+        "TRACEBACK",
+    ):
+        assert private_fragment not in body
+
+
+def test_ai_analyze_does_not_reflect_unknown_value_error(monkeypatch, client):
+    private_error = (
+        "/restricted/private-user/config.private https://secret.example "
+        "token=token-value TRACEBACK"
+    )
+
+    def reject_analysis(*_args, **_kwargs):
+        raise ValueError(private_error)
+
+    monkeypatch.setattr(tracker, "_ai_is_enabled", lambda: True)
+    monkeypatch.setattr(tracker, "_call_ai", reject_analysis)
+    csrf = _csrf_cookie(client)
+
+    response = client.post(
+        "/api/ai/analyze",
+        json={"mode": "freeqa", "question": "ping"},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "AI 请求参数无效"}
+    for private_fragment in (
+        "private-user",
+        "secret.example",
+        "token-value",
+        "TRACEBACK",
+    ):
+        assert private_fragment not in body
+
+
 def test_ai_config_rolls_back_when_secure_persistence_fails(
     monkeypatch, client
 ):
