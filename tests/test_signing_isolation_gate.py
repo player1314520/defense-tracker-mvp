@@ -76,8 +76,11 @@ def test_protected_main_sha_is_resolved_before_any_checkout_or_source_execution(
     assert 'expected_repository = "player1314520/defense-tracker-mvp"' in request
     assert "git/ref/heads/main" in request
     assert 'protected_main_sha != os.environ["WORKFLOW_SHA"]' in request
-    assert "trusted_sha: ${{ steps.resolve.outputs.trusted_sha }}" in request
-    assert "ref: ${{ needs.verify-release-request.outputs.trusted_sha }}" in downstream
+    assert "trusted_sha" not in request
+    assert "GITHUB_OUTPUT" not in request
+    assert "needs.verify-release-request.outputs" not in downstream
+    assert downstream.count("RELEASE_SHA: ${{ github.sha }}") == 3
+    assert downstream.count("ref: ${{ github.sha }}") == 3
     assert workflow.index("  verify-release-request:\n") < workflow.index(
         "actions/checkout@"
     )

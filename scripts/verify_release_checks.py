@@ -59,7 +59,7 @@ def load_check_runs(repository: str, sha: str, token: str) -> list[dict[str, obj
     page = 1
     while True:
         url = (
-            f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/commits/{sha}/check-runs"
+            f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/commits/main/check-runs"
             f"?per_page=100&filter=latest&page={page}"
         )
         request = urllib.request.Request(

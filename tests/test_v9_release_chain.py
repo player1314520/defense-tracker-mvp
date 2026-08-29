@@ -1193,7 +1193,7 @@ def test_required_check_loader_fetches_every_reported_page(monkeypatch):
 
     assert [run["id"] for run in check_runs] == list(range(1, 102))
     assert requested_urls[0].startswith(
-        f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/commits/{COMMIT}/check-runs"
+        f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/commits/main/check-runs"
     )
     assert requested_urls[0].endswith("filter=latest&page=1")
     assert requested_urls[1].endswith("filter=latest&page=2")

@@ -86,7 +86,8 @@ either receipt remains a release blocker.
 The signed-candidate workflow accepts no SHA input. A source-free preflight
 queries the fixed `player1314520/defense-tracker-mvp` GitHub API endpoint and
 proves that current protected `main` is the lowercase 40-hex workflow revision;
-downstream jobs consume only that preflight output. The source-ZIP CLI likewise
+downstream jobs use GitHub's immutable `github.sha` context directly and remain
+blocked unless that independent preflight succeeds. The source-ZIP CLI likewise
 accepts no output path: it writes only
 `build/release-evidence/source-zips/DefenseTracker-source-<expected-sha>.zip`.
 Existing targets, links, reparse points, and non-directory parents fail closed.
