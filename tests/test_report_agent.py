@@ -122,10 +122,10 @@ def test_institution_pack_defaults_and_public_sod_path(agent_db):
     assert project["time_window_days"] == 30
     assert report_agent.REPORT_TYPE_DEFAULTS["institution_pack"]["label"] == "机构开源情报整编包"
 
-    candidates = [Path(path) for path in report_agent._writing_spec_candidates()]
-    assert candidates[0].name == "defensetracker_sod_writing.md"
-    assert candidates[0].parent.name == "docs"
-    assert any(path.name == "report_agent_sod_writing.md" for path in candidates)
+    candidates = report_agent._writing_spec_candidates()
+    assert candidates[0] == "defensetracker_sod_writing.md"
+    assert report_agent._WRITING_SPEC_ROOT.name == "docs"
+    assert "report_agent_sod_writing.md" in candidates
     assert _RETIRED_USER_MARKER not in "\n".join(str(path) for path in candidates)
 
 
@@ -552,7 +552,12 @@ def test_draft_messages_include_sod_writing_requirements(agent_db, monkeypatch, 
         encoding="utf-8",
     )
     monkeypatch.setattr(report_agent, "_WRITING_SPEC_ROOT", tmp_path)
-    monkeypatch.setattr(report_agent, "REPORT_AGENT_WRITING_SPEC_FILE", str(spec_file), raising=False)
+    monkeypatch.setattr(
+        report_agent,
+        "REPORT_AGENT_WRITING_SPEC_FILE",
+        spec_file.name,
+        raising=False,
+    )
     project = report_agent.create_project("台海战略分析报告", "strategic", topic="台海")
     evidence = report_agent.upsert_project_evidence(project["project_id"], [_candidate()])
 
@@ -584,6 +589,41 @@ def test_writing_spec_override_cannot_read_outside_public_docs(
         report_agent.load_report_writing_requirements()
 
 
+@pytest.mark.parametrize(
+    "override",
+    ["../private.md", "/tmp/private.md", r"C:\\private\\spec.md"],
+)
+def test_writing_spec_override_rejects_path_syntax(monkeypatch, tmp_path, override):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    monkeypatch.setattr(report_agent, "_WRITING_SPEC_ROOT", docs)
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_WRITING_SPEC_FILE", override)
+
+    with pytest.raises(ValueError, match="writing specification file is unsafe"):
+        report_agent.load_report_writing_requirements()
+
+
+def test_writing_spec_override_rejects_symlink(monkeypatch, tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    outside = tmp_path / "private.md"
+    outside.write_text("must-not-reach-an-ai-provider", encoding="utf-8")
+    linked = docs / "linked.md"
+    try:
+        linked.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    monkeypatch.setattr(report_agent, "_WRITING_SPEC_ROOT", docs)
+    monkeypatch.setattr(
+        report_agent,
+        "REPORT_AGENT_WRITING_SPEC_FILE",
+        linked.name,
+    )
+
+    with pytest.raises(ValueError, match="writing specification file is unsafe"):
+        report_agent.load_report_writing_requirements()
+
+
 def test_writing_spec_rejects_oversized_file(monkeypatch, tmp_path):
     docs = tmp_path / "docs"
     docs.mkdir()
@@ -593,7 +633,7 @@ def test_writing_spec_rejects_oversized_file(monkeypatch, tmp_path):
     monkeypatch.setattr(
         report_agent,
         "REPORT_AGENT_WRITING_SPEC_FILE",
-        str(oversized),
+        oversized.name,
     )
 
     with pytest.raises(ValueError, match="writing specification file is unsafe"):
@@ -624,7 +664,7 @@ def test_writing_spec_rejects_file_swap_between_check_and_open(
     monkeypatch.setattr(
         report_agent,
         "REPORT_AGENT_WRITING_SPEC_FILE",
-        str(spec),
+        spec.name,
     )
     monkeypatch.setattr(report_agent.os, "open", racing_open)
 

@@ -90,3 +90,19 @@ def test_public_tree_rejects_embedded_image_even_for_hash_allowed_svg(
     assert verify_public_tree.audit(root) == [
         "SVG embeds raster or external image data: static/img/test-map.svg"
     ]
+
+
+def test_public_tree_svg_hash_is_stable_across_checkout_line_endings(
+    tmp_path, monkeypatch
+):
+    relative = "static/img/test-map.svg"
+    payload_lf = b'<svg xmlns="http://www.w3.org/2000/svg">\n<path d="M0 0"/>\n</svg>\n'
+    payload_crlf = payload_lf.replace(b"\n", b"\r\n")
+    root = _tracked_tree(tmp_path, relative, payload_crlf)
+    monkeypatch.setitem(
+        verify_public_tree.ALLOWED_SVG_SHA256,
+        relative,
+        hashlib.sha256(payload_lf).hexdigest(),
+    )
+
+    assert verify_public_tree.audit(root) == []

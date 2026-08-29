@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Proxy-free, DNS-pinned HTTP GET transport for untrusted public URLs.
+"""Proxy-free, DNS-pinned HTTP transport for untrusted public URLs.
 
 The security boundary is deliberately below callers' URL pre-checks: one DNS
 answer is validated in full, the TCP socket connects directly to one validated
@@ -35,6 +35,11 @@ _FORBIDDEN_REQUEST_HEADERS = {
     "transfer-encoding",
 }
 _MAX_DNS_ADDRESSES = 8
+_IPV6_TRANSITION_NETWORKS = (
+    ipaddress.ip_network("::/96"),
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+)
 
 
 class UnsafeTargetError(RuntimeError):
@@ -69,9 +74,12 @@ class _PinnedRawResponse(Urllib3HTTPResponse):
 
 
 def _validated_request(
+    method: str,
     url: str,
     headers: Mapping[str, str] | None,
     cookies: CookieJar | dict[str, str] | None,
+    *,
+    json_body: Any = None,
 ) -> tuple[requests.PreparedRequest, str, str, int]:
     if not isinstance(url, str) or not url or url != url.strip():
         raise UnsafeTargetError("URL为空或包含首尾空白")
@@ -93,12 +101,21 @@ def _validated_request(
     except (UnicodeError, ValueError) as exc:
         raise UnsafeTargetError("URL格式无效") from exc
 
+    request_headers = dict(headers or {})
+    for name, value in request_headers.items():
+        lowered = name.lower()
+        if lowered in _FORBIDDEN_REQUEST_HEADERS:
+            raise UnsafeTargetError(f"不允许覆盖请求头: {name}")
+        if _CONTROL_CHARACTERS.search(name) or _CONTROL_CHARACTERS.search(str(value)):
+            raise UnsafeTargetError("请求头包含控制字符")
+
     try:
         prepared = requests.Request(
-            "GET",
+            method,
             url,
-            headers=dict(headers or {}),
+            headers=request_headers,
             cookies=cookies,
+            json=json_body if method == "POST" else None,
         ).prepare()
         normalized = urlsplit(prepared.url)
         hostname = normalized.hostname
@@ -116,9 +133,6 @@ def _validated_request(
         raise UnsafeTargetError("URL不得包含用户凭据")
 
     for name in prepared.headers:
-        lowered = name.lower()
-        if lowered in _FORBIDDEN_REQUEST_HEADERS:
-            raise UnsafeTargetError(f"不允许覆盖请求头: {name}")
         if _CONTROL_CHARACTERS.search(name) or _CONTROL_CHARACTERS.search(str(prepared.headers[name])):
             raise UnsafeTargetError("请求头包含控制字符")
     prepared.headers["Connection"] = "close"
@@ -131,6 +145,14 @@ def _global_ip(value: str, *, dns_answer: bool) -> ipaddress.IPv4Address | ipadd
     except ValueError as exc:
         label = "DNS结果" if dns_answer else "连接对端"
         raise UnsafeTargetError(f"{label}无法验证") from exc
+    if isinstance(address, ipaddress.IPv6Address) and (
+        address.ipv4_mapped is not None
+        or address.sixtofour is not None
+        or address.teredo is not None
+        or any(address in network for network in _IPV6_TRANSITION_NETWORKS)
+    ):
+        label = "DNS结果" if dns_answer else "连接对端"
+        raise UnsafeTargetError(f"{label}不允许IPv4嵌入或转换IPv6地址")
     if not address.is_global:
         label = "目标解析包含非公网地址" if dns_answer else "连接对端是非公网地址"
         raise UnsafeTargetError(label)
@@ -284,19 +306,29 @@ def _to_requests_response(
     return response
 
 
-def pinned_get(
+def _pinned_request(
+    method: str,
     url: str,
     *,
     headers: Mapping[str, str] | None = None,
     cookies: CookieJar | dict[str, str] | None = None,
     timeout: int | float = 10,
+    json_body: Any = None,
 ) -> requests.Response:
-    """Perform one proxy-free GET to a validated and DNS-pinned public target.
+    """Perform one proxy-free request to a validated, DNS-pinned target.
 
     This function never follows redirects.  A caller that accepts redirects
-    must invoke ``pinned_get`` again for each URL produced by ``urljoin``.
+    must cross this boundary again for every URL produced by ``urljoin``.
     """
-    prepared, scheme, hostname, port = _validated_request(url, headers, cookies)
+    if method not in {"GET", "POST"}:
+        raise ValueError("unsupported pinned HTTP method")
+    prepared, scheme, hostname, port = _validated_request(
+        method,
+        url,
+        headers,
+        cookies,
+        json_body=json_body,
+    )
     request_timeout = _normalized_timeout(timeout)
     addresses = _resolve_global_addresses(hostname, port)
     sock = _connect_pinned(
@@ -310,9 +342,9 @@ def pinned_get(
     connection.sock = sock
     try:
         connection.request(
-            "GET",
+            method,
             prepared.path_url or "/",
-            body=None,
+            body=prepared.body,
             headers=dict(prepared.headers),
         )
         wire_response = connection.getresponse()
@@ -334,4 +366,38 @@ def pinned_get(
         raise
 
 
-__all__ = ["UnsafeTargetError", "pinned_get"]
+def pinned_get(
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    cookies: CookieJar | dict[str, str] | None = None,
+    timeout: int | float = 10,
+) -> requests.Response:
+    return _pinned_request(
+        "GET",
+        url,
+        headers=headers,
+        cookies=cookies,
+        timeout=timeout,
+    )
+
+
+def pinned_post(
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    cookies: CookieJar | dict[str, str] | None = None,
+    json: Any,
+    timeout: int | float = 10,
+) -> requests.Response:
+    return _pinned_request(
+        "POST",
+        url,
+        headers=headers,
+        cookies=cookies,
+        timeout=timeout,
+        json_body=json,
+    )
+
+
+__all__ = ["UnsafeTargetError", "pinned_get", "pinned_post"]

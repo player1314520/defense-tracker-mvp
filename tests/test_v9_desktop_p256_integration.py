@@ -353,8 +353,7 @@ def test_owner_export_session_uses_canonical_vault_and_selected_config(
             self.vault = vault
             self.client = client
 
-    monkeypatch.setenv("DEFENSE_TRACKER_SUPABASE_CONFIG", str(explicit_config))
-    monkeypatch.setattr(exporter, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(exporter, "CONFIG_DIR", explicit_config.parent)
     monkeypatch.setattr(exporter, "VAULT_DIR", canonical_vault)
     monkeypatch.setattr(exporter, "SupabaseSettings", FakeSettings)
     monkeypatch.setattr(exporter, "SessionVault", FakeVault)

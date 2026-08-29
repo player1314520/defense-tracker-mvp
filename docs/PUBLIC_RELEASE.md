@@ -83,6 +83,16 @@ credentialless or least-privileged restricted-egress single-use VM. The
 controller must record runner deregistration and VM destruction; absence of
 either receipt remains a release blocker.
 
+The signed-candidate workflow accepts no SHA input. A source-free preflight
+queries the fixed `player1314520/defense-tracker-mvp` GitHub API endpoint and
+proves that current protected `main` is the lowercase 40-hex workflow revision;
+downstream jobs consume only that preflight output. The source-ZIP CLI likewise
+accepts no output path: it writes only
+`build/release-evidence/source-zips/DefenseTracker-source-<expected-sha>.zip`.
+Existing targets, links, reparse points, and non-directory parents fail closed.
+Tests may call the internal API with two distinct controlled new names to prove
+the archives hash identically.
+
 ## Stable `v9.x` rule
 
 The stable tag must point to the exact accepted release commit. The Release is

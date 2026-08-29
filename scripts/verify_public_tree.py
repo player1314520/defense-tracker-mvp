@@ -69,7 +69,7 @@ FORBIDDEN_RASTER_IMAGE_SUFFIXES = {
 }
 ALLOWED_SVG_SHA256 = {
     "static/img/v9-world-map.svg": (
-        "c2dcd1228265b67b2219cbbeebb15b3e45f8169f36fc18d6e336ea6cff2c6e6f"
+        "d5f5e0c2907ff3fbf42bbc82e6e8fb1bee9380937697b537f1644f5155e93624"
     ),
 }
 SVG_EMBED_PATTERN = re.compile(r"<\s*image\b|data\s*:\s*image/", re.IGNORECASE)
@@ -151,7 +151,8 @@ def audit(root: Path) -> list[str]:
             if expected_hash is None:
                 issues.append(f"unapproved SVG image: {normalized}")
                 continue
-            if hashlib.sha256(raw).hexdigest() != expected_hash:
+            canonical_svg = raw.replace(b"\r\n", b"\n")
+            if hashlib.sha256(canonical_svg).hexdigest() != expected_hash:
                 issues.append(f"SVG hash mismatch: {normalized}")
                 continue
         if b"\0" in raw:

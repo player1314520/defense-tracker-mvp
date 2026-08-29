@@ -3605,10 +3605,7 @@ def _brief_error_type(error: BaseException) -> str:
 # ══════════════════════════════════════════════════════════════
 _BRIEF_OUTPUT_DIR = os.path.join(VAULT_DIR, "每日新闻")
 _DAILY_BRIEF_FOLDER_NAME = "每日自动要讯"
-_DAILY_BRIEF_OUTPUT_ROOT = os.environ.get(
-    "DAILY_BRIEF_OUTPUT_DIR",
-    os.path.join(VAULT_DIR, _DAILY_BRIEF_FOLDER_NAME),
-)
+_DAILY_BRIEF_OUTPUT_ROOT = os.path.join(VAULT_DIR, _DAILY_BRIEF_FOLDER_NAME)
 
 def _persist_brief_to_disk(brief_text: str, output_dir: str | None = None,
                            now: datetime | None = None, *,
@@ -4584,15 +4581,30 @@ def _open_brief_download(root: str, name: str):
     if not os.path.isdir(root):
         raise FileNotFoundError(name)
 
-    candidate = os.path.join(root, name)
+    candidate = None
     try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name == name:
+                    candidate = entry.path
+                    break
+        if candidate is None:
+            raise FileNotFoundError(name)
         resolved = os.path.realpath(candidate)
-        if os.path.commonpath((root, resolved)) != root:
+        if (
+            os.path.commonpath((root, resolved)) != root
+            or os.path.normcase(os.path.abspath(candidate))
+            != os.path.normcase(resolved)
+        ):
             raise FileNotFoundError(name)
         before = os.stat(candidate, follow_symlinks=False)
     except (OSError, ValueError):
         raise FileNotFoundError(name) from None
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or bool(getattr(before, "st_file_attributes", 0) & 0x0400)
+    ):
         raise FileNotFoundError(name)
 
     flags = os.O_RDONLY

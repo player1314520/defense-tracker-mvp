@@ -48,6 +48,31 @@ def _settings_file(tmp_path, **overrides):
     return path
 
 
+def test_settings_reject_noncanonical_filename(tmp_path):
+    from v9.supabase_client import SupabaseSettings
+
+    wrong_name = tmp_path / "selected-by-request.json"
+    wrong_name.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid Supabase V9 config path"):
+        SupabaseSettings.load(wrong_name)
+
+
+def test_settings_reject_linked_config(tmp_path):
+    from v9.supabase_client import SupabaseSettings
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    linked = tmp_path / ".supabase_v9_config.json"
+    try:
+        linked.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="invalid Supabase V9 config path"):
+        SupabaseSettings.load(linked)
+
+
 def _encrypted_credential_payload():
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec

@@ -1,5 +1,6 @@
 import gzip
 import io
+import json
 import socket
 import ssl
 from email.message import Message
@@ -141,6 +142,29 @@ def test_rejects_entire_dns_answer_if_any_address_is_not_global(monkeypatch):
         pinned_http.pinned_get("http://public.test/report")
 
     assert dns_calls == [("public.test", 80)]
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "::ffff:127.0.0.1",
+        "2002:7f00:1::",
+        "2001:0000:4136:e378:8000:63bf:80ff:fffe",
+        "::7f00:1",
+        "64:ff9b::7f00:1",
+        "64:ff9b::a00:1",
+        "64:ff9b:1::7f00:1",
+    ],
+)
+def test_rejects_ipv4_embedded_and_transition_ipv6_addresses(address):
+    with pytest.raises(pinned_http.UnsafeTargetError, match="IPv4"):
+        pinned_http._global_ip(address, dns_answer=True)
+
+
+def test_accepts_native_global_ipv6_address():
+    assert str(
+        pinned_http._global_ip("2606:4700:4700::1111", dns_answer=True)
+    ) == "2606:4700:4700::1111"
 
 
 def test_rejects_too_many_unique_dns_addresses_before_connect(monkeypatch):
@@ -361,3 +385,68 @@ def test_requests_response_streams_and_decodes_gzip_with_size_limit_compatibilit
             search_adapters._read_limited_response(oversized, max_bytes=len(plain) - 1)
     finally:
         oversized.close()
+
+
+def test_pinned_post_serializes_json_over_the_validated_socket(monkeypatch):
+    fake_socket = _FakeSocket()
+    _FakeConnection.instances = []
+    _FakeConnection.wire_response = _WireResponse(
+        b'{"ok":true}',
+        [("Content-Type", "application/json"), ("Content-Length", "11")],
+    )
+    monkeypatch.setattr(pinned_http.socket, "getaddrinfo", _public_dns)
+    monkeypatch.setattr(pinned_http.socket, "socket", lambda *_a, **_k: fake_socket)
+    monkeypatch.setattr(pinned_http.http.client, "HTTPConnection", _FakeConnection)
+
+    response = pinned_http.pinned_post(
+        "http://public.test/v1/chat",
+        headers={"Authorization": "Bearer placeholder"},
+        json={"prompt": "unit"},
+    )
+    try:
+        method, target, body, headers = _FakeConnection.instances[-1].requests[-1]
+        assert method == "POST"
+        assert target == "/v1/chat"
+        assert json.loads(body.decode("utf-8")) == {"prompt": "unit"}
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Authorization"] == "Bearer placeholder"
+        assert headers["Connection"] == "close"
+        assert response.json() == {"ok": True}
+    finally:
+        response.close()
+
+
+def test_pinned_post_rejects_user_content_length_before_dns(monkeypatch):
+    monkeypatch.setattr(
+        pinned_http.socket,
+        "getaddrinfo",
+        lambda *_a, **_k: pytest.fail("forbidden header must fail before DNS"),
+    )
+
+    with pytest.raises(pinned_http.UnsafeTargetError, match="Content-Length"):
+        pinned_http.pinned_post(
+            "https://public.test/v1/chat",
+            headers={"Content-Length": "1"},
+            json={"prompt": "unit"},
+        )
+
+
+def test_pinned_post_rejects_mixed_private_dns_before_request_bytes(monkeypatch):
+    def mixed_dns(_host, port, **_kwargs):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (PUBLIC_IP, port)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("10.0.0.8", port)),
+        ]
+
+    monkeypatch.setattr(pinned_http.socket, "getaddrinfo", mixed_dns)
+    monkeypatch.setattr(
+        pinned_http.socket,
+        "socket",
+        lambda *_a, **_k: pytest.fail("mixed DNS answer must fail before connect"),
+    )
+
+    with pytest.raises(pinned_http.UnsafeTargetError, match="非公网"):
+        pinned_http.pinned_post(
+            "https://public.test/v1/chat",
+            json={"prompt": "unit"},
+        )

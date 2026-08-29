@@ -293,7 +293,7 @@ def test_master_key_payload_is_created_private_and_without_following_links(
     observed = {}
     real_open = service_module.os.open
 
-    def recording_open(path, flags, mode=0o777, *args, **kwargs):
+    def recording_open(path, flags, mode=0o600, *args, **kwargs):
         observed.update(path=path, flags=flags, mode=mode)
         return real_open(path, flags, mode, *args, **kwargs)
 
@@ -307,6 +307,7 @@ def test_master_key_payload_is_created_private_and_without_following_links(
 
     assert target.read_bytes() == b"k" * 32
     assert observed["mode"] == 0o600
+    assert observed["mode"] & 0o077 == 0
     assert observed["flags"] & os.O_EXCL
     assert observed["flags"] & os.O_CREAT
     if getattr(os, "O_NOFOLLOW", 0):

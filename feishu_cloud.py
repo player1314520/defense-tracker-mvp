@@ -49,7 +49,7 @@ from urllib.parse import urlparse, urljoin
 
 import feedparser
 import requests
-from pinned_http import UnsafeTargetError, pinned_get
+from pinned_http import UnsafeTargetError, pinned_get, pinned_post
 from bs4 import BeautifulSoup
 from docx import Document as DocxDocument
 from docx.shared import Pt, Emu
@@ -774,7 +774,7 @@ def _call_ai(messages: list, temperature: float = 0.4) -> str:
         if system_msg:
             payload["system"] = system_msg
         url = base + "/v1/messages"
-        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        resp = pinned_post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
         content = resp.json().get("content", [])
         if isinstance(content, list) and content:
@@ -799,7 +799,7 @@ def _call_ai(messages: list, temperature: float = 0.4) -> str:
     else:
         url = base + "/v1/chat/completions"
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=180)
+    resp = pinned_post(url, headers=headers, json=payload, timeout=180)
     resp.raise_for_status()
     result = resp.json()
     choices = result.get("choices")
@@ -911,7 +911,7 @@ def _call_ai_with_image(
         if system_prompt:
             payload["system"] = system_prompt
         url = base + "/v1/messages"
-        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        resp = pinned_post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
         content = resp.json().get("content", [])
         if isinstance(content, list) and content:
@@ -937,7 +937,7 @@ def _call_ai_with_image(
             "messages": messages,
         }
         url = base + "/v1/chat/completions" if not base.endswith("/v1") else base + "/chat/completions"
-        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        resp = pinned_post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
         result = resp.json()
         choices = result.get("choices")

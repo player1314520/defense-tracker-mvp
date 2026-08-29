@@ -614,28 +614,59 @@ def assert_report_exportable(draft: dict, project: dict | None = None,
     return quality
 
 
-def _writing_spec_candidates() -> list[Path]:
-    candidates = [
-        REPORT_AGENT_WRITING_SPEC_FILE,
-        _DEFAULT_DEFENSETRACKER_SOD_FILE,
-        _WRITING_SPEC_ROOT / "report_agent_sod_writing.md",
-    ]
-    return [Path(p) for p in candidates if p]
+def _writing_spec_name(value: object) -> str:
+    """Accept one Markdown filename, never a caller-controlled path."""
+
+    name = str(value or "").strip()
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+        or "\x00" in name
+        or not name.lower().endswith(".md")
+        or name != os.path.basename(name)
+    ):
+        raise ValueError("writing specification file is unsafe")
+    return name
 
 
-def _read_writing_spec(path: Path) -> str | None:
+def _writing_spec_candidates() -> list[str]:
+    candidates: list[str] = []
+    if REPORT_AGENT_WRITING_SPEC_FILE:
+        candidates.append(_writing_spec_name(REPORT_AGENT_WRITING_SPEC_FILE))
+    candidates.extend(
+        [
+            os.path.basename(_DEFAULT_DEFENSETRACKER_SOD_FILE),
+            "report_agent_sod_writing.md",
+        ]
+    )
+    return list(dict.fromkeys(candidates))
+
+
+def _read_writing_spec(name: str) -> str | None:
     """Read one pinned, regular UTF-8 file from the public docs root."""
 
     descriptor = -1
     try:
         root = _WRITING_SPEC_ROOT.resolve(strict=True)
-        resolved = path.resolve(strict=True)
+        safe_name = _writing_spec_name(name)
+        candidate = None
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name == safe_name:
+                    candidate = entry.path
+                    break
+        if candidate is None:
+            return None
+        resolved = Path(candidate).resolve(strict=True)
         resolved.relative_to(root)
-        if os.path.normcase(os.path.abspath(path)) != os.path.normcase(
+        if os.path.normcase(os.path.abspath(candidate)) != os.path.normcase(
             str(resolved)
         ):
             raise ValueError("writing specification file is unsafe")
-        before = os.lstat(path)
+        before = os.lstat(candidate)
         if (
             stat.S_ISLNK(before.st_mode)
             or not stat.S_ISREG(before.st_mode)
@@ -648,7 +679,7 @@ def _read_writing_spec(path: Path) -> str | None:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
+        descriptor = os.open(candidate, flags)
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)

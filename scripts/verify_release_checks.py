@@ -36,19 +36,30 @@ EXPECTED_CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 # so a similarly named job from any other workflow cannot satisfy the gate.
 EXPECTED_CODEQL_WORKFLOW_PATH = "dynamic/github-code-scanning/codeql"
 EXPECTED_CODEQL_EVENT = "dynamic"
-REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+EXPECTED_REPOSITORY = "player1314520/defense-tracker-mvp"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 WorkflowRunLoader = Callable[[int], dict[str, object]]
 
 
+def _require_expected_repository(repository: str) -> None:
+    if repository != EXPECTED_REPOSITORY:
+        raise ValueError(
+            "Release checks may query only the pinned public repository: "
+            + EXPECTED_REPOSITORY
+        )
+
+
 def load_check_runs(repository: str, sha: str, token: str) -> list[dict[str, object]]:
+    _require_expected_repository(repository)
+    if SHA_RE.fullmatch(sha) is None:
+        raise ValueError("Release SHA is malformed")
     all_runs: list[dict[str, object]] = []
     seen_run_ids: set[int] = set()
     expected_total: int | None = None
     page = 1
     while True:
         url = (
-            f"https://api.github.com/repos/{repository}/commits/{sha}/check-runs"
+            f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/commits/{sha}/check-runs"
             f"?per_page=100&filter=latest&page={page}"
         )
         request = urllib.request.Request(
@@ -119,8 +130,7 @@ def _verify_required_check_set(
 def _group_required_check_suites(
     check_runs: list[dict[str, object]], *, repository: str
 ) -> dict[tuple[int, int], list[dict[str, object]]]:
-    if REPOSITORY_RE.fullmatch(repository) is None:
-        raise ValueError("Repository name is malformed")
+    _require_expected_repository(repository)
     details_re = re.compile(
         rf"^https://github\.com/{re.escape(repository)}/actions/runs/([1-9][0-9]*)/job/[1-9][0-9]*$"
     )
@@ -227,6 +237,7 @@ def verify(
         raise ValueError(
             "repository, sha and workflow_run_loader are required for provenance verification"
         )
+    _require_expected_repository(repository)
     if SHA_RE.fullmatch(sha) is None:
         raise ValueError("Release SHA is malformed")
     suites = _group_required_check_suites(check_runs, repository=repository)
@@ -270,7 +281,10 @@ def verify(
 
 
 def load_workflow_run(repository: str, run_id: int, token: str) -> dict[str, object]:
-    url = f"https://api.github.com/repos/{repository}/actions/runs/{run_id}"
+    _require_expected_repository(repository)
+    if type(run_id) is not int or run_id <= 0:
+        raise ValueError("Workflow run ID is malformed")
+    url = f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/actions/runs/{run_id}"
     request = urllib.request.Request(
         url,
         headers={
@@ -325,8 +339,8 @@ def main() -> int:
     args = parser.parse_args()
     if not args.token:
         raise SystemExit("GITHUB_TOKEN is required")
-    if REPOSITORY_RE.fullmatch(args.repository) is None or SHA_RE.fullmatch(args.sha) is None:
-        raise SystemExit("repository or sha is malformed")
+    if args.repository != EXPECTED_REPOSITORY or SHA_RE.fullmatch(args.sha) is None:
+        raise SystemExit("repository or sha is not the pinned release target")
     verify(
         load_check_runs(args.repository, args.sha, args.token),
         repository=args.repository,

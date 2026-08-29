@@ -85,7 +85,7 @@ def issue_device_token(device_name: str):
             "VALUES(?,?,?,?)",
             (_hash(plaintext), plaintext[:6], normalized_name, _now()))
         dev_id = cur.lastrowid
-    logger.info("设备 token 已发放: id=%s name=%s", dev_id, normalized_name)
+    logger.info("设备 token 已发放: id=%s", dev_id)
     return plaintext, dev_id
 
 

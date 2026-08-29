@@ -231,8 +231,8 @@ def test_feishu_ai_invalid_response_log_excludes_body_prompt_and_user_content(
     secret = "response-secret-must-not-be-logged"
     prompt = "user-prompt-must-not-be-logged"
     monkeypatch.setattr(
-        cloud.requests,
-        "post",
+        cloud,
+        "pinned_post",
         lambda *args, **kwargs: _AiResponse({"choices": [], "body": secret}),
     )
 
@@ -255,8 +255,8 @@ def test_feishu_ai_empty_content_log_maps_untrusted_finish_reason_to_enum(
     monkeypatch.setitem(cloud.AI_CONFIG, "base_url", "https://api.deepseek.com")
     secret = "finish-reason-secret-must-not-be-logged"
     monkeypatch.setattr(
-        cloud.requests,
-        "post",
+        cloud,
+        "pinned_post",
         lambda *args, **kwargs: _AiResponse({
             "choices": [{"message": {"content": ""}, "finish_reason": secret}],
         }),
@@ -278,8 +278,8 @@ def test_feishu_multimodal_ai_invalid_response_log_excludes_body_and_prompt(
     secret = "multimodal-response-secret"
     prompt = "multimodal-user-prompt"
     monkeypatch.setattr(
-        cloud.requests,
-        "post",
+        cloud,
+        "pinned_post",
         lambda *args, **kwargs: _AiResponse({"choices": [], "body": secret}),
     )
 
@@ -329,11 +329,11 @@ def test_feishu_ai_simpleai_allowlist_never_disables_tls_verification(
             "choices": [{"message": {"content": "ok"}}],
         })
 
-    monkeypatch.setattr(cloud.requests, "post", fake_post)
+    monkeypatch.setattr(cloud, "pinned_post", fake_post)
 
     assert _invoke_cloud_ai(cloud, multimodal=multimodal) == "ok"
     assert len(calls) == 1
-    assert calls[0][1].get("verify", True) is True
+    assert "verify" not in calls[0][1]
 
 
 @pytest.mark.parametrize("multimodal", [False, True])
@@ -361,9 +361,9 @@ def test_feishu_ai_rejects_untrusted_endpoint_before_requests(
     monkeypatch.setitem(cloud.AI_CONFIG, "base_url", base_url)
     monkeypatch.setitem(cloud.AI_CONFIG, "allowed_hosts", "")
     monkeypatch.setattr(
-        cloud.requests,
-        "post",
-        lambda *args, **kwargs: pytest.fail("untrusted endpoint must fail before requests.post"),
+        cloud,
+        "pinned_post",
+        lambda *args, **kwargs: pytest.fail("untrusted endpoint must fail before pinned_post"),
     )
 
     with pytest.raises(ValueError, match="AI_BASE_URL"):
@@ -391,9 +391,9 @@ def test_feishu_ai_rejects_malformed_allowed_hosts_before_requests(
     monkeypatch.setitem(cloud.AI_CONFIG, "base_url", "https://ai.example.com/v1")
     monkeypatch.setitem(cloud.AI_CONFIG, "allowed_hosts", allowed_hosts)
     monkeypatch.setattr(
-        cloud.requests,
-        "post",
-        lambda *args, **kwargs: pytest.fail("malformed allowlist must fail before requests.post"),
+        cloud,
+        "pinned_post",
+        lambda *args, **kwargs: pytest.fail("malformed allowlist must fail before pinned_post"),
     )
 
     with pytest.raises(ValueError, match="AI_ALLOWED_HOSTS"):
@@ -411,11 +411,11 @@ def test_feishu_ai_explicit_custom_https_host_is_allowed_with_default_tls(monkey
         calls.append((url, kwargs))
         return _AiResponse({"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr(cloud.requests, "post", fake_post)
+    monkeypatch.setattr(cloud, "pinned_post", fake_post)
 
     assert cloud._call_ai([{"role": "user", "content": "unit prompt"}]) == "ok"
     assert calls[0][0] == "https://ai.example.com/v1/chat/completions"
-    assert calls[0][1].get("verify", True) is True
+    assert "verify" not in calls[0][1]
 
 
 @pytest.mark.parametrize(

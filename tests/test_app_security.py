@@ -200,6 +200,25 @@ def test_brief_download_rejects_path_components_instead_of_coercing_basename(
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "requested_name",
+    ["/tmp/report.docx", r"C:\\private\\report.docx", "nested/report.docx"],
+)
+def test_brief_download_rejects_absolute_and_nested_paths(
+    monkeypatch, client, tmp_path, requested_name
+):
+    output_root = tmp_path / "manual"
+    output_root.mkdir()
+    monkeypatch.setattr(tracker, "_BRIEF_OUTPUT_DIR", str(output_root))
+
+    response = client.get(
+        "/api/brief/download_file",
+        query_string={"kind": "manual", "f": requested_name},
+    )
+
+    assert response.status_code == 400
+
+
 def test_brief_download_serves_regular_file_from_fixed_root(
     monkeypatch, client, tmp_path
 ):
@@ -572,8 +591,7 @@ def test_main_cloud_session_uses_canonical_vault_and_migrates_selected_bug_path(
             self.vault = vault
             self.client = client
 
-    monkeypatch.setenv("DEFENSE_TRACKER_SUPABASE_CONFIG", str(explicit_config))
-    monkeypatch.setattr(tracker, "CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setattr(tracker, "CONFIG_DIR", str(explicit_config.parent))
     monkeypatch.setattr(tracker, "VAULT_DIR", str(canonical_vault))
     monkeypatch.setattr(tracker, "SupabaseSettings", FakeSettings)
     monkeypatch.setattr(tracker, "SessionVault", FakeVault)

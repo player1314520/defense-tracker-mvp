@@ -57,7 +57,7 @@ def test_hash_stored_not_plaintext(devices):
     assert len(row["token_hash"]) == 64  # sha256 hex
 
 
-def test_device_name_is_bounded_and_single_line_in_storage_and_logs(devices, caplog):
+def test_device_name_is_bounded_in_storage_and_excluded_from_logs(devices, caplog):
     supplied = "终端\r\n伪造日志\u2028" + ("A" * 100)
 
     with caplog.at_level(logging.INFO, logger="auth_devices"):
@@ -67,9 +67,10 @@ def test_device_name_is_bounded_and_single_line_in_storage_and_logs(devices, cap
     assert stored == "终端 伪造日志 " + ("A" * 56)
     assert len(stored) == 64
     assert "\r" not in stored and "\n" not in stored and "\u2028" not in stored
-    assert caplog.records[-1].getMessage().endswith(f"name={stored}")
-    assert "\r" not in caplog.records[-1].getMessage()
-    assert "\n" not in caplog.records[-1].getMessage()
+    message = caplog.records[-1].getMessage()
+    assert message.startswith("设备 token 已发放: id=")
+    assert stored not in message
+    assert supplied not in message
 
 
 def test_endpoints_issue_and_revoke(monkeypatch, tmp_path):

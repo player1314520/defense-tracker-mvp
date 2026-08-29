@@ -42,11 +42,13 @@ from scripts.verify_release_assets import verify as verify_release_assets
 from scripts.verify_release_checks import (
     EXPECTED_CODEQL_EVENT,
     EXPECTED_CODEQL_WORKFLOW_PATH,
+    EXPECTED_REPOSITORY,
     GITHUB_ACTIONS_APP_ID,
     REQUIRED_CHECKS,
     REQUIRED_CI_CHECKS,
     REQUIRED_CODEQL_CHECKS,
     load_check_runs,
+    load_workflow_run,
     verify as verify_checks,
     verify_workflow_run,
 )
@@ -1123,7 +1125,7 @@ def _required_check_suite(run_id, suite_id, names):
             "conclusion": "success",
             "app": {"id": GITHUB_ACTIONS_APP_ID, "slug": "github-actions"},
             "details_url": (
-                f"https://github.com/owner/repo/actions/runs/{run_id}/job/456"
+                f"https://github.com/{EXPECTED_REPOSITORY}/actions/runs/{run_id}/job/456"
             ),
             "check_suite": {"id": suite_id},
         }
@@ -1149,7 +1151,7 @@ def _required_ci_workflow_run(run_id, suite_id, **overrides):
         "event": "push",
         "status": "completed",
         "conclusion": "success",
-        "repository": {"full_name": "owner/repo"},
+        "repository": {"full_name": EXPECTED_REPOSITORY},
     }
     workflow.update(overrides)
     return workflow
@@ -1187,11 +1189,53 @@ def test_required_check_loader_fetches_every_reported_page(monkeypatch):
         "scripts.verify_release_checks.urllib.request.urlopen", fake_urlopen
     )
 
-    check_runs = load_check_runs("owner/repo", COMMIT, "token")
+    check_runs = load_check_runs(EXPECTED_REPOSITORY, COMMIT, "token")
 
     assert [run["id"] for run in check_runs] == list(range(1, 102))
+    assert requested_urls[0].startswith(
+        f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/commits/{COMMIT}/check-runs"
+    )
     assert requested_urls[0].endswith("filter=latest&page=1")
     assert requested_urls[1].endswith("filter=latest&page=2")
+
+
+def test_required_check_loaders_refuse_any_other_repository_before_network(monkeypatch):
+    def fail_urlopen(*_args, **_kwargs):
+        raise AssertionError("untrusted repository reached the network")
+
+    monkeypatch.setattr(
+        "scripts.verify_release_checks.urllib.request.urlopen", fail_urlopen
+    )
+
+    with pytest.raises(ValueError, match="pinned public repository"):
+        load_check_runs("attacker/fork", COMMIT, "token")
+    with pytest.raises(ValueError, match="pinned public repository"):
+        verify_checks(
+            [],
+            repository="attacker/fork",
+            sha=COMMIT,
+            workflow_run_loader=lambda _run_id: {},
+        )
+    with pytest.raises(ValueError, match="malformed"):
+        load_check_runs(EXPECTED_REPOSITORY, COMMIT.upper(), "token")
+
+
+def test_required_workflow_loader_uses_fixed_repository_url(monkeypatch):
+    requested_urls = []
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 30
+        requested_urls.append(request.full_url)
+        return io.BytesIO(b"{}")
+
+    monkeypatch.setattr(
+        "scripts.verify_release_checks.urllib.request.urlopen", fake_urlopen
+    )
+
+    assert load_workflow_run(EXPECTED_REPOSITORY, 123, "token") == {}
+    assert requested_urls == [
+        f"https://api.github.com/repos/{EXPECTED_REPOSITORY}/actions/runs/123"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1223,7 +1267,7 @@ def test_required_check_loader_rejects_changed_or_truncated_pagination(
     )
 
     with pytest.raises(ValueError, match="pagination"):
-        load_check_runs("owner/repo", COMMIT, "token")
+        load_check_runs(EXPECTED_REPOSITORY, COMMIT, "token")
 
 
 def test_required_check_gate_rejects_any_non_success():
@@ -1237,7 +1281,7 @@ def test_required_check_gate_rejects_any_non_success():
     assert (
         verify_checks(
             successful,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader=workflow_runs.__getitem__,
         )
@@ -1247,7 +1291,7 @@ def test_required_check_gate_rejects_any_non_success():
     with pytest.raises(ValueError, match="not green"):
         verify_checks(
             successful,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader=workflow_runs.__getitem__,
         )
@@ -1261,7 +1305,7 @@ def test_required_check_gate_rejects_spoofed_or_mixed_sources():
     with pytest.raises(ValueError, match="untrusted publisher"):
         verify_checks(
             successful,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: _required_ci_workflow_run(123, 789),
@@ -1269,11 +1313,13 @@ def test_required_check_gate_rejects_spoofed_or_mixed_sources():
             }.__getitem__,
         )
     successful[0]["app"] = {"id": GITHUB_ACTIONS_APP_ID, "slug": "github-actions"}
-    successful[0]["details_url"] = "https://github.com/owner/repo/actions/runs/124/job/456"
+    successful[0]["details_url"] = (
+        f"https://github.com/{EXPECTED_REPOSITORY}/actions/runs/124/job/456"
+    )
     with pytest.raises(ValueError, match="missing"):
         verify_checks(
             successful,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: _required_ci_workflow_run(123, 789),
@@ -1281,12 +1327,14 @@ def test_required_check_gate_rejects_spoofed_or_mixed_sources():
                 223: _required_codeql_workflow_run(223, 889),
             }.__getitem__,
         )
-    successful[0]["details_url"] = "https://github.com/owner/repo/actions/runs/123/job/456"
+    successful[0]["details_url"] = (
+        f"https://github.com/{EXPECTED_REPOSITORY}/actions/runs/123/job/456"
+    )
     successful.append(dict(successful[0]))
     with pytest.raises(ValueError, match="duplicates"):
         verify_checks(
             successful,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: _required_ci_workflow_run(123, 789),
@@ -1299,8 +1347,8 @@ def test_required_check_gate_rejects_spoofed_or_mixed_sources():
     "kwargs",
     [
         {},
-        {"repository": "owner/repo"},
-        {"repository": "owner/repo", "sha": COMMIT},
+        {"repository": EXPECTED_REPOSITORY},
+        {"repository": EXPECTED_REPOSITORY, "sha": COMMIT},
     ],
 )
 def test_required_check_gate_rejects_missing_provenance_inputs(kwargs):
@@ -1327,7 +1375,7 @@ def test_required_check_gate_selects_exact_push_suite_among_duplicate_named_runs
     assert (
         verify_checks(
             check_runs,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader=workflow_runs.__getitem__,
         )
@@ -1358,7 +1406,7 @@ def test_required_check_gate_rejects_invalid_selected_push_suite(invalid_shape):
     with pytest.raises(ValueError, match=expected_error):
         verify_checks(
             check_runs,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader=workflow_runs.__getitem__,
         )
@@ -1382,7 +1430,7 @@ def test_required_check_gate_rejects_wrong_workflow_provenance(field, value):
         verify_checks(
             _required_ci_check_suite(123, 789)
             + _required_codeql_check_suite(223, 889),
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: workflow,
@@ -1403,7 +1451,7 @@ def test_required_check_gate_rejects_multiple_exact_push_suites():
             _required_ci_check_suite(123, 789)
             + _required_ci_check_suite(124, 790)
             + _required_codeql_check_suite(223, 889),
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader=workflow_runs.__getitem__,
         )
@@ -1444,7 +1492,7 @@ def test_required_check_gate_rejects_invalid_codeql_suite(invalid_shape):
     with pytest.raises(ValueError, match=expected_error):
         verify_checks(
             _required_ci_check_suite(123, 789) + codeql_runs,
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: _required_ci_workflow_run(123, 789),
@@ -1457,7 +1505,7 @@ def test_required_check_gate_rejects_all_codeql_checks_missing():
     with pytest.raises(ValueError, match="CodeQL.*found=0"):
         verify_checks(
             _required_ci_check_suite(123, 789),
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={123: _required_ci_workflow_run(123, 789)}.__getitem__,
         )
@@ -1483,7 +1531,7 @@ def test_required_check_gate_rejects_wrong_codeql_provenance(field, value):
         verify_checks(
             _required_ci_check_suite(123, 789)
             + _required_codeql_check_suite(223, 889),
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: _required_ci_workflow_run(123, 789),
@@ -1498,7 +1546,7 @@ def test_required_check_gate_rejects_multiple_exact_codeql_suites():
             _required_ci_check_suite(123, 789)
             + _required_codeql_check_suite(223, 889)
             + _required_codeql_check_suite(224, 890),
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: _required_ci_workflow_run(123, 789),
@@ -1515,7 +1563,7 @@ def test_required_check_gate_rejects_cross_workflow_check_mixing():
     with pytest.raises(ValueError, match="another workflow"):
         verify_checks(
             ci_runs + _required_codeql_check_suite(223, 889),
-            repository="owner/repo",
+            repository=EXPECTED_REPOSITORY,
             sha=COMMIT,
             workflow_run_loader={
                 123: _required_ci_workflow_run(123, 789),
@@ -1533,12 +1581,16 @@ def test_required_ci_workflow_run_is_exact_main_push():
         "event": "push",
         "status": "completed",
         "conclusion": "success",
-        "repository": {"full_name": "owner/repo"},
+        "repository": {"full_name": EXPECTED_REPOSITORY},
     }
-    verify_workflow_run(workflow, repository="owner/repo", sha=COMMIT, run_id=123)
+    verify_workflow_run(
+        workflow, repository=EXPECTED_REPOSITORY, sha=COMMIT, run_id=123
+    )
     workflow["path"] = ".github/workflows/spoof.yml"
     with pytest.raises(ValueError, match="provenance mismatch"):
-        verify_workflow_run(workflow, repository="owner/repo", sha=COMMIT, run_id=123)
+        verify_workflow_run(
+            workflow, repository=EXPECTED_REPOSITORY, sha=COMMIT, run_id=123
+        )
 
 
 def test_deployment_evidence_schema_3_binds_raw_evidence_and_recomputes_thresholds(tmp_path):

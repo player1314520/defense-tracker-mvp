@@ -7,11 +7,13 @@
 得到的引用与各模块始终指向同一对象、保持同步。
 """
 import json
-import os, sys, threading
 import hashlib
+import os
 import shutil
 import stat
+import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,24 +161,20 @@ def resolve_supabase_config_path(
     environ: Mapping[str, str],
     config_dir: Path | str,
 ) -> Path | None:
-    """Select the V9 public config without deriving any secret-state path."""
-    candidates: list[Path] = []
-    explicit = (environ.get("DEFENSE_TRACKER_SUPABASE_CONFIG") or "").strip()
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    candidates.append(Path(config_dir) / _SUPABASE_CONFIG_FILE)
-    local_app_data = (environ.get("LOCALAPPDATA") or "").strip()
-    if local_app_data:
-        candidates.append(
-            Path(local_app_data)
-            / "DefenseTracker"
-            / "config"
-            / _SUPABASE_CONFIG_FILE
-        )
-    for candidate in candidates:
-        absolute = Path(os.path.abspath(candidate))
-        if absolute.is_file():
-            return absolute
+    """Select the fixed V9 config inside the established runtime config root.
+
+    ``config_dir`` is resolved by the runtime-layout boundary.  Environment
+    values must not introduce a second arbitrary read root here: packaged
+    layouts already place ``config_dir`` under the platform data directory,
+    while source layouts deliberately use the project root.
+    """
+    del environ  # Kept in the signature for backwards-compatible callers.
+    trusted_config_dir = Path(os.path.abspath(config_dir))
+    if not _require_safe_directory(trusted_config_dir, create=False):
+        return None
+    candidate = trusted_config_dir / _SUPABASE_CONFIG_FILE
+    if _require_safe_regular_file(candidate) is not None:
+        return candidate
     return None
 
 
@@ -346,7 +344,11 @@ def _migrate_legacy_supabase_vault(
     canonical_vault: Path | str,
 ) -> dict[str, int]:
     """Copy only the two files written through the old config-derived vault."""
-    config_path = Path(selected_config)
+    config_path = Path(os.path.abspath(selected_config))
+    if config_path.name != _SUPABASE_CONFIG_FILE:
+        raise _unsafe_vault_entry()
+    if _require_safe_regular_file(config_path) is None:
+        raise _unsafe_vault_entry()
     legacy_vault = config_path.parent.parent / "vault"
     destination_vault = Path(canonical_vault)
     _require_safe_directory(

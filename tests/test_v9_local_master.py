@@ -324,7 +324,7 @@ def test_release_zip_clears_ambient_git_repository_overrides(monkeypatch, tmp_pa
     assert zipfile.is_zipfile(output)
 
 
-def test_release_zip_replaces_output_path_without_following_hardlinks(tmp_path):
+def test_release_zip_refuses_existing_output_and_preserves_hardlink_victim(tmp_path):
     import scripts.make_release_zip as release_zip
 
     project_root, expected_sha = _release_repo(tmp_path)
@@ -336,11 +336,68 @@ def test_release_zip_replaces_output_path_without_following_hardlinks(tmp_path):
     except OSError as exc:
         pytest.skip(f"hard links unavailable on this test volume: {exc}")
 
-    release_zip.make_release_zip(project_root, output, expected_sha=expected_sha)
+    with pytest.raises(RuntimeError, match="existing output"):
+        release_zip.make_release_zip(project_root, output, expected_sha=expected_sha)
 
     assert victim.read_bytes() == b"do not overwrite this file"
-    assert zipfile.is_zipfile(output)
+    assert output.read_bytes() == b"do not overwrite this file"
     assert not list(tmp_path.glob(".source-release.zip.*.tmp"))
+
+
+def test_release_zip_cli_output_is_confined_and_new(tmp_path):
+    import scripts.make_release_zip as release_zip
+
+    source = (Path(release_zip.__file__)).read_text(encoding="utf-8")
+    main_source = source[source.index("def main()") :]
+    assert '"--output"' not in main_source
+    assert 'Path("build/release-evidence/source-zips")' in main_source
+
+    project_root, _expected_sha = _release_repo(tmp_path)
+    first = release_zip.validate_cli_output(
+        project_root, Path("build/release-evidence/source-zips/first.zip")
+    )
+
+    assert first == project_root / "build/release-evidence/source-zips/first.zip"
+    first.write_bytes(b"existing")
+    with pytest.raises(RuntimeError, match="existing output"):
+        release_zip.validate_cli_output(project_root, first)
+    with pytest.raises(RuntimeError, match="must remain under"):
+        release_zip.validate_cli_output(project_root, tmp_path / "escape.zip")
+
+
+def test_release_zip_cli_allows_two_distinct_deterministic_outputs(tmp_path):
+    import scripts.make_release_zip as release_zip
+
+    project_root, expected_sha = _release_repo(tmp_path, "docs/tracked.txt")
+    first = release_zip.validate_cli_output(
+        project_root, Path("build/release-evidence/source-zips/first.zip")
+    )
+    second = release_zip.validate_cli_output(
+        project_root, Path("build/release-evidence/source-zips/second.zip")
+    )
+
+    release_zip.make_release_zip(project_root, first, expected_sha=expected_sha)
+    release_zip.make_release_zip(project_root, second, expected_sha=expected_sha)
+
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_release_zip_cli_output_refuses_link_parent(tmp_path):
+    import scripts.make_release_zip as release_zip
+
+    project_root, _expected_sha = _release_repo(tmp_path)
+    evidence = project_root / "build" / "release-evidence"
+    evidence.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = evidence / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory links unavailable on this test volume: {exc}")
+
+    with pytest.raises(RuntimeError, match="link or non-directory"):
+        release_zip.validate_cli_output(project_root, linked / "release.zip")
 
 
 @pytest.mark.parametrize(
