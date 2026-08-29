@@ -846,6 +846,19 @@ def test_cloud_deployment_allowlist_excludes_full_text_runtime():
         assert required in staging
 
 
+def test_full_stack_server_pins_lxml_with_the_xxe_default_fix():
+    root = Path(__file__).resolve().parents[1]
+    input_text = (root / "deploy/requirements.server.in").read_text(
+        encoding="utf-8"
+    )
+    lock_text = (root / "deploy/requirements.server.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert re.search(r"(?m)^lxml==6\.1\.2$", input_text)
+    assert re.search(r"(?m)^lxml==6\.1\.2 \\$", lock_text)
+
+
 def test_full_stack_server_uses_a_reproducible_hash_lock():
     root = Path(__file__).resolve().parents[1]
     input_text = (root / "deploy/requirements.server.in").read_text(
