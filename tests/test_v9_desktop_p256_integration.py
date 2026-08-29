@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -312,6 +313,60 @@ def test_owner_manifest_windows_acl_tools_fail_closed(
 
     with pytest.raises(PermissionError, match=message):
         exporter._harden_windows_private_file(tmp_path / "owner.tmp")
+
+
+def test_owner_export_session_uses_canonical_vault_and_selected_config(
+    tmp_path,
+    monkeypatch,
+):
+    import scripts.export_mvp_owner_manifest as exporter
+
+    explicit_config = (
+        tmp_path / "external" / "config" / ".supabase_v9_config.json"
+    )
+    explicit_config.parent.mkdir(parents=True)
+    explicit_config.write_text("{}", encoding="utf-8")
+    old_bug_vault = explicit_config.parent.parent / "vault"
+    old_bug_vault.mkdir()
+    (old_bug_vault / "supabase-pkce.vault").write_bytes(b"legacy-pkce")
+    canonical_vault = tmp_path / "canonical-vault"
+    loaded = []
+    vaults = []
+
+    class FakeSettings:
+        @classmethod
+        def load(cls, path):
+            loaded.append(Path(path))
+            return cls()
+
+    class FakeVault:
+        def __init__(self, path):
+            vaults.append(Path(path))
+
+    class FakeHttpClient:
+        def __init__(self, _settings):
+            pass
+
+    class FakeSessionManager:
+        def __init__(self, settings, vault, client):
+            self.settings = settings
+            self.vault = vault
+            self.client = client
+
+    monkeypatch.setattr(exporter, "CONFIG_DIR", explicit_config.parent)
+    monkeypatch.setattr(exporter, "VAULT_DIR", canonical_vault)
+    monkeypatch.setattr(exporter, "SupabaseSettings", FakeSettings)
+    monkeypatch.setattr(exporter, "SessionVault", FakeVault)
+    monkeypatch.setattr(exporter, "SupabaseHttpClient", FakeHttpClient)
+    monkeypatch.setattr(exporter, "SupabaseSessionManager", FakeSessionManager)
+
+    session = exporter._authenticated_cloud_session()
+
+    assert isinstance(session, FakeSessionManager)
+    assert loaded == [explicit_config.resolve()]
+    assert vaults == [canonical_vault]
+    assert (canonical_vault / "supabase-pkce.vault").read_bytes() == b"legacy-pkce"
+    assert (old_bug_vault / "supabase-pkce.vault").read_bytes() == b"legacy-pkce"
 
 
 class _Settings:

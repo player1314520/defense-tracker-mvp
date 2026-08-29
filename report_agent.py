@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -45,12 +46,18 @@ except ImportError:
 REPORT_AGENT_DB_FILE = os.path.join(DATA_DIR, "report_agent.sqlite3")
 _DB_LOCK = threading.Lock()
 REPORT_AGENT_WRITING_SPEC_FILE = os.environ.get("REPORT_AGENT_WRITING_SPEC_FILE", "")
+_WRITING_SPEC_ROOT = Path(__file__).resolve().parent / "docs"
 _DEFAULT_DEFENSETRACKER_SOD_FILE = os.path.join(
-    str(Path(__file__).resolve().parent),
-    "docs",
+    str(_WRITING_SPEC_ROOT),
     "defensetracker_sod_writing.md",
 )
 _WRITING_SPEC_MAX_CHARS = 6000
+_WRITING_SPEC_MAX_BYTES = 256 * 1024
+_WINDOWS_REPARSE_POINT = 0x0400
+MAX_REPORT_TEXT_CHARS = 2 * 1024 * 1024
+MAX_REPORT_LINE_CHARS = 32 * 1024
+MAX_REPORT_REQUEST_CHARS = 4096
+MAX_REPORT_TITLE_CHARS = 512
 
 REPORT_TYPE_DEFAULTS = {
     "strategic": {"target_count": 12, "time_window_days": 14, "label": "战略分析报告"},
@@ -105,8 +112,18 @@ _SOD_WRITING_FALLBACK = """DefenseTracker SOD/SOP写作要求（内置摘要）�
 10. 证据不足处必须标注待核实或后续跟踪，不得补写虚构数据、来源和结论。"""
 
 
-def sanitize_report_text(value: str) -> str:
+def require_report_text_bounds(value: str) -> str:
+    """Fail before report regex/Markdown parsing can process an oversized value."""
     text = str(value or "")
+    if len(text) > MAX_REPORT_TEXT_CHARS:
+        raise ValueError("报告文本超过 2 MiB 字符限制")
+    if any(len(line) > MAX_REPORT_LINE_CHARS for line in text.splitlines()):
+        raise ValueError("报告文本单行超过 32 KiB 字符限制")
+    return text
+
+
+def sanitize_report_text(value: str) -> str:
+    text = require_report_text_bounds(value)
     for term in FORBIDDEN_CLASSIFICATION_TERMS:
         text = text.replace(term, "")
     text = re.sub(r"[ \t]+([，。；：、,.!?！？])", r"\1", text)
@@ -145,7 +162,10 @@ def _parse_chinese_number_under_100(text: str) -> int | None:
 
 
 def extract_target_word_count(*values) -> int | None:
-    text = " ".join(str(v or "") for v in values)
+    text = " ".join(
+        require_report_text_bounds(v)[:MAX_REPORT_REQUEST_CHARS]
+        for v in values
+    )
     patterns = [
         r"(\d+(?:\.\d+)?)\s*万\s*字",
         r"([一二两三四五六七八九十]{1,4})\s*万\s*字",
@@ -386,7 +406,7 @@ def build_delivery_preflight(project: dict, draft: dict, evidence: list[dict] | 
     project = project or {}
     draft = draft or {}
     evidence_rows = list(evidence or [])
-    content = str(draft.get("content") or "")
+    content = require_report_text_bounds(draft.get("content") or "")
     base_counts = {
         "evidence": len(evidence_rows),
         "valid_links": 0,
@@ -594,13 +614,93 @@ def assert_report_exportable(draft: dict, project: dict | None = None,
     return quality
 
 
+def _writing_spec_name(value: object) -> str:
+    """Accept one Markdown filename, never a caller-controlled path."""
+
+    name = str(value or "").strip()
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+        or "\x00" in name
+        or not name.lower().endswith(".md")
+        or name != os.path.basename(name)
+    ):
+        raise ValueError("writing specification file is unsafe")
+    return name
+
+
 def _writing_spec_candidates() -> list[str]:
-    candidates = [
-        REPORT_AGENT_WRITING_SPEC_FILE,
-        _DEFAULT_DEFENSETRACKER_SOD_FILE,
-        os.path.join(Path(__file__).resolve().parent, "docs", "report_agent_sod_writing.md"),
-    ]
-    return [p for p in candidates if p]
+    candidates: list[str] = []
+    if REPORT_AGENT_WRITING_SPEC_FILE:
+        candidates.append(_writing_spec_name(REPORT_AGENT_WRITING_SPEC_FILE))
+    candidates.extend(
+        [
+            os.path.basename(_DEFAULT_DEFENSETRACKER_SOD_FILE),
+            "report_agent_sod_writing.md",
+        ]
+    )
+    return list(dict.fromkeys(candidates))
+
+
+def _read_writing_spec(name: str) -> str | None:
+    """Read one pinned, regular UTF-8 file from the public docs root."""
+
+    descriptor = -1
+    try:
+        root = _WRITING_SPEC_ROOT.resolve(strict=True)
+        safe_name = _writing_spec_name(name)
+        candidate = None
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name == safe_name:
+                    candidate = entry.path
+                    break
+        if candidate is None:
+            return None
+        resolved = Path(candidate).resolve(strict=True)
+        resolved.relative_to(root)
+        if os.path.normcase(os.path.abspath(candidate)) != os.path.normcase(
+            str(resolved)
+        ):
+            raise ValueError("writing specification file is unsafe")
+        before = os.lstat(candidate)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or bool(
+                getattr(before, "st_file_attributes", 0)
+                & _WINDOWS_REPARSE_POINT
+            )
+        ):
+            raise ValueError("writing specification file is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (before.st_dev, before.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or opened.st_size > _WRITING_SPEC_MAX_BYTES
+        ):
+            raise ValueError("writing specification file is unsafe")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            payload = handle.read(_WRITING_SPEC_MAX_BYTES + 1)
+        if len(payload) > _WRITING_SPEC_MAX_BYTES:
+            raise ValueError("writing specification file is unsafe")
+        return payload.decode("utf-8-sig").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("writing specification file is unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _extract_relevant_sod_lines(markdown: str) -> str:
@@ -630,19 +730,17 @@ def _extract_relevant_sod_lines(markdown: str) -> str:
 
 def load_report_writing_requirements() -> str:
     for path in _writing_spec_candidates():
-        if not os.path.exists(path):
+        text = _read_writing_spec(path)
+        if text is None:
             continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read().strip()
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="utf-8-sig") as f:
-                text = f.read().strip()
         if not text:
             continue
         excerpt = text if len(text) <= _WRITING_SPEC_MAX_CHARS else _extract_relevant_sod_lines(text)
         excerpt = (excerpt or text[:_WRITING_SPEC_MAX_CHARS]).strip()
-        return f"DefenseTracker SOD/SOP写作要求来源：{path}\n{excerpt[:_WRITING_SPEC_MAX_CHARS]}"
+        return (
+            "DefenseTracker SOD/SOP写作要求（内置公开规范）\n"
+            f"{excerpt[:_WRITING_SPEC_MAX_CHARS]}"
+        )
     return _SOD_WRITING_FALLBACK
 
 
@@ -942,6 +1040,12 @@ def create_project(title: str = "", report_type: str = "strategic", topic: str =
                    time_window_days: int | None = None,
                    target_count: int | None = None, voice: str = DEFAULT_AGENT_VOICE,
                    client_request: str = "") -> dict:
+    if len(str(title or "")) > MAX_REPORT_TITLE_CHARS:
+        raise ValueError("项目标题过长")
+    if len(str(topic or "")) > MAX_REPORT_TITLE_CHARS:
+        raise ValueError("研究主题过长")
+    if len(str(client_request or "")) > MAX_REPORT_REQUEST_CHARS:
+        raise ValueError("客户需求超过 4096 字符限制")
     title = (title or "").strip()
     client_request = _clean_text(client_request)
     report_type = (report_type or "strategic").strip()
@@ -1863,7 +1967,7 @@ def _parse_markdown_table(lines: list[str]) -> list[list[str]]:
 
 
 def _markdown_blocks(content: str) -> list[dict]:
-    lines = content.splitlines()
+    lines = require_report_text_bounds(content).splitlines()
     blocks: list[dict] = []
     i = 0
     while i < len(lines):

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 import threading
 from ctypes import wintypes
@@ -36,6 +37,8 @@ _UUID = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_SETTINGS_FILENAME = ".supabase_v9_config.json"
+_WINDOWS_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 def _ai_provider_name(value: object) -> str:
@@ -65,7 +68,41 @@ class SupabaseSettings:
 
     @classmethod
     def load(cls, path: Path) -> "SupabaseSettings":
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        config_path = Path(os.path.abspath(path))
+        if config_path.name != _SETTINGS_FILENAME:
+            raise ValueError("invalid Supabase V9 config path")
+        try:
+            before = config_path.lstat()
+        except (FileNotFoundError, OSError):
+            raise ValueError("Supabase V9 config is unavailable") from None
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or bool(
+                getattr(before, "st_file_attributes", 0)
+                & _WINDOWS_REPARSE_POINT
+            )
+            or not stat.S_ISREG(before.st_mode)
+        ):
+            raise ValueError("invalid Supabase V9 config path")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(config_path, flags)
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=True) as handle:
+                descriptor = -1
+                opened = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (before.st_dev, before.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    raise ValueError("invalid Supabase V9 config path")
+                raw = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ValueError("Supabase V9 config is unavailable") from None
+        finally:
+            if "descriptor" in locals() and descriptor >= 0:
+                os.close(descriptor)
         if not isinstance(raw, dict):
             raise ValueError("Supabase V9 config must be an object")
         if _FORBIDDEN_CONFIG_KEYS.intersection(

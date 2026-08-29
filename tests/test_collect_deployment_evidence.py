@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import os
+import ssl
 import stat
 import sys
 from datetime import datetime, timedelta, timezone
@@ -21,12 +22,21 @@ from scripts.verify_deployment_evidence import (
 
 COMMIT = "1a2b3c4d5e6f78900112233445566778899aabbc"
 IMAGE_DIGEST = "sha256:" + hashlib.sha256(b"portal image").hexdigest()
+IMAGE_ID = "sha256:" + hashlib.sha256(b"portal image config").hexdigest()
 RUN_ID = 424242
 STAGING_ORIGIN = "https://staging.example.test"
 PRODUCTION_ORIGIN = "https://production.example.test"
 STAGING_CERT = hashlib.sha256(b"staging cert").hexdigest()
 PRODUCTION_CERT = hashlib.sha256(b"production cert").hexdigest()
 SECURE_ENSURE_ROOT = collector._ensure_root
+
+
+def test_deployment_evidence_tls_context_requires_tls12_and_identity_verification():
+    context = collector._tls_client_context()
+
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
 
 
 @pytest.fixture(autouse=True)
@@ -50,9 +60,19 @@ def _collector_machine_identity(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows fail-closed check")
-def test_secure_evidence_root_rejects_windows_runtime(tmp_path):
+def test_secure_evidence_root_rejects_windows_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector, "EVIDENCE_ROOT_BASE", tmp_path)
     with pytest.raises(collector.CollectionError, match="requires a POSIX host"):
-        SECURE_ENSURE_ROOT(tmp_path / "evidence")
+        SECURE_ENSURE_ROOT(tmp_path / COMMIT)
+
+
+def test_secure_evidence_root_rejects_arbitrary_root_before_mutation(tmp_path):
+    arbitrary = tmp_path / COMMIT
+    with pytest.raises(
+        collector.CollectionError, match="fixed release directory"
+    ):
+        SECURE_ENSURE_ROOT(arbitrary)
+    assert not arbitrary.exists()
 
 
 def _root_owned_directory_stat(metadata: os.stat_result, *, mode: int = 0o700, uid: int = 0):
@@ -64,7 +84,7 @@ def _root_owned_directory_stat(metadata: os.stat_result, *, mode: int = 0o700, u
 
 @pytest.mark.skipif(os.name == "nt", reason="dirfd trust checks are POSIX-only")
 def test_secure_evidence_root_rejects_non_root_owned_existing_root(tmp_path, monkeypatch):
-    root = tmp_path / "evidence"
+    root = tmp_path / COMMIT
     root.mkdir()
     real_fstat = os.fstat
 
@@ -76,13 +96,14 @@ def test_secure_evidence_root_rejects_non_root_owned_existing_root(tmp_path, mon
 
     monkeypatch.setattr(collector.os, "geteuid", lambda: 0)
     monkeypatch.setattr(collector.os, "fstat", fake_fstat)
+    monkeypatch.setattr(collector, "EVIDENCE_ROOT_BASE", tmp_path)
     with pytest.raises(collector.CollectionError, match="evidence root is not root-controlled"):
         SECURE_ENSURE_ROOT(root)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="dirfd trust checks are POSIX-only")
 def test_secure_evidence_root_rejects_writable_parent(tmp_path, monkeypatch):
-    root = tmp_path / "trusted-parent" / "evidence"
+    root = tmp_path / "trusted-parent" / COMMIT
     root.mkdir(parents=True)
     writable_parent = root.parent
     real_fstat = os.fstat
@@ -95,6 +116,7 @@ def test_secure_evidence_root_rejects_writable_parent(tmp_path, monkeypatch):
 
     monkeypatch.setattr(collector.os, "geteuid", lambda: 0)
     monkeypatch.setattr(collector.os, "fstat", fake_fstat)
+    monkeypatch.setattr(collector, "EVIDENCE_ROOT_BASE", root.parent)
     with pytest.raises(
         collector.CollectionError, match="evidence root parent is not root-controlled"
     ):
@@ -104,7 +126,7 @@ def test_secure_evidence_root_rejects_writable_parent(tmp_path, monkeypatch):
 @pytest.mark.skipif(os.name == "nt", reason="dirfd trust checks are POSIX-only")
 def test_secure_evidence_root_rejects_symlink_swap_race(tmp_path, monkeypatch):
     parent = tmp_path / "trusted-parent"
-    root = parent / "evidence"
+    root = parent / COMMIT
     attacker = tmp_path / "attacker"
     root.mkdir(parents=True)
     attacker.mkdir()
@@ -126,6 +148,7 @@ def test_secure_evidence_root_rejects_symlink_swap_race(tmp_path, monkeypatch):
     monkeypatch.setattr(collector.os, "geteuid", lambda: 0)
     monkeypatch.setattr(collector.os, "fstat", fake_fstat)
     monkeypatch.setattr(collector.os, "open", racing_open)
+    monkeypatch.setattr(collector, "EVIDENCE_ROOT_BASE", parent)
     with pytest.raises(collector.CollectionError, match="changed or contains a symbolic link"):
         SECURE_ENSURE_ROOT(root)
     assert swapped
@@ -182,6 +205,78 @@ def _env() -> dict[str, str]:
     }
 
 
+def _release_fields() -> dict[str, object]:
+    return {
+        "version": "9.0.0",
+        "semantic_version": "9.0.0",
+        "display_version": "V9",
+        "release_tag": "v9.0.0",
+        "build_commit": COMMIT,
+        "wire_compatibility": "mvp-wire-v1",
+    }
+
+
+def _public_response(name: str, challenge: str) -> bytes:
+    payload: dict[str, object] = {
+        **_release_fields(),
+        "evidence_challenge": challenge,
+    }
+    if name in {"health", "api_status"}:
+        payload.update(
+            {"status": "ok", "mode": "ciphertext-only", "sync_backend": "supabase"}
+        )
+    else:
+        payload.update(
+            {
+                "configured": True,
+                "url": "https://api.example.test",
+                "publishable_key": "sb_publishable_test_public_value",
+                "invited_signup_enabled": False,
+                "access_applications_enabled": False,
+                "account_limit": 100,
+                "daily_event_limit": 1000,
+                "deployment_mode": "mvp",
+            }
+        )
+    return json.dumps(payload, separators=(",", ":")).encode()
+
+
+def _probe_response(name: str, challenge: str, environment: str) -> bytes:
+    origin = STAGING_ORIGIN if environment == "staging" else PRODUCTION_ORIGIN
+    return json.dumps(
+        {
+            "schema": 1,
+            "check": name,
+            "result": "pass",
+            "result_code": collector.PROBE_RESULT_CODES[name],
+            "environment": environment,
+            "origin": origin,
+            "semantic_version": "9.0.0",
+            "release_commit": COMMIT,
+            "wire_compatibility": "mvp-wire-v1",
+            "portal_image_digest": IMAGE_DIGEST,
+            "evidence_challenge": challenge,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _runtime_portal(
+    environment: str = "staging", origin: str = STAGING_ORIGIN
+) -> dict[str, object]:
+    return {
+        "environment": environment,
+        "origin": origin,
+        "container_name": collector.PORTAL_CONTAINER_NAME,
+        "image_reference": f"ghcr.io/example/portal@{IMAGE_DIGEST}",
+        "image_digest": IMAGE_DIGEST,
+        "image_id": IMAGE_ID,
+        "release_commit": COMMIT,
+        "wire_compatibility": "mvp-wire-v1",
+        "state": "healthy",
+    }
+
+
 def _fake_http_factory(
     *,
     environment: str,
@@ -194,11 +289,26 @@ def _fake_http_factory(
     certificate = STAGING_CERT if environment == "staging" else PRODUCTION_CERT
 
     def fake_http(method, url, headers, body, timeout_seconds):
-        name = url.rsplit("/", 1)[-1]
-        status = expected[name]
-        if name == wrong_name:
-            status = 418
-        response = f"private response for {environment}/{name}".encode()
+        challenge = headers[collector.EVIDENCE_CHALLENGE_HEADER]
+        assert collector.EVIDENCE_CHALLENGE_RE.fullmatch(challenge)
+        public_name = next(
+            (
+                candidate
+                for candidate, path in collector.PUBLIC_METADATA_PATHS.items()
+                if url.endswith(path)
+            ),
+            None,
+        )
+        if public_name is not None:
+            name = public_name
+            status = 200
+            response = _public_response(name, challenge)
+        else:
+            name = url.rsplit("/", 1)[-1]
+            status = expected[name]
+            if name == wrong_name:
+                status = 418
+            response = _probe_response(name, challenge, environment)
         return (
             _tls(origin, certificate, clock),
             collector.HttpMeasurement(
@@ -206,6 +316,7 @@ def _fake_http_factory(
                 elapsed_ms=10,
                 observed_at_utc=_utc(clock),
                 response_sha256=hashlib.sha256(response).hexdigest(),
+                response_body=response,
             ),
         )
 
@@ -232,6 +343,11 @@ def _collect_probe(
             wrong_name=wrong_name,
         ),
     )
+    monkeypatch.setattr(
+        collector,
+        "_running_portal_identity",
+        lambda **kwargs: _runtime_portal(kwargs["environment"], kwargs["origin"]),
+    )
     return collector.collect_probe(
         evidence_root=root,
         environment=environment,
@@ -253,17 +369,22 @@ def test_probe_uses_real_http_tls_measurements_without_persisting_secrets(
     output = _collect_probe(monkeypatch, root, environment="staging", at=at)
     assert output == root / "staging-probe.json"
     payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["schema"] == 2
+    assert payload["schema"] == 3
     assert payload["origin"] == STAGING_ORIGIN
     assert payload["tls"]["peer_certificate_sha256"] == STAGING_CERT
     assert {row["name"] for row in payload["checks"]} == set(STAGING_CHECKS)
+    assert {row["name"] for row in payload["public_metadata"]} == set(
+        collector.PUBLIC_METADATA_PATHS
+    )
+    assert payload["runtime_portal"] == _runtime_portal("staging", STAGING_ORIGIN)
+    assert collector.SHA256_RE.fullmatch(payload["challenge_sha256"])
     assert {row["status_code"] for row in payload["checks"]} == set(
         STAGING_CHECKS.values()
     )
     rendered = output.read_text(encoding="utf-8")
     assert "secret-that-must-not-be-written" not in rendered
     assert "must-not-be-written" not in rendered
-    assert "private response" not in rendered
+    assert "evidence_challenge" not in rendered
 
 
 def test_probe_wrong_live_status_fails_without_writing_evidence(tmp_path, monkeypatch):
@@ -278,6 +399,354 @@ def test_probe_wrong_live_status_fails_without_writing_evidence(tmp_path, monkey
             wrong_name="release_metadata",
         )
     assert not (root / "production-probe.json").exists()
+
+
+def _measurement_with_body(
+    measurement: collector.HttpMeasurement, body: bytes
+) -> collector.HttpMeasurement:
+    return collector.HttpMeasurement(
+        status_code=measurement.status_code,
+        elapsed_ms=measurement.elapsed_ms,
+        observed_at_utc=measurement.observed_at_utc,
+        response_sha256=hashlib.sha256(body).hexdigest(),
+        response_body=body,
+    )
+
+
+def test_legacy_status_matrix_service_is_rejected_without_evidence(tmp_path, monkeypatch):
+    """Correct HTTP statuses alone must never impersonate a V9 deployment."""
+
+    root = tmp_path / "evidence"
+    plan = tmp_path / "plan.json"
+    _plan(plan, "production")
+    at = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr(collector, "_utc_now", lambda: at)
+    monkeypatch.setattr(
+        collector,
+        "_running_portal_identity",
+        lambda **kwargs: _runtime_portal(kwargs["environment"], kwargs["origin"]),
+    )
+
+    def status_matrix(method, url, headers, body, timeout_seconds):
+        del method, headers, body, timeout_seconds
+        name = url.rsplit("/", 1)[-1]
+        status = PRODUCTION_CHECKS.get(name, 200)
+        response = b'{"status":"ok"}'
+        return (
+            _tls(PRODUCTION_ORIGIN, PRODUCTION_CERT, at),
+            collector.HttpMeasurement(
+                status_code=status,
+                elapsed_ms=5,
+                observed_at_utc=_utc(at),
+                response_sha256=hashlib.sha256(response).hexdigest(),
+                response_body=response,
+            ),
+        )
+
+    monkeypatch.setattr(collector, "_perform_https_request", status_matrix)
+    with pytest.raises(collector.CollectionError, match="fields differ"):
+        collector.collect_probe(
+            evidence_root=root,
+            environment="production",
+            origin_env="PRODUCTION_ORIGIN",
+            plan_path=plan,
+            release_commit=COMMIT,
+            candidate_run_id=RUN_ID,
+            portal_image_digest=IMAGE_DIGEST,
+            timeout_seconds=15,
+            environ=_env(),
+        )
+    assert not (root / "production-probe.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value", "error"),
+    [
+        ("health", "build_commit", "0" * 40, "release metadata differs"),
+        (
+            "cross_role_rls_negative",
+            "result_code",
+            "GENERIC_FORBIDDEN",
+            "response semantics differ",
+        ),
+        (
+            "event_1001_rejected",
+            "evidence_challenge",
+            "0" * 64,
+            "response semantics differ",
+        ),
+        (
+            "member_101_rejected",
+            "environment",
+            "production",
+            "response semantics differ",
+        ),
+        (
+            "duplicate_request_rejection",
+            "origin",
+            PRODUCTION_ORIGIN,
+            "response semantics differ",
+        ),
+    ],
+)
+def test_probe_rejects_stale_release_generic_error_or_replayed_challenge(
+    tmp_path, monkeypatch, target, field, value, error
+):
+    root = tmp_path / "evidence"
+    plan = tmp_path / "plan.json"
+    _plan(plan, "staging")
+    at = datetime.now(timezone.utc).replace(microsecond=0)
+    base = _fake_http_factory(environment="staging", clock=at)
+    monkeypatch.setattr(collector, "_utc_now", lambda: at)
+    monkeypatch.setattr(
+        collector,
+        "_running_portal_identity",
+        lambda **kwargs: _runtime_portal(kwargs["environment"], kwargs["origin"]),
+    )
+
+    def tampered(method, url, headers, body, timeout_seconds):
+        tls, measurement = base(method, url, headers, body, timeout_seconds)
+        public_name = next(
+            (
+                candidate
+                for candidate, path in collector.PUBLIC_METADATA_PATHS.items()
+                if url.endswith(path)
+            ),
+            None,
+        )
+        name = public_name or url.rsplit("/", 1)[-1]
+        if name == target:
+            payload = json.loads(measurement.response_body)
+            payload[field] = value
+            mutated = json.dumps(payload, separators=(",", ":")).encode()
+            measurement = _measurement_with_body(measurement, mutated)
+        return tls, measurement
+
+    monkeypatch.setattr(collector, "_perform_https_request", tampered)
+    with pytest.raises(collector.CollectionError, match=error):
+        collector.collect_probe(
+            evidence_root=root,
+            environment="staging",
+            origin_env="STAGING_ORIGIN",
+            plan_path=plan,
+            release_commit=COMMIT,
+            candidate_run_id=RUN_ID,
+            portal_image_digest=IMAGE_DIGEST,
+            timeout_seconds=15,
+            environ=_env(),
+        )
+    assert not (root / "staging-probe.json").exists()
+
+
+def test_running_portal_identity_uses_fixed_container_inspection(tmp_path, monkeypatch):
+    docker = tmp_path / "docker"
+    docker.write_bytes(b"fixed docker client")
+    captured: dict[str, object] = {"calls": []}
+    monkeypatch.setattr(collector.shutil, "which", lambda *args, **kwargs: str(docker))
+    monkeypatch.setattr(collector, "_require_root_controlled_path", lambda path, label: path)
+
+    def run(argv, *, timeout_seconds, child_environment=None):
+        del child_environment
+        captured["calls"].append(argv)
+        captured["timeout"] = timeout_seconds
+        now = collector._utc_now()
+        if argv[1] == "container":
+            payload = {
+                "image_reference": f"ghcr.io/example/portal@{IMAGE_DIGEST}",
+                "image_id": IMAGE_ID,
+                "release_commit": COMMIT,
+                "wire_compatibility": "mvp-wire-v1",
+                "running": True,
+                "health": "healthy",
+            }
+        else:
+            payload = {
+                "image_id": IMAGE_ID,
+                "repo_digests": [f"ghcr.io/example/portal@{IMAGE_DIGEST}"],
+                "release_commit": COMMIT,
+                "wire_compatibility": "mvp-wire-v1",
+            }
+        stdout = json.dumps(payload, separators=(",", ":")).encode()
+        return collector.CommandMeasurement(
+            exit_code=0,
+            stdout=stdout,
+            stderr=b"",
+            started_at_utc=_utc(now),
+            completed_at_utc=_utc(now),
+        )
+
+    monkeypatch.setattr(collector, "run_command", run)
+    assert collector._running_portal_identity(
+        environment="production",
+        origin=PRODUCTION_ORIGIN,
+        release_commit=COMMIT,
+        portal_image_digest=IMAGE_DIGEST,
+    ) == _runtime_portal("production", PRODUCTION_ORIGIN)
+    assert captured["timeout"] == 30
+    calls = captured["calls"]
+    assert calls[0][-1] == collector.PORTAL_CONTAINER_NAME
+    assert calls[0][1:4] == ["container", "inspect", "--format"]
+    assert calls[1][1:4] == ["image", "inspect", "--format"]
+    assert calls[1][-1] == IMAGE_ID
+
+
+def test_running_portal_identity_rejects_cli_digest_not_deployed(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector.shutil, "which", lambda *args, **kwargs: str(tmp_path / "docker"))
+    monkeypatch.setattr(collector, "_require_root_controlled_path", lambda path, label: path)
+    wrong_digest = "sha256:" + "0" * 64
+    now = collector._utc_now()
+    monkeypatch.setattr(
+        collector,
+        "run_command",
+        lambda *args, **kwargs: collector.CommandMeasurement(
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "image_reference": f"ghcr.io/example/portal@{wrong_digest}",
+                    "image_id": IMAGE_ID,
+                    "release_commit": COMMIT,
+                    "wire_compatibility": "mvp-wire-v1",
+                    "running": True,
+                    "health": "healthy",
+                }
+            ).encode(),
+            stderr=b"",
+            started_at_utc=_utc(now),
+            completed_at_utc=_utc(now),
+        ),
+    )
+    with pytest.raises(collector.CollectionError, match="identity differs"):
+        collector._running_portal_identity(
+            environment="production",
+            origin=PRODUCTION_ORIGIN,
+            release_commit=COMMIT,
+            portal_image_digest=IMAGE_DIGEST,
+        )
+
+
+def test_running_portal_identity_rejects_config_reference_absent_from_repo_digests(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        collector.shutil, "which", lambda *args, **kwargs: str(tmp_path / "docker")
+    )
+    monkeypatch.setattr(
+        collector, "_require_root_controlled_path", lambda path, label: path
+    )
+    calls = {"count": 0}
+
+    def run(*args, **kwargs):
+        del args, kwargs
+        calls["count"] += 1
+        now = collector._utc_now()
+        payload = (
+            {
+                "image_reference": f"ghcr.io/example/portal@{IMAGE_DIGEST}",
+                "image_id": IMAGE_ID,
+                "release_commit": COMMIT,
+                "wire_compatibility": "mvp-wire-v1",
+                "running": True,
+                "health": "healthy",
+            }
+            if calls["count"] == 1
+            else {
+                "image_id": IMAGE_ID,
+                "repo_digests": ["ghcr.io/example/portal@sha256:" + "0" * 64],
+                "release_commit": COMMIT,
+                "wire_compatibility": "mvp-wire-v1",
+            }
+        )
+        return collector.CommandMeasurement(
+            exit_code=0,
+            stdout=json.dumps(payload).encode(),
+            stderr=b"",
+            started_at_utc=_utc(now),
+            completed_at_utc=_utc(now),
+        )
+
+    monkeypatch.setattr(collector, "run_command", run)
+    with pytest.raises(collector.CollectionError, match="RepoDigest differs"):
+        collector._running_portal_identity(
+            environment="production",
+            origin=PRODUCTION_ORIGIN,
+            release_commit=COMMIT,
+            portal_image_digest=IMAGE_DIGEST,
+        )
+
+
+def test_public_metadata_endpoints_echo_only_bounded_evidence_challenge(tmp_path):
+    from v9_cloud import create_app
+
+    application = create_app(
+        database_path=tmp_path / "portal.sqlite3",
+        legacy_coordinator_enabled=False,
+        allowed_origins={"https://portal.example.test"},
+        supabase_url="https://api.example.test",
+        supabase_publishable_key="sb_publishable_test_public_value",
+        invited_signup_enabled=False,
+        access_applications_enabled=False,
+        production_mode=True,
+        build_commit=COMMIT,
+    )
+    client = application.test_client()
+    challenge = "a1" * 32
+    for name, path in collector.PUBLIC_METADATA_PATHS.items():
+        response = client.get(path, headers={collector.EVIDENCE_CHALLENGE_HEADER: challenge})
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["semantic_version"] == "9.0.0"
+        assert payload["build_commit"] == COMMIT
+        assert payload["wire_compatibility"] == "mvp-wire-v1"
+        assert payload["evidence_challenge"] == challenge
+        collector._validate_public_metadata_response(
+            name,
+            collector.HttpMeasurement(
+                status_code=response.status_code,
+                elapsed_ms=1,
+                observed_at_utc=_utc(datetime.now(timezone.utc).replace(microsecond=0)),
+                response_sha256=hashlib.sha256(response.data).hexdigest(),
+                response_body=response.data,
+            ),
+            release_commit=COMMIT,
+            challenge=challenge,
+        )
+
+    invalid = client.get(
+        "/health",
+        headers={collector.EVIDENCE_CHALLENGE_HEADER: "refuse arbitrary reflected text"},
+    )
+    assert invalid.status_code == 400
+    assert invalid.get_json() == {"error_code": "INVALID_EVIDENCE_CHALLENGE"}
+
+
+def test_probe_plan_cannot_override_collector_challenge_header(tmp_path, monkeypatch):
+    plan = tmp_path / "plan.json"
+    _plan(plan, "staging")
+    payload = json.loads(plan.read_text(encoding="utf-8"))
+    payload["checks"][0]["headers"].append(
+        {
+            "name": collector.EVIDENCE_CHALLENGE_HEADER,
+            "value_env": "TEST_AUTH_TOKEN",
+        }
+    )
+    plan.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        collector,
+        "_perform_https_request",
+        lambda *args: pytest.fail("reserved challenge header reached the network"),
+    )
+    with pytest.raises(collector.CollectionError, match="unsafe or duplicated"):
+        collector.collect_probe(
+            evidence_root=tmp_path / "evidence",
+            environment="staging",
+            origin_env="STAGING_ORIGIN",
+            plan_path=plan,
+            release_commit=COMMIT,
+            candidate_run_id=RUN_ID,
+            portal_image_digest=IMAGE_DIGEST,
+            timeout_seconds=15,
+            environ=_env(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -415,6 +884,8 @@ def _install_observation_measurements(
     calls = {"count": 0}
 
     def measure(*args, **kwargs):
+        headers = args[2]
+        challenge = headers[collector.EVIDENCE_CHALLENGE_HEADER]
         index = calls["count"]
         calls["count"] += 1
         observed = start + timedelta(seconds=interval * index)
@@ -423,7 +894,7 @@ def _install_observation_measurements(
             if wrong_certificate
             else certificate
         )
-        body = f"{environment}-{index}".encode()
+        body = _public_response("health", challenge)
         return (
             _tls(origin, actual_certificate, observed),
             collector.HttpMeasurement(
@@ -431,6 +902,7 @@ def _install_observation_measurements(
                 elapsed_ms=25,
                 observed_at_utc=_utc(observed),
                 response_sha256=hashlib.sha256(body).hexdigest(),
+                response_body=body,
             ),
         )
 
@@ -814,9 +1286,12 @@ def test_https_request_total_deadline_includes_tls_context_loading(monkeypatch):
         lambda host, port, timeout=30: (2, ("8.8.8.8", 443)),
     )
 
+    class Context:
+        pass
+
     def slow_context():
         collector.time.sleep(0.05)
-        return object()
+        return Context()
 
     monkeypatch.setattr(collector.ssl, "create_default_context", slow_context)
     monkeypatch.setattr(

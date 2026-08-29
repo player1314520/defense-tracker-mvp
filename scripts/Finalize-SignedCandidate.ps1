@@ -42,6 +42,11 @@ param(
     [string]$AzureSigningMetadata = $env:DEFENSE_TRACKER_AZURE_SIGNING_METADATA,
     [string]$DigiCertKeyAlias = $env:DEFENSE_TRACKER_DIGICERT_KEY_ALIAS,
     [string]$DigiCertCertificateFile = $env:DEFENSE_TRACKER_DIGICERT_CERT_FILE,
+    [string]$ExpectedDigiCertCertificateFileSha256 = $env:DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256,
+    [string]$ExpectedSignerSubjects = $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS,
+    [string]$ExpectedSignerSpkiSha256 = $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256,
+    [string]$ExpectedSignerIssuers = $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS,
+    [string]$ExpectedSignerRootSha256 = $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256,
     [string]$ExpectedSignToolSha256 = $env:DEFENSE_TRACKER_SIGNTOOL_SHA256,
     [string]$ExpectedInnoSha256 = $env:DEFENSE_TRACKER_ISCC_SHA256,
     [string]$ExpectedSevenZipSha256 = $env:DEFENSE_TRACKER_7ZIP_SHA256,
@@ -61,6 +66,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+. (Join-Path $PSScriptRoot 'ReleaseCertificatePolicy.ps1')
 
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -250,25 +256,11 @@ function Assert-AndConsumeBuildEnvironment {
     return [ordered]@{ python = $pythonPath; marker = $marker; packages = $freezePath }
 }
 
-function Assert-CertificateChain {
-    param([Parameter(Mandatory = $true)]$Certificate)
-    $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-    try {
-        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::Online
-        $chain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
-        $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
-        $chain.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::FromSeconds(20)
-        if (-not $chain.Build($Certificate)) {
-            $statuses = @($chain.ChainStatus | ForEach-Object { $_.Status.ToString() }) -join ','
-            throw "Certificate chain validation failed: $statuses"
-        }
-    } finally { $chain.Dispose() }
-}
-
 function Invoke-SignAndVerify {
     param(
         [string]$Path,[string]$Tool,[string]$Provider,[string]$Publisher,[string]$Timestamp,
         [string]$AzureDlib,[string]$AzureMetadata,[string]$DigiCertAlias,[string]$DigiCertCertFile,
+        [Parameter(Mandatory = $true)]$CertificatePolicy,
         [switch]$VerifyOnly
     )
     $arguments = @('sign','/v','/fd','SHA256','/tr',$Timestamp,'/td','SHA256')
@@ -292,20 +284,15 @@ function Invoke-SignAndVerify {
         [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false
     )
     if ($simpleName -cne $Publisher) { throw "Signer Publisher differs from the reviewed Publisher." }
-    $hasCodeSigningEku = $false
-    foreach ($extension in $signature.SignerCertificate.Extensions) {
-        if ($extension -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
-            @($extension.EnhancedKeyUsages | Where-Object { $_.Value -eq '1.3.6.1.5.5.7.3.3' }).Count -gt 0) {
-            $hasCodeSigningEku = $true
-        }
-    }
-    if (-not $hasCodeSigningEku) { throw "Signer certificate lacks the Code Signing EKU." }
-    Assert-CertificateChain $signature.SignerCertificate
-    Assert-CertificateChain $signature.TimeStamperCertificate
+    $identity = Assert-ReleaseSignerCertificatePolicy $signature.SignerCertificate $CertificatePolicy
+    $null = Assert-TrustedCertificateChain $signature.TimeStamperCertificate
     return [ordered]@{
         provider = $Provider
         publisher = $Publisher
-        signer_subject = $signature.SignerCertificate.Subject
+        signer_subject = $identity.normalized_subject
+        signer_spki_sha256 = $identity.spki_sha256
+        signer_issuer_subject = $identity.issuer_subject
+        signer_root_sha256 = $identity.root_sha256
         timestamp_url = $Timestamp
         timestamp_certificate_subject = $signature.TimeStamperCertificate.Subject
         verified_at_utc = [DateTime]::UtcNow.ToString('o')
@@ -474,6 +461,11 @@ if ($SigningProvider -notin @('AzureArtifactSigning','DigiCertKeyLocker') -or
     $TimestampUrl -notmatch '^https?://[^\s]+$') {
     throw "Finalization requires a trusted signing provider and explicit RFC 3161 URL."
 }
+$certificatePolicy = Get-ReleaseCertificatePolicy `
+    -ExpectedSignerSubjects $ExpectedSignerSubjects `
+    -ExpectedSignerSpkiSha256 $ExpectedSignerSpkiSha256 `
+    -ExpectedSignerIssuers $ExpectedSignerIssuers `
+    -ExpectedSignerRootSha256 $ExpectedSignerRootSha256
 if ($ExpectedRepository -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or
     [string]::IsNullOrWhiteSpace($ExpectedWorkflowRef) -or
     $ExpectedPreparationArtifactName -cne
@@ -560,6 +552,10 @@ if ($SigningProvider -eq 'AzureArtifactSigning') {
 } else {
     if ([string]::IsNullOrWhiteSpace($DigiCertKeyAlias)) { throw "DigiCert KeyLocker alias is missing." }
     $DigiCertCertificateFile = Resolve-RequiredTool $DigiCertCertificateFile 'signing-certificate.crt' 'DigiCert certificate'
+    $digicertCertificateIdentity = Assert-DigiCertCertificateFilePolicy `
+        -Path $DigiCertCertificateFile `
+        -ExpectedSha256 $ExpectedDigiCertCertificateFileSha256 `
+        -Policy $certificatePolicy
 }
 $toolchain = [ordered]@{
     python = [ordered]@{
@@ -577,6 +573,13 @@ if ($SigningProvider -eq 'AzureArtifactSigning') {
     $toolchain['azure_dlib'] = Get-VerifiedToolEvidence $AzureSigningDlib $ExpectedAzureDlibSha256 'Azure signing DLib'
     $toolchain['azure_metadata'] = Get-VerifiedToolEvidence $AzureSigningMetadata $ExpectedAzureMetadataSha256 `
         'Azure signing metadata' 'not-applicable:json-metadata'
+} else {
+    $toolchain['digicert_certificate'] = [ordered]@{
+        version = "X.509 $($digicertCertificateIdentity.normalized_subject)"
+        sha256 = $ExpectedDigiCertCertificateFileSha256
+        expected_sha256 = $ExpectedDigiCertCertificateFileSha256
+        hash_verified = $true
+    }
 }
 
 $workRoot = Join-Path $projectRoot 'build\candidate-finalization'
@@ -604,7 +607,8 @@ $applicationExe = Join-Path $applicationRoot 'DefenseTracker.exe'
     --output (Join-Path $evidenceRoot 'application-authenticode-reverified.json')
 if ($LASTEXITCODE -ne 0) { throw "Prepared signed application fails normalized Authenticode verification." }
 $applicationSignature = Invoke-SignAndVerify $applicationExe $signTool $SigningProvider $PublisherName $TimestampUrl `
-    $AzureSigningDlib $AzureSigningMetadata $DigiCertKeyAlias $DigiCertCertificateFile -VerifyOnly
+    $AzureSigningDlib $AzureSigningMetadata $DigiCertKeyAlias $DigiCertCertificateFile `
+    $certificatePolicy -VerifyOnly
 
 $runtimeLockHash = Get-Sha256 (Join-Path $projectRoot 'requirements.runtime.lock')
 $buildLockHash = Get-Sha256 (Join-Path $projectRoot 'requirements.build.lock')
@@ -679,7 +683,13 @@ if ($applicationKey.Count -ne 1 -or $installerKey.Count -ne 1 -or
 
 $installerSignature = Invoke-SignAndVerify $signedInstaller $signTool $SigningProvider `
     $PublisherName $TimestampUrl $AzureSigningDlib $AzureSigningMetadata `
-    $DigiCertKeyAlias $DigiCertCertificateFile
+    $DigiCertKeyAlias $DigiCertCertificateFile $certificatePolicy
+if ($installerSignature.signer_subject -cne $applicationSignature.signer_subject -or
+    $installerSignature.signer_spki_sha256 -cne $applicationSignature.signer_spki_sha256 -or
+    $installerSignature.signer_issuer_subject -cne $applicationSignature.signer_issuer_subject -or
+    $installerSignature.signer_root_sha256 -cne $applicationSignature.signer_root_sha256) {
+    throw 'Application and installer were not signed by the same pinned certificate identity.'
+}
 $unsignedInstallerDigest = Get-Content -LiteralPath (
     Resolve-BundlePath $preparationFull ([string]$preparation.installer.unsigned_digest)
 ) -Raw | ConvertFrom-Json
@@ -761,7 +771,8 @@ $portableFindings = @(Get-ArtifactSafetyFindings $portableExtract)
 if ($portableFindings.Count -gt 0) { throw "Portable ZIP content safety scan failed." }
 $portableExe = Join-Path $portableExtract 'DefenseTracker\DefenseTracker.exe'
 $null = Invoke-SignAndVerify $portableExe $signTool $SigningProvider $PublisherName $TimestampUrl `
-    $AzureSigningDlib $AzureSigningMetadata $DigiCertKeyAlias $DigiCertCertificateFile -VerifyOnly
+    $AzureSigningDlib $AzureSigningMetadata $DigiCertKeyAlias $DigiCertCertificateFile `
+    $certificatePolicy -VerifyOnly
 & $python (Join-Path $projectRoot 'scripts\authenticode_digest.py') `
     --path $portableExe --require-state signed `
     --expected-unsigned-size ([string]$applicationDigest.bytes) `

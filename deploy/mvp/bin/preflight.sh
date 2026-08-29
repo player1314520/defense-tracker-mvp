@@ -19,6 +19,12 @@ require_command() {
 for command_name in docker python3 curl age rclone flock tar sha256sum grep git stat sed systemctl; do
     require_command "$command_name"
 done
+python3 - <<'PY'
+import sys
+
+if sys.version_info < (3, 11):
+    raise SystemExit("Python >= 3.11 is required")
+PY
 docker compose version >/dev/null 2>&1 || {
     printf '%s\n' "Docker Compose v2 is required" >&2
     exit 69

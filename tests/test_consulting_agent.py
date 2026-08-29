@@ -44,6 +44,19 @@ def test_create_session_parses_instruction_and_requested_source_count(consult_db
     assert session["plan"]["target_source_count"] == 20
 
 
+def test_create_session_rejects_overlong_instruction_before_regex_parsing(
+    consult_db, monkeypatch,
+):
+    monkeypatch.setattr(
+        consulting_agent,
+        "_derive_topic",
+        lambda _value: pytest.fail("overlong instructions must not reach topic regexes"),
+    )
+
+    with pytest.raises(ValueError, match="4096"):
+        consulting_agent.create_session("x" * 4097)
+
+
 def test_create_session_parses_search_only_instruction_topic(consult_db):
     session = consulting_agent.create_session("搜集3份RAND台海无人系统智库报告")
 

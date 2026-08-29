@@ -22,6 +22,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+IMAGE_REFERENCE_RE = re.compile(
+    r"^[A-Za-z0-9._/-]+@(?P<digest>sha256:[0-9a-f]{64})$"
+)
 DNS_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
@@ -90,6 +93,35 @@ PROBE_ROUTE_SPECS = {
     }
     for name in {*STAGING_CHECKS, *PRODUCTION_CHECKS}
 }
+PUBLIC_METADATA_PATHS = {
+    "health": "/health",
+    "api_status": "/api/status",
+    "portal_config": "/portal/config.json",
+}
+PROBE_RESULT_CODES = {
+    "release_metadata": "RELEASE_METADATA_MATCH",
+    "application_invite_flow": "APPLICATION_INVITE_FLOW_VERIFIED",
+    "two_users_two_devices": "TWO_USERS_TWO_DEVICES_VERIFIED",
+    "desktop_pkce": "DESKTOP_PKCE_VERIFIED",
+    "ciphertext_sync": "CIPHERTEXT_SYNC_VERIFIED",
+    "approval_and_withdrawal": "APPROVAL_WITHDRAWAL_VERIFIED",
+    "member_and_device_revocation": "MEMBER_DEVICE_REVOCATION_VERIFIED",
+    "cross_role_rls_negative": "CROSS_ROLE_ACCESS_DENIED",
+    "old_jwt_revocation": "OLD_JWT_REVOKED",
+    "duplicate_request_rejection": "DUPLICATE_REQUEST_REJECTED",
+    "member_101_rejected": "ACTIVE_MEMBER_LIMIT_ENFORCED",
+    "event_1001_rejected": "DAILY_EVENT_LIMIT_ENFORCED",
+    "concurrency_20": "CONCURRENCY_20_VERIFIED",
+    "portal_rollback": "PORTAL_ROLLBACK_VERIFIED",
+    "application_closed_during_smoke": "APPLICATIONS_CLOSED",
+    "owner_bootstrap": "OWNER_BOOTSTRAP_VERIFIED",
+    "two_user_flow": "TWO_USER_FLOW_VERIFIED",
+    "desktop_browser_smoke": "DESKTOP_BROWSER_SMOKE_VERIFIED",
+    "mobile_browser_smoke": "MOBILE_BROWSER_SMOKE_VERIFIED",
+    "monitoring_smoke": "MONITORING_SMOKE_VERIFIED",
+    "application_opened_after_acceptance": "APPLICATION_ACCEPTED",
+}
+PORTAL_CONTAINER_NAME = "defense-tracker-mvp-portal-1"
 
 
 def _require_object(value: object, label: str) -> dict[str, object]:
@@ -533,11 +565,14 @@ def _validate_probe(
             "started_at_utc",
             "completed_at_utc",
             "tls",
+            "challenge_sha256",
+            "runtime_portal",
+            "public_metadata",
             "checks",
         },
         label,
     )
-    if probe["schema"] != 2 or probe["environment"] != environment:
+    if probe["schema"] != 3 or probe["environment"] != environment:
         raise ValueError(f"{label} schema or environment mismatch")
     _validate_bindings(
         probe,
@@ -578,6 +613,89 @@ def _validate_probe(
     if not (not_before <= started <= completed <= not_after):
         raise ValueError(f"{label} was not collected during certificate validity")
 
+    _require_sha256(probe["challenge_sha256"], f"{label} challenge")
+    runtime_portal = _require_object(probe["runtime_portal"], f"{label} runtime Portal")
+    _require_exact_keys(
+        runtime_portal,
+        {
+            "environment",
+            "origin",
+            "container_name",
+            "image_reference",
+            "image_digest",
+            "image_id",
+            "release_commit",
+            "wire_compatibility",
+            "state",
+        },
+        f"{label} runtime Portal",
+    )
+    image_reference = runtime_portal["image_reference"]
+    image_reference_match = (
+        IMAGE_REFERENCE_RE.fullmatch(image_reference)
+        if isinstance(image_reference, str)
+        else None
+    )
+    if (
+        runtime_portal["environment"] != environment
+        or runtime_portal["origin"] != origin
+        or runtime_portal["container_name"] != PORTAL_CONTAINER_NAME
+        or image_reference_match is None
+        or image_reference_match.group("digest") != image_digest
+        or runtime_portal["image_digest"] != image_digest
+        or not isinstance(runtime_portal["image_id"], str)
+        or DIGEST_RE.fullmatch(runtime_portal["image_id"]) is None
+        or runtime_portal["release_commit"] != commit
+        or runtime_portal["wire_compatibility"] != "mvp-wire-v1"
+        or runtime_portal["state"] != "healthy"
+    ):
+        raise ValueError(f"{label} runtime Portal identity mismatch")
+
+    public_metadata = probe["public_metadata"]
+    if not isinstance(public_metadata, list) or len(public_metadata) != len(PUBLIC_METADATA_PATHS):
+        raise ValueError(f"{label} does not contain exact public metadata checks")
+    public_seen: set[str] = set()
+    for index, raw_public in enumerate(public_metadata):
+        public = _require_object(raw_public, f"{label} public metadata {index}")
+        _require_exact_keys(
+            public,
+            {
+                "name",
+                "method",
+                "url",
+                "status_code",
+                "elapsed_ms",
+                "observed_at_utc",
+                "response_sha256",
+            },
+            f"{label} public metadata {index}",
+        )
+        name = public["name"]
+        if not isinstance(name, str) or name not in PUBLIC_METADATA_PATHS or name in public_seen:
+            raise ValueError(f"{label} has unknown or duplicate public metadata")
+        public_seen.add(name)
+        url = public["url"]
+        parsed_url = urlsplit(url) if isinstance(url, str) else None
+        if (
+            public["method"] != "GET"
+            or parsed_url is None
+            or f"{parsed_url.scheme}://{parsed_url.netloc}" != origin
+            or parsed_url.path != PUBLIC_METADATA_PATHS[name]
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.query
+            or parsed_url.fragment
+            or public["status_code"] != 200
+        ):
+            raise ValueError(f"{label} public metadata route or status mismatch: {name}")
+        _require_positive_int(public["elapsed_ms"], f"{label} public metadata latency", 120_000)
+        observed = _parse_utc(public["observed_at_utc"], f"{label} public metadata time")
+        if not started <= observed <= completed:
+            raise ValueError(f"{label} public metadata time is outside the probe: {name}")
+        _require_sha256(public["response_sha256"], f"{label} public metadata response")
+    if public_seen != set(PUBLIC_METADATA_PATHS):
+        raise ValueError(f"{label} does not contain exact public metadata checks")
+
     expected_checks = STAGING_CHECKS if environment == "staging" else PRODUCTION_CHECKS
     checks = probe["checks"]
     if not isinstance(checks, list) or len(checks) != len(expected_checks):
@@ -595,6 +713,7 @@ def _validate_probe(
                 "elapsed_ms",
                 "observed_at_utc",
                 "response_sha256",
+                "result_code",
             },
             f"{label} check {index}",
         )
@@ -620,6 +739,8 @@ def _validate_probe(
             raise ValueError(f"{label} check escaped its fixed route: {name}")
         if check["status_code"] != expected_checks[name]:
             raise ValueError(f"{label} check returned the wrong status: {name}")
+        if check["result_code"] != PROBE_RESULT_CODES[name]:
+            raise ValueError(f"{label} check returned the wrong semantic code: {name}")
         _require_positive_int(check["elapsed_ms"], f"{label} elapsed time", 120_000)
         observed = _parse_utc(check["observed_at_utc"], f"{label} check time")
         if not (started <= observed <= completed):
@@ -669,10 +790,12 @@ def _validate_observations(
                 "data_device_sha256",
                 "backup_receipt_sha256",
                 "response_sha256",
+                "challenge_sha256",
+                "semantic_code",
             },
             f"{label} line {index + 1}",
         )
-        if record["schema"] != 2 or record["environment"] != environment:
+        if record["schema"] != 3 or record["environment"] != environment:
             raise ValueError(f"{label} schema or environment mismatch")
         _validate_bindings(
             record,
@@ -708,6 +831,9 @@ def _validate_observations(
             record["backup_receipt_sha256"], f"{label} backup receipt"
         )
         _require_sha256(record["response_sha256"], f"{label} response digest")
+        _require_sha256(record["challenge_sha256"], f"{label} challenge digest")
+        if record["semantic_code"] != "PUBLIC_HEALTH_OK":
+            raise ValueError(f"{label} health semantics were not validated")
     if times[-1] > generated_at:
         raise ValueError(f"{label} contains future samples")
     if environment == "staging":
@@ -947,10 +1073,14 @@ def verify(
         certificate_sha256=production_certificate,
         generated_at=generated_at,
     )
-    if generated_at - max(staging_probe_end, staging_observation_end) > timedelta(hours=48):
-        raise ValueError("Staging evidence is stale")
-    if generated_at - max(production_probe_end, production_observation_end) > timedelta(hours=6):
-        raise ValueError("Production evidence is stale")
+    if generated_at - staging_probe_end > timedelta(hours=48):
+        raise ValueError("Staging probe evidence is stale")
+    if generated_at - staging_observation_end > timedelta(minutes=90):
+        raise ValueError("Staging observation evidence is stale")
+    if generated_at - production_probe_end > timedelta(hours=6):
+        raise ValueError("Production probe evidence is stale")
+    if generated_at - production_observation_end > timedelta(minutes=30):
+        raise ValueError("Production observation evidence is stale")
     _validate_backup_restore(
         root / "backup-restore.json",
         commit=expected_commit,

@@ -19,6 +19,12 @@ class ProbeFailure(RuntimeError):
     pass
 
 
+def _tls_client_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
 def _default_version_paths() -> tuple[Path, ...]:
     configured = (os.environ.get("DEFENSE_TRACKER_VERSION_FILE") or "").strip()
     if configured:
@@ -98,7 +104,9 @@ def request_bytes(
         method="POST" if body is not None else "GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(
+            request, timeout=15, context=_tls_client_context()
+        ) as response:
             status = int(response.status)
             payload = response.read(1024 * 1024 + 1)
     except urllib.error.HTTPError as exc:
@@ -161,7 +169,7 @@ def probe_realtime_websocket(api_domain: str, key: str) -> None:
         "",
         "",
     ]
-    context = ssl.create_default_context()
+    context = _tls_client_context()
     context.set_alpn_protocols(["http/1.1"])
     try:
         with socket.create_connection((api_domain, 443), timeout=15) as raw:

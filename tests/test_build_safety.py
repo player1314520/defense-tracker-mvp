@@ -109,7 +109,12 @@ def test_candidate_workflow_separates_application_and_installer_trust_environmen
 
     assert "prepare-installer-review:" in workflow
     assert "finalize-signed-candidate:" in workflow
-    assert "needs: prepare-installer-review" in workflow
+    assert (
+        "needs:\n"
+        "      - signing-isolation-gate\n"
+        "      - verify-release-request\n"
+        "      - prepare-installer-review"
+    ) in workflow
     assert "environment: v9-trusted-signing" in workflow
     assert "environment: v9-installer-signing-review" in workflow
     assert "defense-v9-candidate-ephemeral" in workflow

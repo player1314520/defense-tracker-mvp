@@ -1,3 +1,8 @@
+import json
+import os
+import stat
+from types import SimpleNamespace
+
 import pytest
 import requests
 from contextlib import nullcontext
@@ -7,9 +12,31 @@ from pathlib import Path
 from werkzeug.datastructures import FileStorage
 
 import app as tracker
+import protected_secrets
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _TestCurrentUserProtector:
+    prefix = b"test-current-user-protected:"
+
+    def protect(self, value: bytes) -> bytes:
+        return self.prefix + value[::-1]
+
+    def unprotect(self, value: bytes) -> bytes:
+        if not value.startswith(self.prefix):
+            raise ValueError("invalid protected test value")
+        return value[len(self.prefix) :][::-1]
+
+
+def _simulate_windows_dpapi(monkeypatch) -> None:
+    monkeypatch.setattr(tracker, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(
+        protected_secrets,
+        "WindowsCurrentUserProtector",
+        _TestCurrentUserProtector,
+    )
 
 
 def _response(status=200, headers=None, body=b"ok"):
@@ -83,6 +110,193 @@ def test_public_source_url_accepts_absolute_http_and_drops_fragment():
         tracker._public_http_url(" https://example.test/report?q=1#section ")
         == "https://example.test/report?q=1"
     )
+
+
+def test_rss_feed_catalog_contains_only_https_endpoints():
+    assert tracker.RSS_FEEDS
+    assert all(feed["url"].startswith("https://") for feed in tracker.RSS_FEEDS)
+
+
+def test_fetch_feed_stores_only_fixed_failure_metadata(monkeypatch, caplog):
+    name = "Synthetic malicious reason feed"
+    malicious_reason = '\"><img src=x onerror=alert(1)>\r\nInjected: true'
+    response = _response(status=502)
+    response.reason = malicious_reason
+    failure = requests.HTTPError(malicious_reason, response=response)
+    monkeypatch.setattr(
+        tracker,
+        "_fetch_with_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda _url: (True, ""))
+    feed = {
+        "name": name,
+        "name_cn": name,
+        "url": "https://example.test/feed.xml",
+        "region": "test",
+        "color": "#000000",
+    }
+    with tracker.feed_health_lock:
+        tracker.feed_health.pop(name, None)
+    try:
+        assert tracker.fetch_feed(feed) == []
+        with tracker.feed_health_lock:
+            recorded = dict(tracker.feed_health[name])
+        assert recorded["last_error_code"] == "http_error"
+        assert recorded["last_http_status"] == 502
+        assert recorded["last_err"] == "http_error"
+        assert malicious_reason not in repr(recorded)
+        assert malicious_reason not in caplog.text
+    finally:
+        with tracker.feed_health_lock:
+            tracker.feed_health.pop(name, None)
+
+
+def test_feed_health_api_sanitizes_legacy_raw_error_text(client):
+    feed_name = tracker.RSS_FEEDS[0]["name"]
+    malicious_reason = '\"><svg onload=globalThis.__feedXss=1>'
+    with tracker.feed_health_lock:
+        previous = tracker.feed_health.get(feed_name)
+        tracker.feed_health[feed_name] = {
+            "ok_cnt": 0,
+            "fail_cnt": 1,
+            "fail_streak": 1,
+            "last_err": malicious_reason,
+            "last_ok_ts": None,
+        }
+    try:
+        response = client.get("/api/feeds/health")
+        assert response.status_code == 200
+        serialized = response.get_data(as_text=True)
+        assert malicious_reason not in serialized
+        feed = next(
+            item for item in response.get_json()["feeds"]
+            if item["name"] == feed_name
+        )
+        assert feed["last_error_code"] == "fetch_error"
+        assert feed["last_err"] == "fetch_error"
+        assert feed["last_http_status"] is None
+    finally:
+        with tracker.feed_health_lock:
+            if previous is None:
+                tracker.feed_health.pop(feed_name, None)
+            else:
+                tracker.feed_health[feed_name] = previous
+
+
+def test_brief_download_rejects_path_components_instead_of_coercing_basename(
+    monkeypatch, client, tmp_path
+):
+    output_root = tmp_path / "manual"
+    output_root.mkdir()
+    (output_root / "report.docx").write_bytes(b"inside")
+    monkeypatch.setattr(tracker, "_BRIEF_OUTPUT_DIR", str(output_root))
+
+    response = client.get(
+        "/api/brief/download_file",
+        query_string={"kind": "manual", "f": "../report.docx"},
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "requested_name",
+    ["/tmp/report.docx", r"C:\\private\\report.docx", "nested/report.docx"],
+)
+def test_brief_download_rejects_absolute_and_nested_paths(
+    monkeypatch, client, tmp_path, requested_name
+):
+    output_root = tmp_path / "manual"
+    output_root.mkdir()
+    monkeypatch.setattr(tracker, "_BRIEF_OUTPUT_DIR", str(output_root))
+
+    response = client.get(
+        "/api/brief/download_file",
+        query_string={"kind": "manual", "f": requested_name},
+    )
+
+    assert response.status_code == 400
+
+
+def test_brief_download_serves_regular_file_from_fixed_root(
+    monkeypatch, client, tmp_path
+):
+    output_root = tmp_path / "manual"
+    output_root.mkdir()
+    document = output_root / "report.docx"
+    document.write_bytes(b"safe-docx")
+    monkeypatch.setattr(tracker, "_BRIEF_OUTPUT_DIR", str(output_root))
+
+    response = client.get(
+        "/api/brief/download_file",
+        query_string={"kind": "manual", "f": document.name},
+    )
+
+    assert response.status_code == 200
+    assert response.data == b"safe-docx"
+    assert "attachment" in response.headers["Content-Disposition"]
+
+
+def test_brief_download_and_listing_reject_symlink(monkeypatch, client, tmp_path):
+    today = datetime.now().strftime("%Y%m%d")
+    output_root = tmp_path / "manual"
+    output_root.mkdir()
+    outside = tmp_path / "outside.docx"
+    outside.write_bytes(b"private")
+    link = output_root / f"{today}_linked.docx"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    monkeypatch.setattr(tracker, "_BRIEF_OUTPUT_DIR", str(output_root))
+
+    download = client.get(
+        "/api/brief/download_file",
+        query_string={"kind": "manual", "f": link.name},
+    )
+    listing = client.get("/api/brief/today_files")
+
+    assert download.status_code == 404
+    assert link.name not in {item["name"] for item in listing.get_json()["files"]}
+
+
+def test_brief_download_rejects_link_metadata_even_without_platform_symlink_support(
+    monkeypatch, tmp_path
+):
+    output_root = tmp_path / "manual"
+    output_root.mkdir()
+    monkeypatch.setattr(tracker.os.path, "isdir", lambda _path: True)
+    monkeypatch.setattr(
+        tracker.os,
+        "stat",
+        lambda _path, follow_symlinks=False: type(
+            "LinkStat", (), {"st_mode": tracker.stat.S_IFLNK}
+        )(),
+    )
+
+    with pytest.raises(FileNotFoundError):
+        tracker._open_brief_download(str(output_root), "linked.docx")
+
+
+def test_brief_download_rejects_file_swapped_between_validation_and_open(
+    monkeypatch, tmp_path
+):
+    output_root = tmp_path / "manual"
+    output_root.mkdir()
+    expected = output_root / "report.docx"
+    expected.write_bytes(b"expected")
+    swapped = tmp_path / "outside.docx"
+    swapped.write_bytes(b"outside")
+    real_open = tracker.os.open
+
+    def open_swapped(_path, flags):
+        return real_open(swapped, flags & ~int(getattr(tracker.os, "O_NOFOLLOW", 0)))
+
+    monkeypatch.setattr(tracker.os, "open", open_swapped)
+
+    with pytest.raises(FileNotFoundError):
+        tracker._open_brief_download(str(output_root), expected.name)
 
 
 def test_uploaded_pdf_uses_bounded_isolated_document_parser(monkeypatch):
@@ -251,7 +465,12 @@ def test_auth_session_expires_and_logout_revokes_it(monkeypatch):
     _, first_session = _auth_cookie_value(login)
     assert browser.get("/api/status").status_code == 200
 
-    browser.get("/logout")
+    csrf = browser.get_cookie(tracker.CSRF_COOKIE).value
+    logout = browser.post(
+        "/logout",
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    assert logout.status_code == 302
     replay = tracker.app.test_client()
     replay.set_cookie(tracker.AUTH_COOKIE, first_session)
     assert replay.get("/api/status").status_code == 401
@@ -333,6 +552,61 @@ def test_main_v9_service_initialization_does_not_consume_recovery_code(
     service.acknowledge_personal_recovery(pending["organization_id"])
     assert tracker._get_v9_service() is service
     assert tracker._V9_MIGRATION_DONE is True
+
+
+def test_main_cloud_session_uses_canonical_vault_and_migrates_selected_bug_path(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    explicit_config = (
+        tmp_path / "external" / "config" / ".supabase_v9_config.json"
+    )
+    explicit_config.parent.mkdir(parents=True)
+    explicit_config.write_text("{}", encoding="utf-8")
+    old_bug_vault = explicit_config.parent.parent / "vault"
+    old_bug_vault.mkdir()
+    (old_bug_vault / "supabase-session.vault").write_bytes(b"legacy-session")
+    canonical_vault = tmp_path / "canonical-vault"
+    loaded = []
+    vaults = []
+
+    class FakeSettings:
+        @classmethod
+        def load(cls, path):
+            loaded.append(Path(path))
+            return cls()
+
+    class FakeVault:
+        def __init__(self, path):
+            vaults.append(Path(path))
+
+    class FakeHttpClient:
+        def __init__(self, _settings):
+            pass
+
+    class FakeSessionManager:
+        def __init__(self, settings, vault, client):
+            self.settings = settings
+            self.vault = vault
+            self.client = client
+
+    monkeypatch.setattr(tracker, "CONFIG_DIR", str(explicit_config.parent))
+    monkeypatch.setattr(tracker, "VAULT_DIR", str(canonical_vault))
+    monkeypatch.setattr(tracker, "SupabaseSettings", FakeSettings)
+    monkeypatch.setattr(tracker, "SessionVault", FakeVault)
+    monkeypatch.setattr(tracker, "SupabaseHttpClient", FakeHttpClient)
+    monkeypatch.setattr(tracker, "SupabaseSessionManager", FakeSessionManager)
+    monkeypatch.setattr(tracker, "_V9_CLOUD_SESSION", None)
+
+    session = tracker._get_v9_cloud_session()
+
+    assert isinstance(session, FakeSessionManager)
+    assert loaded == [explicit_config.resolve()]
+    assert vaults == [canonical_vault]
+    assert (canonical_vault / "supabase-session.vault").read_bytes() == b"legacy-session"
+    assert (old_bug_vault / "supabase-session.vault").read_bytes() == b"legacy-session"
+    assert str(tmp_path) not in caplog.text
 
 
 def test_fresh_main_app_bootstrap_displays_recoverable_context_once(
@@ -831,16 +1105,101 @@ def test_cloud_ai_runtime_lease_is_bound_to_credential_version(monkeypatch):
     assert captured["device_id"] == "device-a"
 
 
-def test_logout_clears_active_cloud_ai_credential(monkeypatch, client):
+def test_logout_rejects_get_without_clearing_active_cloud_ai_credential(
+    monkeypatch, client
+):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-master-token")
+    _clear_auth_sessions()
     cleared = []
     monkeypatch.setattr(
         tracker, "_clear_active_cloud_ai_credentials", lambda: cleared.append(True)
     )
 
+    client.post("/login", data={"token": "test-master-token"})
     response = client.get("/logout")
+
+    assert response.status_code == 405
+    assert cleared == []
+    assert client.get("/api/status").status_code == 200
+
+
+def test_logout_rejects_anonymous_post_without_clearing_active_cloud_ai_credential(
+    monkeypatch
+):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    _clear_auth_sessions()
+    cleared = []
+    monkeypatch.setattr(
+        tracker, "_clear_active_cloud_ai_credentials", lambda: cleared.append(True)
+    )
+
+    response = tracker.app.test_client().post("/logout")
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/login")
+    assert cleared == []
+
+
+def test_logout_rejects_raw_master_header_without_opaque_session(monkeypatch):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-master-token")
+    _clear_auth_sessions()
+    cleared = []
+    monkeypatch.setattr(
+        tracker, "_clear_active_cloud_ai_credentials", lambda: cleared.append(True)
+    )
+
+    response = tracker.app.test_client().post(
+        "/logout",
+        headers={"X-Access-Token": "test-master-token"},
+    )
+
+    assert response.status_code == 401
+    assert cleared == []
+
+
+def test_logout_requires_csrf_before_clearing_active_cloud_ai_credential(monkeypatch):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-master-token")
+    _clear_auth_sessions()
+    cleared = []
+    monkeypatch.setattr(
+        tracker, "_clear_active_cloud_ai_credentials", lambda: cleared.append(True)
+    )
+    browser = tracker.app.test_client()
+    browser.post("/login", data={"token": "test-master-token"})
+
+    response = browser.post("/logout")
+
+    assert response.status_code == 403
+    assert cleared == []
+    assert browser.get("/api/status").status_code == 200
+
+
+def test_logout_valid_session_post_revokes_session_and_clears_cloud_ai(monkeypatch):
+    monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-master-token")
+    _clear_auth_sessions()
+    cleared = []
+    monkeypatch.setattr(
+        tracker, "_clear_active_cloud_ai_credentials", lambda: cleared.append(True)
+    )
+    browser = tracker.app.test_client()
+    login = browser.post("/login", data={"token": "test-master-token"})
+    _, session_token = _auth_cookie_value(login)
+    csrf = browser.get_cookie(tracker.CSRF_COOKIE).value
+
+    response = browser.post(
+        "/logout",
+        headers={tracker.CSRF_HEADER: csrf},
+    )
 
     assert response.status_code == 302
     assert cleared == [True]
+    replay = tracker.app.test_client()
+    replay.set_cookie(tracker.AUTH_COOKIE, session_token)
+    assert replay.get("/api/status").status_code == 401
 
 
 def test_ai_stream_closes_upstream_response(monkeypatch, client):
@@ -944,11 +1303,7 @@ def test_fetch_rechecks_redirect_target(monkeypatch):
     response = _response(
         302, headers={"Location": "http://169.254.169.254/latest/meta-data"}
     )
-    monkeypatch.setattr(
-        tracker, "_ssrf_http_session",
-        lambda: type("FakeSession", (), {"get": lambda self, *args, **kwargs: response})(),
-    )
-    monkeypatch.setattr(tracker, "_validate_connected_peer", lambda _response: None)
+    monkeypatch.setattr(tracker, "pinned_get", lambda *args, **kwargs: response)
     with pytest.raises(requests.RequestException, match="URL不安全"):
         tracker._fetch_with_retry("http://example.test/start", timeout=1, retries=0)
 
@@ -958,28 +1313,32 @@ def test_fetch_rejects_large_content_length(monkeypatch):
     response = _response(
         200, headers={"Content-Length": str(tracker.MAX_FETCH_BYTES + 1)}
     )
-    monkeypatch.setattr(
-        tracker, "_ssrf_http_session",
-        lambda: type("FakeSession", (), {"get": lambda self, *args, **kwargs: response})(),
-    )
-    monkeypatch.setattr(tracker, "_validate_connected_peer", lambda _response: None)
+    monkeypatch.setattr(tracker, "pinned_get", lambda *args, **kwargs: response)
     with pytest.raises(requests.RequestException, match="响应体过大"):
         tracker._fetch_with_retry("http://example.test/feed", timeout=1, retries=0)
 
 
-def test_fetch_rejects_private_connected_peer(monkeypatch):
-    response = _response(200)
-    monkeypatch.setattr(tracker, "_connected_peer_ip", lambda _response: "169.254.169.254")
+def test_fetch_maps_dns_pinned_transport_rejection_to_request_error(monkeypatch):
+    monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda url: (True, ""))
 
-    with pytest.raises(requests.RequestException, match="重绑定到私有地址"):
-        tracker._validate_connected_peer(response)
+    def reject_private_peer(*_args, **_kwargs):
+        raise tracker.UnsafeTargetError("连接对端是非公网地址")
+
+    monkeypatch.setattr(tracker, "pinned_get", reject_private_peer)
+    with pytest.raises(requests.RequestException, match="非公网地址"):
+        tracker._safe_get_once("https://example.test/report", {}, 1)
 
 
 def test_fetch_feed_rejects_unsafe_source_url(monkeypatch):
     monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda url: (False, "私有地址"))
     feed = {"name": "Unsafe RSS", "url": "http://127.0.0.1/rss", "region": "x", "color": "#fff"}
-    assert tracker.fetch_feed(feed) == []
-    assert "不安全" in tracker.feed_health["Unsafe RSS"]["last_err"]
+    try:
+        assert tracker.fetch_feed(feed) == []
+        assert tracker.feed_health["Unsafe RSS"]["last_err"] == "unsafe_url"
+        assert tracker.feed_health["Unsafe RSS"]["last_http_status"] is None
+    finally:
+        with tracker.feed_health_lock:
+            tracker.feed_health.pop("Unsafe RSS", None)
 
 
 def test_news_pagination_returns_requested_slice(client):
@@ -1116,6 +1475,8 @@ def test_ai_config_save_encrypts_api_key_at_rest(monkeypatch, tmp_path):
     if not tracker.CRYPTO_AVAILABLE:
         pytest.skip("cryptography is unavailable")
 
+    _simulate_windows_dpapi(monkeypatch)
+    monkeypatch.delenv("AI_CONFIG_FERNET_KEY", raising=False)
     config_file = tmp_path / ".ai_config.json"
     key_file = tmp_path / ".ai_config.key"
     monkeypatch.setattr(tracker, "_AI_CONFIG_FILE", str(config_file))
@@ -1132,13 +1493,30 @@ def test_ai_config_save_encrypts_api_key_at_rest(monkeypatch, tmp_path):
         })
         assert tracker._save_ai_config() is True
         raw = config_file.read_text(encoding="utf-8")
+        protected_key_raw = key_file.read_bytes()
+        protected_key = protected_secrets.ProtectedValueStore(
+            key_file,
+            purpose=tracker._AI_CONFIG_KEY_PURPOSE,
+            protector=_TestCurrentUserProtector(),
+        ).load()
         assert "unit-test-secret-value" not in raw
         assert "fernet:" in raw
+        assert json.loads(protected_key_raw.decode("utf-8"))["schema"] == (
+            "defense-tracker.protected-value"
+        )
+        assert protected_key is not None
+        assert protected_key.value != protected_key_raw.strip()
+        assert tracker._is_valid_fernet_key(protected_key.value)
+        with pytest.raises((TypeError, ValueError)):
+            tracker.Fernet(protected_key_raw.strip())
         loaded = tracker._load_ai_config()
         assert loaded["api_key"] == "unit-test-secret-value"
         assert loaded["provider"] == "zhipu"
         assert loaded["model"] == "glm-5.2"
         assert "api.example.test" not in raw
+        if os.name != "nt":
+            assert stat.S_IMODE(config_file.stat().st_mode) == 0o600
+            assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
     finally:
         tracker.AI_CONFIG.clear()
         tracker.AI_CONFIG.update(old_config)
@@ -1162,6 +1540,542 @@ def test_ai_config_refuses_plaintext_fallback(monkeypatch, tmp_path):
     finally:
         tracker.AI_CONFIG.clear()
         tracker.AI_CONFIG.update(old_config)
+
+
+def test_legacy_raw_fernet_key_migrates_and_keeps_ai_and_email_roundtrip(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    _simulate_windows_dpapi(monkeypatch)
+    monkeypatch.delenv("AI_CONFIG_FERNET_KEY", raising=False)
+    config_file = tmp_path / ".ai_config.json"
+    email_file = tmp_path / ".email_config.json"
+    key_file = tmp_path / ".ai_config.key"
+    monkeypatch.setattr(tracker, "_AI_CONFIG_FILE", str(config_file))
+    monkeypatch.setattr(tracker, "_EMAIL_CONFIG_FILE", str(email_file))
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+    legacy_key = tracker.Fernet.generate_key()
+    legacy_cipher = tracker.Fernet(legacy_key)
+    ai_secret = "synthetic-legacy-ai-secret"
+    smtp_secret = "synthetic-legacy-smtp-secret"
+    key_file.write_bytes(legacy_key)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "api_key": "fernet:"
+                + legacy_cipher.encrypt(ai_secret.encode()).decode("ascii"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    email_file.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "smtp_user": "sender@example.com",
+                "smtp_password": "fernet:"
+                + legacy_cipher.encrypt(smtp_secret.encode()).decode("ascii"),
+                "to_addrs": ["recipient@example.com"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        tracker._migrate_legacy_ai_key_file()
+        loaded_ai = tracker._load_ai_config()
+        loaded_email = tracker._load_email_config()
+
+    protected_raw = key_file.read_bytes()
+    assert loaded_ai["api_key"] == ai_secret
+    assert loaded_email["smtp_password"] == smtp_secret
+    assert legacy_key not in protected_raw
+    assert json.loads(protected_raw.decode("utf-8"))["purpose"] == (
+        tracker._AI_CONFIG_KEY_PURPOSE
+    )
+    assert "旧版本地加密密钥已迁移" in caplog.text
+    assert ai_secret not in caplog.text
+    assert smtp_secret not in caplog.text
+    assert str(key_file) not in caplog.text
+
+
+def test_windows_environment_override_still_migrates_legacy_raw_key(
+    monkeypatch,
+    tmp_path,
+):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    _simulate_windows_dpapi(monkeypatch)
+    legacy_key = tracker.Fernet.generate_key()
+    environment_key = tracker.Fernet.generate_key()
+    monkeypatch.setenv(
+        "AI_CONFIG_FERNET_KEY",
+        environment_key.decode("ascii"),
+    )
+    key_file = tmp_path / ".ai_config.key"
+    key_file.write_bytes(legacy_key)
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+
+    tracker._migrate_legacy_ai_key_file()
+
+    protected_raw = key_file.read_bytes()
+    assert legacy_key not in protected_raw
+    assert json.loads(protected_raw.decode("utf-8"))["schema"] == (
+        "defense-tracker.protected-value"
+    )
+    assert tracker._AI_CIPHER is None
+    environment_token = tracker.Fernet(environment_key).encrypt(b"control")
+    assert tracker._load_or_create_ai_cipher().decrypt(environment_token) == (
+        b"control"
+    )
+
+
+def test_ai_cipher_non_windows_requires_explicit_environment_key(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(tracker, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.delenv("AI_CONFIG_FERNET_KEY", raising=False)
+    key_file = tmp_path / ".ai_config.key"
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+
+    assert tracker._load_or_create_ai_cipher() is None
+    assert not key_file.exists()
+
+
+def test_non_windows_rejects_plaintext_ai_search_and_email_files(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    monkeypatch.setattr(tracker, "sys", SimpleNamespace(platform="linux"))
+    for name in (
+        "AI_CONFIG_FERNET_KEY",
+        "AI_API_KEY",
+        "TAVILY_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "SERPAPI_API_KEY",
+        "EMAIL_SMTP_PASSWORD",
+        "GMAIL_APP_PASSWORD",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    ai_file = tmp_path / ".ai_config.json"
+    search_file = tmp_path / ".search_config.json"
+    email_file = tmp_path / ".email_config.json"
+    ai_file.write_text(
+        json.dumps(
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "api_key": "synthetic-plaintext-ai",
+            }
+        ),
+        encoding="utf-8",
+    )
+    search_file.write_text(
+        json.dumps({"tavily_api_key": "synthetic-plaintext-search"}),
+        encoding="utf-8",
+    )
+    email_file.write_text(
+        json.dumps(
+            {
+                "smtp_password": "synthetic-plaintext-smtp",
+                "to_addrs": ["recipient@example.com"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tracker, "_AI_CONFIG_FILE", str(ai_file))
+    monkeypatch.setattr(tracker, "SEARCH_CONFIG_FILE", str(search_file))
+    monkeypatch.setattr(tracker, "_EMAIL_CONFIG_FILE", str(email_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+
+    with caplog.at_level("WARNING"):
+        ai = tracker._load_ai_config()
+        search = tracker._load_search_config()
+        email = tracker._load_email_config()
+
+    assert ai["api_key"] == ""
+    assert search["tavily_api_key"] == ""
+    assert email["smtp_password"] == ""
+    assert "synthetic-plaintext-ai" not in caplog.text
+    assert "synthetic-plaintext-search" not in caplog.text
+    assert "synthetic-plaintext-smtp" not in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+def test_windows_migrates_plaintext_ai_search_and_email_files(
+    monkeypatch,
+    tmp_path,
+):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    _simulate_windows_dpapi(monkeypatch)
+    environment_key = tracker.Fernet.generate_key().decode("ascii")
+    monkeypatch.setenv("AI_CONFIG_FERNET_KEY", environment_key)
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+    ai_file = tmp_path / ".ai_config.json"
+    search_file = tmp_path / ".search_config.json"
+    email_file = tmp_path / ".email_config.json"
+    ai_secret = "synthetic-windows-legacy-ai"
+    search_secret = "synthetic-windows-legacy-search"
+    email_secret = "synthetic-windows-legacy-email"
+    ai_file.write_text(
+        json.dumps(
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "api_key": ai_secret,
+            }
+        ),
+        encoding="utf-8",
+    )
+    search_file.write_text(
+        json.dumps({"tavily_api_key": search_secret}),
+        encoding="utf-8",
+    )
+    email_file.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "smtp_password": email_secret,
+                "to_addrs": ["recipient@example.com"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tracker, "_AI_CONFIG_FILE", str(ai_file))
+    monkeypatch.setattr(tracker, "SEARCH_CONFIG_FILE", str(search_file))
+    monkeypatch.setattr(tracker, "_EMAIL_CONFIG_FILE", str(email_file))
+
+    ai = tracker._load_ai_config()
+    search = tracker._load_search_config()
+    email = tracker._load_email_config()
+
+    assert ai["api_key"] == ai_secret
+    assert search["tavily_api_key"] == search_secret
+    assert email["smtp_password"] == email_secret
+    for path, secret in (
+        (ai_file, ai_secret),
+        (search_file, search_secret),
+        (email_file, email_secret),
+    ):
+        raw = path.read_bytes()
+        assert secret.encode("utf-8") not in raw
+        if os.name != "nt":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_ai_cipher_non_windows_environment_key_round_trips_without_key_file(
+    monkeypatch,
+    tmp_path,
+):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    monkeypatch.setattr(tracker, "sys", SimpleNamespace(platform="linux"))
+    environment_key = tracker.Fernet.generate_key().decode("ascii")
+    monkeypatch.setenv("AI_CONFIG_FERNET_KEY", environment_key)
+    config_file = tmp_path / ".ai_config.json"
+    key_file = tmp_path / ".ai_config.key"
+    monkeypatch.setattr(tracker, "_AI_CONFIG_FILE", str(config_file))
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+    old_config = dict(tracker.AI_CONFIG)
+    try:
+        tracker.AI_CONFIG.clear()
+        tracker.AI_CONFIG.update(
+            {
+                "api_key": "synthetic-env-only-secret",
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+            }
+        )
+
+        assert tracker._save_ai_config() is True
+        tracker._AI_CIPHER = None
+        assert tracker._load_ai_config()["api_key"] == (
+            "synthetic-env-only-secret"
+        )
+        assert not key_file.exists()
+    finally:
+        tracker.AI_CONFIG.clear()
+        tracker.AI_CONFIG.update(old_config)
+        tracker._AI_CIPHER = None
+
+
+def test_ai_key_migration_failure_preserves_legacy_key(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    _simulate_windows_dpapi(monkeypatch)
+    monkeypatch.delenv("AI_CONFIG_FERNET_KEY", raising=False)
+    key_file = tmp_path / ".ai_config.key"
+    legacy_key = tracker.Fernet.generate_key()
+    key_file.write_bytes(legacy_key)
+    before = key_file.read_bytes()
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+
+    def reject_commit(*_args, **_kwargs):
+        raise protected_secrets.ProtectedSecretError("PERSIST_FAILED")
+
+    monkeypatch.setattr(
+        protected_secrets,
+        "write_private_bytes_atomic",
+        reject_commit,
+    )
+
+    with caplog.at_level("WARNING"):
+        assert tracker._load_or_create_ai_cipher() is None
+
+    assert key_file.read_bytes() == before
+    assert "初始化 AI 配置加密失败" in caplog.text
+    assert legacy_key.decode("ascii") not in caplog.text
+    assert str(key_file) not in caplog.text
+
+
+def test_wrong_purpose_protected_key_is_not_overwritten(monkeypatch, tmp_path):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    _simulate_windows_dpapi(monkeypatch)
+    monkeypatch.delenv("AI_CONFIG_FERNET_KEY", raising=False)
+    key_file = tmp_path / ".ai_config.key"
+    protected_secrets.ProtectedValueStore(
+        key_file,
+        purpose="different-local-purpose",
+        protector=_TestCurrentUserProtector(),
+    ).save(tracker.Fernet.generate_key())
+    before = key_file.read_bytes()
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+
+    assert tracker._load_or_create_ai_cipher() is None
+    assert key_file.read_bytes() == before
+
+
+def test_corrupt_protected_key_is_not_overwritten(monkeypatch, tmp_path):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    _simulate_windows_dpapi(monkeypatch)
+    monkeypatch.delenv("AI_CONFIG_FERNET_KEY", raising=False)
+    key_file = tmp_path / ".ai_config.key"
+    protected_secrets.ProtectedValueStore(
+        key_file,
+        purpose=tracker._AI_CONFIG_KEY_PURPOSE,
+        protector=_TestCurrentUserProtector(),
+    ).save(tracker.Fernet.generate_key())
+    envelope = json.loads(key_file.read_text(encoding="utf-8"))
+    envelope["protected_blob"] = "invalid-protected-value%%%"
+    key_file.write_text(json.dumps(envelope), encoding="utf-8")
+    before = key_file.read_bytes()
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+
+    assert tracker._load_or_create_ai_cipher() is None
+    assert key_file.read_bytes() == before
+
+
+def test_atomic_private_config_failure_preserves_ai_search_and_email_files(
+    monkeypatch,
+    tmp_path,
+):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    environment_key = tracker.Fernet.generate_key().decode("ascii")
+    monkeypatch.setenv("AI_CONFIG_FERNET_KEY", environment_key)
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+    ai_file = tmp_path / ".ai_config.json"
+    search_file = tmp_path / ".search_config.json"
+    email_file = tmp_path / ".email_config.json"
+    ai_before = b'{"provider":"deepseek","model":"deepseek-v4-flash"}\n'
+    search_before = b'{"default_providers":["tavily"]}\n'
+    email_before = b'{"enabled":false}\n'
+    ai_file.write_bytes(ai_before)
+    search_file.write_bytes(search_before)
+    email_file.write_bytes(email_before)
+    monkeypatch.setattr(tracker, "_AI_CONFIG_FILE", str(ai_file))
+    monkeypatch.setattr(tracker, "SEARCH_CONFIG_FILE", str(search_file))
+    monkeypatch.setattr(tracker, "_EMAIL_CONFIG_FILE", str(email_file))
+    old_config = dict(tracker.AI_CONFIG)
+
+    def reject_permissions(_path):
+        raise RuntimeError("simulated private-file gate failure")
+
+    def guarded_write(path, payload):
+        return protected_secrets.write_private_json_atomic(
+            path,
+            payload,
+            file_security=reject_permissions,
+        )
+
+    monkeypatch.setattr(tracker, "write_private_json_atomic", guarded_write)
+    try:
+        tracker.AI_CONFIG.clear()
+        tracker.AI_CONFIG.update(
+            {
+                "api_key": "synthetic-ai-write-failure",
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+            }
+        )
+        assert tracker._save_ai_config() is False
+        assert tracker._save_search_config(
+            {
+                "tavily_api_key": "synthetic-search-write-failure",
+                "default_providers": ["tavily"],
+            }
+        ) is False
+        assert tracker._save_email_config(
+            {
+                "enabled": True,
+                "smtp_user": "sender@example.com",
+                "smtp_password": "synthetic-email-write-failure",
+                "to_addrs": ["recipient@example.com"],
+            }
+        ) is False
+    finally:
+        tracker.AI_CONFIG.clear()
+        tracker.AI_CONFIG.update(old_config)
+        tracker._AI_CIPHER = None
+
+    assert ai_file.read_bytes() == ai_before
+    assert search_file.read_bytes() == search_before
+    assert email_file.read_bytes() == email_before
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_private_config_read_fails_closed_when_permissions_cannot_be_enforced(
+    tmp_path,
+):
+    config_file = tmp_path / ".email_config.json"
+    original = b'{"smtp_password":"synthetic-private-read"}\n'
+    config_file.write_bytes(original)
+
+    def reject_permissions(_path):
+        raise RuntimeError("simulated private read gate failure")
+
+    with pytest.raises(protected_secrets.ProtectedSecretError) as rejected:
+        protected_secrets.read_private_json(
+            config_file,
+            file_security=reject_permissions,
+        )
+
+    assert rejected.value.code == "INVALID_LOCAL_CONFIG"
+    assert config_file.read_bytes() == original
+
+
+def test_protected_fernet_key_read_fails_closed_on_permission_gate(tmp_path):
+    key_file = tmp_path / ".ai_config.key"
+    protector = _TestCurrentUserProtector()
+    protected_secrets.ProtectedValueStore(
+        key_file,
+        purpose=tracker._AI_CONFIG_KEY_PURPOSE,
+        protector=protector,
+    ).save(tracker.Fernet.generate_key())
+    original = key_file.read_bytes()
+
+    def reject_permissions(_path):
+        raise RuntimeError("simulated protected-key permission failure")
+
+    with pytest.raises(protected_secrets.ProtectedSecretError) as rejected:
+        protected_secrets.ProtectedValueStore(
+            key_file,
+            purpose=tracker._AI_CONFIG_KEY_PURPOSE,
+            protector=protector,
+            file_security=reject_permissions,
+        ).load()
+
+    assert rejected.value.code == "INVALID_PROTECTED_VALUE"
+    assert key_file.read_bytes() == original
+
+
+def test_search_config_api_rolls_back_when_secure_persistence_fails(
+    monkeypatch,
+    client,
+):
+    previous = dict(tracker.SEARCH_CONFIG)
+    monkeypatch.setattr(
+        tracker,
+        "_save_search_config",
+        lambda _config=None: False,
+    )
+    csrf = _csrf_cookie(client)
+    try:
+        response = client.post(
+            "/api/search/config",
+            json={"tavily_api_key": "synthetic-unsaved-search-secret"},
+            headers={tracker.CSRF_HEADER: csrf},
+        )
+
+        assert response.status_code == 503
+        assert response.get_json()["code"] == (
+            "SEARCH_CONFIG_PERSISTENCE_FAILED"
+        )
+        assert tracker.SEARCH_CONFIG == previous
+        assert "synthetic-unsaved-search-secret" not in response.get_data(
+            as_text=True
+        )
+    finally:
+        tracker.SEARCH_CONFIG.clear()
+        tracker.SEARCH_CONFIG.update(previous)
+
+
+def test_email_config_save_is_private_encrypted_and_round_trips(
+    monkeypatch,
+    tmp_path,
+):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+
+    environment_key = tracker.Fernet.generate_key().decode("ascii")
+    monkeypatch.setenv("AI_CONFIG_FERNET_KEY", environment_key)
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
+    email_file = tmp_path / ".email_config.json"
+    key_file = tmp_path / ".ai_config.key"
+    monkeypatch.setattr(tracker, "_EMAIL_CONFIG_FILE", str(email_file))
+    monkeypatch.setattr(tracker, "_AI_CONFIG_KEY_FILE", str(key_file))
+    password = "synthetic-smtp-roundtrip-secret"
+    config = {
+        "enabled": True,
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 465,
+        "smtp_user": "sender@example.com",
+        "smtp_password": password,
+        "from_addr": "sender@example.com",
+        "to_addrs": ["recipient@example.com"],
+        "use_ssl": True,
+        "starttls": False,
+    }
+
+    assert tracker._save_email_config(config) is True
+    raw = email_file.read_bytes()
+    tracker._AI_CIPHER = None
+    loaded = tracker._load_email_config()
+
+    assert password.encode("utf-8") not in raw
+    assert loaded["smtp_password"] == password
+    assert not key_file.exists()
+    if os.name != "nt":
+        assert stat.S_IMODE(email_file.stat().st_mode) == 0o600
 
 
 def _quality_article(title="解放军首次开展台海联合演训值得警惕", source="Jamestown China Brief"):

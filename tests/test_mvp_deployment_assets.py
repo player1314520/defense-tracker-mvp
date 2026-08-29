@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -41,6 +42,69 @@ def test_embedded_deployment_python_has_valid_syntax():
             compile(source, f"{script.name}:heredoc-{index}", "exec")
             checked += 1
     assert checked >= 5
+
+
+@pytest.mark.parametrize(
+    ("module_name", "script_name"),
+    (
+        ("defense_probe_origin_tls", "probe-origin-isolation.py"),
+        ("defense_probe_public_tls", "probe-public.py"),
+    ),
+)
+def test_deployment_probe_tls_contexts_require_tls12_and_identity_verification(
+    module_name, script_name
+):
+    script = MVP / "bin" / script_name
+    spec = importlib.util.spec_from_file_location(module_name, script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    context = module._tls_client_context()
+
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_public_probe_urlopen_uses_hardened_tls_context(monkeypatch):
+    script = MVP / "bin" / "probe-public.py"
+    spec = importlib.util.spec_from_file_location("defense_probe_public_urlopen", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    expected_context = object()
+    observed = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, maximum):
+            return b"{}"
+
+    def fake_urlopen(request, *, timeout, context):
+        observed["timeout"] = timeout
+        observed["context"] = context
+        return Response()
+
+    monkeypatch.setattr(module, "_tls_client_context", lambda: expected_context)
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+
+    assert module.request_bytes("https://example.test/health") == b"{}"
+    assert observed == {"timeout": 15, "context": expected_context}
+
+
+def test_preflight_requires_python_311_or_newer():
+    preflight = read(MVP / "bin" / "preflight.sh")
+
+    assert "sys.version_info < (3, 11)" in preflight
+    assert "Python >= 3.11 is required" in preflight
 
 
 def test_production_compose_exposes_only_portal_and_edge_with_hardening():

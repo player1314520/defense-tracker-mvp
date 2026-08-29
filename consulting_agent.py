@@ -17,6 +17,7 @@ import report_agent
 from state import DATA_DIR
 
 CONSULTING_AGENT_DB_FILE = os.path.join(DATA_DIR, "consulting_agent.sqlite3")
+MAX_CONSULTING_INSTRUCTION_CHARS = 4096
 SOURCE_ARCHIVE_DIR = os.path.join(DATA_DIR, "source_archive")
 _DB_LOCK = threading.Lock()
 
@@ -518,6 +519,8 @@ def _log_event(conn, session_id: str, event_type: str, payload=None):
 
 def create_session(instruction: str, target_source_count: int | None = None,
                    report_goal: str = "", search_web: bool = True) -> dict:
+    if len(str(instruction or "")) > MAX_CONSULTING_INSTRUCTION_CHARS:
+        raise ValueError("客户指令超过 4096 字符限制")
     instruction = _clean_text(instruction)
     if not instruction:
         raise ValueError("缺少客户指令")

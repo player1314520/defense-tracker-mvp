@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import hashlib
 import json
 import sqlite3
 
@@ -237,6 +238,38 @@ def test_remote_sync_is_idempotent_and_never_carries_plaintext(service):
     assert service.read_record(
         boot["organization_id"], "owner", record["record_id"]
     )["content"]["body"] == "cloud must not see this"
+
+
+def test_remote_sync_accepts_legacy_plaintext_content_hash(service):
+    boot = service.bootstrap_organization("Org", "owner", "Desktop")
+    content = {"body": "legacy ciphertext sync"}
+    record = service.create_record(
+        boot["organization_id"],
+        "owner",
+        boot["device_id"],
+        "evidence",
+        content,
+    )
+    event = service.export_outbox(boot["organization_id"])[0]
+    plaintext = json.dumps(
+        content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    event["payload"]["content_hash"] = hashlib.sha256(plaintext).hexdigest()
+
+    with sqlite3.connect(service.database_path) as conn:
+        conn.execute("DELETE FROM sync_outbox WHERE record_id=?", (record["record_id"],))
+        conn.execute(
+            "DELETE FROM encrypted_records WHERE record_id=?", (record["record_id"],)
+        )
+
+    result = service.apply_remote_event(
+        boot["organization_id"], "owner", event, remote_cursor=12
+    )
+
+    assert result["state"] == "applied"
+    assert service.read_record(
+        boot["organization_id"], "owner", record["record_id"]
+    )["content"] == content
 
 
 def test_newer_remote_body_conflict_is_preserved_when_local_outbox_pending(service):

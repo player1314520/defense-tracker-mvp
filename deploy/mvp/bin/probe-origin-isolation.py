@@ -42,6 +42,12 @@ class ProbeFailure(RuntimeError):
     """A redaction-safe origin-isolation failure."""
 
 
+def _tls_client_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -129,7 +135,7 @@ def _tcp_is_blocked(addresses: list[tuple[int, tuple[object, ...]]]) -> bool:
 def _sni_tls_is_blocked(
     addresses: list[tuple[int, tuple[object, ...]]], server_name: str
 ) -> bool:
-    context = ssl.create_default_context()
+    context = _tls_client_context()
     for family, sockaddr in addresses:
         raw = socket.socket(family, socket.SOCK_STREAM)
         raw.settimeout(CONNECT_TIMEOUT_SECONDS)
@@ -155,7 +161,7 @@ def _public_health_reachable(server_name: str) -> bool:
         server_name,
         443,
         timeout=CONNECT_TIMEOUT_SECONDS,
-        context=ssl.create_default_context(),
+        context=_tls_client_context(),
     )
     try:
         connection.request(

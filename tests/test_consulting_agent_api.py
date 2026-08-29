@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 import app as tracker
 import consulting_agent
 import report_agent
@@ -312,6 +314,13 @@ def test_consult_revise_records_revision(monkeypatch, tmp_path):
 
 
 def test_search_status_and_config_routes_mask_keys(monkeypatch, tmp_path):
+    if not tracker.CRYPTO_AVAILABLE:
+        pytest.skip("cryptography is unavailable")
+    monkeypatch.setenv(
+        "AI_CONFIG_FERNET_KEY",
+        tracker.Fernet.generate_key().decode("ascii"),
+    )
+    monkeypatch.setattr(tracker, "_AI_CIPHER", None)
     monkeypatch.setattr(tracker, "SEARCH_CONFIG_FILE", str(tmp_path / "search_config.json"), raising=False)
     tracker.SEARCH_CONFIG.clear()
     tracker.SEARCH_CONFIG.update({})
@@ -544,6 +553,58 @@ def test_consult_real_pdf_file_allows_same_origin_reader_iframe(monkeypatch, tmp
     assert "frame-src 'self' blob:" in csp
     assert "frame-ancestors 'self'" in csp
     assert "frame-ancestors 'none'" not in csp
+
+
+def test_consult_asset_open_rejects_symlink_outside_archive(
+    monkeypatch, tmp_path
+):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    outside = tmp_path / "private.txt"
+    outside.write_text("must-not-be-served", encoding="utf-8")
+    link = archive / "linked.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    monkeypatch.setattr(
+        consulting_agent,
+        "source_archive_root",
+        lambda _session_id: str(archive),
+    )
+
+    with pytest.raises(FileNotFoundError):
+        tracker._open_consult_asset("session-1", str(link))
+
+
+def test_consult_asset_open_rejects_inode_swap(monkeypatch, tmp_path):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    candidate = archive / "asset.txt"
+    replacement = archive / "replacement.txt"
+    candidate.write_text("approved", encoding="utf-8")
+    replacement.write_text("must-not-be-served", encoding="utf-8")
+    real_open = tracker.os.open
+    swapped = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == candidate and not swapped:
+            swapped = True
+            candidate.rename(archive / "asset-original.txt")
+            replacement.replace(candidate)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(
+        consulting_agent,
+        "source_archive_root",
+        lambda _session_id: str(archive),
+    )
+    monkeypatch.setattr(tracker.os, "open", racing_open)
+
+    with pytest.raises(FileNotFoundError):
+        tracker._open_consult_asset("session-1", str(candidate))
+    assert swapped
 
 
 def test_consult_capture_to_target_archives_success_and_marks_restricted(monkeypatch, tmp_path):

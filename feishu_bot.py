@@ -44,6 +44,13 @@ from feishu_webhook_security import (
     validate_event_identity,
     verify_signed_request,
 )
+from protected_secrets import (
+    FEISHU_CONFIG_FIELDS,
+    FEISHU_SECRET_FIELDS,
+    FeishuSecretStore,
+    ProtectedSecretError,
+    ROTATION_NOTICE,
+)
 from state import CONFIG_DIR
 
 feishu_bp = Blueprint("feishu_bot", __name__)
@@ -51,33 +58,103 @@ logger = logging.getLogger(__name__)
 
 # 全局线程池（替代无限 daemon thread，防止线程爆炸）
 _worker_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="feishu_bot")
+_feishu_config_lock = threading.RLock()
 
 # ── 飞书应用配置（运行时可通过 /api/feishu/config 接口更新）────
 _FEISHU_CONFIG_FILE = os.path.join(CONFIG_DIR, ".feishu_config.json")
+_FEISHU_ROTATION_REQUIRED = False
+_FEISHU_ROTATION_FINGERPRINT_KEY = os.urandom(32)
+_FEISHU_MIGRATED_SECRET_FINGERPRINT = None
+_FEISHU_STRIPPED_SECRET_FIELDS = frozenset({
+    "verify_token",
+    "encrypt_key",
+    "tenant_key",
+})
 
-def _load_feishu_config() -> dict:
-    base = {
+
+def _feishu_secret_fingerprint(config: dict) -> bytes:
+    serialized = json.dumps(
+        [
+            config.get(field, "").strip()
+            if field in _FEISHU_STRIPPED_SECRET_FIELDS
+            else config.get(field, "")
+            for field in FEISHU_SECRET_FIELDS
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.digest(
+        _FEISHU_ROTATION_FINGERPRINT_KEY,
+        serialized,
+        "sha256",
+    )
+
+
+def _matches_migrated_feishu_secrets(config: dict) -> bool:
+    if _FEISHU_MIGRATED_SECRET_FINGERPRINT is None:
+        return False
+    return hmac.compare_digest(
+        _feishu_secret_fingerprint(config),
+        _FEISHU_MIGRATED_SECRET_FINGERPRINT,
+    )
+
+
+def _environment_feishu_config() -> dict:
+    return {
         "app_id":       os.environ.get("FEISHU_APP_ID", ""),
         "app_secret":   os.environ.get("FEISHU_APP_SECRET", ""),
         "verify_token": os.environ.get("FEISHU_VERIFY_TOKEN", ""),
         "encrypt_key":  os.environ.get("FEISHU_ENCRYPT_KEY", ""),
         "tenant_key":   os.environ.get("FEISHU_TENANT_KEY", ""),
     }
-    if os.path.exists(_FEISHU_CONFIG_FILE):
-        try:
-            with open(_FEISHU_CONFIG_FILE, encoding="utf-8") as f:
-                saved = json.load(f)
-            base.update({k: v for k, v in saved.items() if v})
-        except Exception:
-            pass
+
+
+def _environment_manages_feishu_secrets() -> bool:
+    environment = _environment_feishu_config()
+    return any(environment.get(field) for field in FEISHU_SECRET_FIELDS)
+
+
+def _load_feishu_config(*, protector=None) -> dict:
+    global _FEISHU_MIGRATED_SECRET_FINGERPRINT, _FEISHU_ROTATION_REQUIRED
+    environment = _environment_feishu_config()
+    loaded = FeishuSecretStore(
+        _FEISHU_CONFIG_FILE,
+        protector=protector,
+    ).load()
+    base = {field: "" for field in FEISHU_CONFIG_FIELDS}
+    if loaded is not None:
+        base.update(loaded.values)
+        _FEISHU_ROTATION_REQUIRED = loaded.rotation_required
+        if loaded.rotation_required:
+            _FEISHU_MIGRATED_SECRET_FINGERPRINT = _feishu_secret_fingerprint(
+                loaded.values,
+            )
+            logger.warning("feishu_bot: %s", ROTATION_NOTICE)
+        else:
+            _FEISHU_MIGRATED_SECRET_FINGERPRINT = None
+    else:
+        _FEISHU_ROTATION_REQUIRED = False
+        _FEISHU_MIGRATED_SECRET_FINGERPRINT = None
+    # Environment variables are the only supported secret source on non-Windows
+    # and intentionally take precedence over local protected state everywhere.
+    base.update({key: value for key, value in environment.items() if value})
     return base
 
-def _save_feishu_config():
-    try:
-        with open(_FEISHU_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(FEISHU_CONFIG, f)
-    except Exception as e:
-        logger.warning("保存飞书配置失败: %s", e)
+
+def _save_feishu_config(
+    config=None,
+    *,
+    protector=None,
+    rotation_required=None,
+):
+    if config is None:
+        config = FEISHU_CONFIG
+    if rotation_required is None:
+        rotation_required = _FEISHU_ROTATION_REQUIRED
+    FeishuSecretStore(
+        _FEISHU_CONFIG_FILE,
+        protector=protector,
+    ).save(config, rotation_required=rotation_required)
 
 FEISHU_CONFIG = _load_feishu_config()
 
@@ -116,7 +193,11 @@ def get_tenant_token() -> str:
                 last_err = e
                 _token_cache["token"] = ""
                 _token_cache["expire"] = 0
-                logger.warning("tenant_token 获取失败 (attempt %d/3): %s", attempt + 1, e)
+                logger.warning(
+                    "tenant_token 获取失败 attempt=%d error_type=%s",
+                    attempt + 1,
+                    type(e).__name__,
+                )
                 if attempt < 2:
                     time.sleep(1 * (attempt + 1))
         raise RuntimeError(f"飞书Token获取失败（3次重试后放弃）: {last_err}")
@@ -135,7 +216,7 @@ def _post(path: str, payload: dict) -> dict:
     data = r.json()
     code = data.get("code", -1)
     if code != 0:
-        logger.warning("飞书 API %s 返回错误 code=%s msg=%s", path, code, data.get("msg"))
+        logger.warning("飞书 API %s 返回错误 code=%s", path, code)
     return data
 
 
@@ -149,7 +230,7 @@ def send_text(chat_id: str, text: str) -> bool:
         })
         return data.get("code") == 0
     except Exception as e:
-        logger.error("send_text 失败: %s", e)
+        logger.error("send_text 失败 error_type=%s", type(e).__name__)
         return False
 
 
@@ -163,7 +244,7 @@ def send_card(chat_id: str, card: dict) -> bool:
         })
         return data.get("code") == 0
     except Exception as e:
-        logger.error("send_card 失败: %s", e)
+        logger.error("send_card 失败 error_type=%s", type(e).__name__)
         return False
 
 
@@ -421,7 +502,10 @@ def upload_file(file_name: str, file_data: bytes, file_type: str = "stream") -> 
     if data.get("code") == 0:
         return data["data"]["file_key"]
 
-    logger.warning("飞书上传第一次失败 (%s)，尝试 ASCII fallback", last_err)
+    logger.warning(
+        "飞书上传第一次失败 error_type=%s，尝试 ASCII fallback",
+        type(last_err).__name__,
+    )
     fallback_name = _ascii_fallback_name(matched_ext, original=file_name)
     data = _do_upload(fallback_name)
     if data.get("code") == 0:
@@ -716,6 +800,8 @@ def feishu_webhook():
 @feishu_bp.route("/api/feishu/config", methods=["GET", "POST"])
 def feishu_config():
     """读写飞书机器人配置（供前端设置页调用，需登录）"""
+    global FEISHU_CONFIG, _FEISHU_MIGRATED_SECRET_FINGERPRINT
+    global _FEISHU_ROTATION_REQUIRED
     # Blueprint 为避免循环 import 在请求期复用主应用的统一鉴权；浏览器
     # cookie 是短期进程内 session，长期 master/device token 不进入 cookie。
     from app import _workspace_auth_error_response
@@ -724,30 +810,120 @@ def feishu_config():
         return rejection
     if request.method == "POST":
         data = request.get_json() or {}
-        if data.get("app_id"):
-            FEISHU_CONFIG["app_id"] = data["app_id"]
-        if data.get("app_secret"):
-            FEISHU_CONFIG["app_secret"] = data["app_secret"]
-        if data.get("verify_token"):
-            FEISHU_CONFIG["verify_token"] = data["verify_token"]
-        if data.get("encrypt_key"):
-            FEISHU_CONFIG["encrypt_key"] = data["encrypt_key"]
-        if data.get("tenant_key"):
-            FEISHU_CONFIG["tenant_key"] = data["tenant_key"]
-        # 清除 token 缓存，让下次请求重新获取
-        with _token_lock:
-            _token_cache["expire"] = 0
-        _save_feishu_config()
+        if not isinstance(data, dict):
+            return jsonify({"error": "飞书配置格式无效"}), 400
+        for field in FEISHU_CONFIG_FIELDS:
+            value = data.get(field)
+            if value:
+                if not isinstance(value, str):
+                    return jsonify({"error": "飞书配置字段必须是字符串"}), 400
+        if (
+            "old_credentials_revoked" in data
+            and not isinstance(data["old_credentials_revoked"], bool)
+        ):
+            return jsonify({
+                "error": "旧凭据撤销确认必须是布尔值",
+                "code": "FEISHU_REVOCATION_CONFIRMATION_INVALID",
+            }), 400
+        with _feishu_config_lock:
+            if (
+                _FEISHU_ROTATION_REQUIRED
+                and _environment_manages_feishu_secrets()
+            ):
+                return jsonify({
+                    "error": (
+                        "飞书秘密凭据由环境变量托管，本应用不会写入本地或清除"
+                        "轮换状态；请在飞书开发者后台撤销旧值，更新部署环境中的"
+                        "完整凭据并重启。环境覆盖存在期间，本地迁移提醒不会自动"
+                        "清除；如需清除，请先移除秘密凭据环境覆盖并重启，再通过"
+                        "本接口完整提交新凭据和撤销确认"
+                    ),
+                    "code": "FEISHU_ROTATION_ENVIRONMENT_MANAGED",
+                }), 409
+            candidate = dict(FEISHU_CONFIG)
+            candidate.update({
+                field: data[field]
+                for field in FEISHU_CONFIG_FIELDS
+                if data.get(field)
+            })
+            rotation_required = _FEISHU_ROTATION_REQUIRED
+            submitted_secret_fields = {
+                field for field in FEISHU_SECRET_FIELDS if data.get(field)
+            }
+            if _FEISHU_ROTATION_REQUIRED:
+                if submitted_secret_fields != set(FEISHU_SECRET_FIELDS):
+                    return jsonify({
+                        "error": "轮换时必须一次提交完整的新飞书凭据",
+                        "code": "FEISHU_ROTATION_INCOMPLETE",
+                    }), 409
+                if data.get("old_credentials_revoked") is not True:
+                    return jsonify({
+                        "error": (
+                            "请确认已在飞书开发者后台撤销旧凭据；"
+                            "本应用无法自动核验远程撤销状态"
+                        ),
+                        "code": "FEISHU_REVOCATION_CONFIRMATION_REQUIRED",
+                    }), 409
+                if _matches_migrated_feishu_secrets(candidate):
+                    return jsonify({
+                        "error": "新凭据不能与迁移前的旧凭据完全相同",
+                        "code": "FEISHU_CREDENTIALS_UNCHANGED",
+                    }), 409
+                if any(
+                    data[field] != data[field].strip()
+                    for field in FEISHU_SECRET_FIELDS
+                ):
+                    return jsonify({
+                        "error": "飞书秘密凭据不得为空或包含首尾空白",
+                        "code": "FEISHU_ROTATION_SECRET_WHITESPACE",
+                    }), 400
+                rotation_required = False
+            try:
+                _save_feishu_config(
+                    candidate,
+                    rotation_required=rotation_required,
+                )
+            except ProtectedSecretError as exc:
+                logger.error(
+                    "feishu_bot: protected configuration save failed (%s)",
+                    exc.code,
+                )
+                status = 413 if exc.code == "CONFIG_TOO_LARGE" else 503
+                return jsonify({
+                    "error": (
+                        "飞书配置超过安全存储大小限制"
+                        if status == 413
+                        else "当前系统无法安全保存飞书凭据，请改用环境变量配置"
+                    ),
+                    "code": (
+                        "FEISHU_CONFIG_TOO_LARGE"
+                        if status == 413
+                        else "FEISHU_SECRET_STORAGE_UNAVAILABLE"
+                    ),
+                }), status
+            # Assignment is atomic for readers.  The token lock orders the
+            # configuration switch with cache invalidation, while the outer
+            # lock linearizes concurrent configuration POST requests.
+            with _token_lock:
+                FEISHU_CONFIG = candidate
+                _FEISHU_ROTATION_REQUIRED = rotation_required
+                if not rotation_required:
+                    _FEISHU_MIGRATED_SECRET_FINGERPRINT = None
+                _token_cache["expire"] = 0
         return jsonify({"ok": True,
                         "app_id": FEISHU_CONFIG["app_id"],
                         "configured": bool(FEISHU_CONFIG["app_id"]),
                         "signature_configured": bool(FEISHU_CONFIG.get("encrypt_key")),
-                        "tenant_configured": bool(FEISHU_CONFIG.get("tenant_key"))})
+                        "tenant_configured": bool(FEISHU_CONFIG.get("tenant_key")),
+                        "credential_rotation_required": _FEISHU_ROTATION_REQUIRED,
+                        "credential_notice": ROTATION_NOTICE if _FEISHU_ROTATION_REQUIRED else ""})
     return jsonify({
         "app_id":     FEISHU_CONFIG["app_id"],
         "configured": bool(FEISHU_CONFIG["app_id"] and FEISHU_CONFIG["app_secret"]),
         "signature_configured": bool(FEISHU_CONFIG.get("encrypt_key")),
         "tenant_configured": bool(FEISHU_CONFIG.get("tenant_key")),
+        "credential_rotation_required": _FEISHU_ROTATION_REQUIRED,
+        "credential_notice": ROTATION_NOTICE if _FEISHU_ROTATION_REQUIRED else "",
         "webhook_url": "/api/feishu/webhook  （需配合 ngrok 或公网域名使用）",
     })
 

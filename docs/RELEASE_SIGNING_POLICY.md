@@ -71,6 +71,25 @@ certificate-table bytes changed. It then re-extracts and compares the complete
 payload before smoke, malware, portable, SBOM, and final six-asset checks. No
 single-stage path may produce a signed installer or stable assets.
 
+That two-stage design is not currently sufficient to authorize credential use.
+The candidate workflow therefore starts with a tokenless GitHub-hosted gate
+that emits a machine-readable `SIGNING_ISOLATION_NOT_PROVISIONED` blocker and
+exits non-zero. Every source-verification or signing job depends on that failed
+gate, so neither a signing environment, OIDC login, secret, nor self-hosted
+runner can be reached by a manual dispatch. The blocker may be replaced only by
+a separately reviewed change after all of these roles exist:
+
+1. a credentialless builder/scanner and approval controller that emits the
+   approved artifact hashes;
+2. a minimal signing runner that accepts only those approved bytes, verifies
+   their hashes, signs them, and never executes a candidate; and
+3. a credentialless or least-privileged, restricted-egress, single-use VM that
+   performs post-signature smoke tests, followed by controller-signed runner
+   deregistration and VM-destruction receipts.
+
+Those roles must not share a runner image, long-lived workspace, credential, or
+controller identity. Missing teardown receipts fail the candidate run closed.
+
 ## Required verification evidence
 
 The schema-2 release manifest records:
@@ -116,7 +135,10 @@ Ed25519 public-key fingerprint, and allowed Publisher. The two active reviews
 must use distinct public keys; an environment-variable edit cannot activate a
 reviewer or bypass that separation. Until those conditions are satisfied, the
 stable Windows release is blocked, and signed candidates are also blocked. A
-self-signed substitute is not allowed.
+self-signed substitute is not allowed. The explicit isolation blocker described
+above is also active; a failed candidate run produces no releasable artifact,
+and the stable workflow accepts only a successful run of this exact candidate
+workflow before attempting its exact artifact download.
 
 ## Honest boundaries
 
