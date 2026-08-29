@@ -16,6 +16,7 @@ from scripts import auto_start
 
 @pytest.fixture(autouse=True)
 def _reset_pinned_ngrok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(auto_start, "_process_is_elevated", lambda: False)
     monkeypatch.setattr(auto_start, "_ngrok_executable", None, raising=False)
     monkeypatch.setattr(auto_start, "_ngrok_identity", None, raising=False)
     monkeypatch.setattr(auto_start, "_app_supervisor_secret", None, raising=False)

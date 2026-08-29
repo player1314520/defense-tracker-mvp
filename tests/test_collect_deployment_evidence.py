@@ -29,6 +29,11 @@ PRODUCTION_ORIGIN = "https://production.example.test"
 STAGING_CERT = hashlib.sha256(b"staging cert").hexdigest()
 PRODUCTION_CERT = hashlib.sha256(b"production cert").hexdigest()
 SECURE_ENSURE_ROOT = collector._ensure_root
+SECURE_EXPECTED_ROOT_UID = collector._expected_root_uid
+
+
+def test_deployment_evidence_production_owner_is_root():
+    assert SECURE_EXPECTED_ROOT_UID() == 0
 
 
 def test_deployment_evidence_tls_context_requires_tls12_and_identity_verification():
@@ -65,6 +70,8 @@ def _collector_machine_identity(tmp_path, monkeypatch):
         "ORIGIN_CONFIG_PATHS",
         {"staging": staging_config, "production": production_config},
     )
+    if hasattr(os, "geteuid"):
+        monkeypatch.setattr(collector, "_expected_root_uid", lambda: os.geteuid())
 
     def test_evidence_root(root: Path) -> Path:
         if root.is_symlink():
