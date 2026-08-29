@@ -8,7 +8,7 @@
     "build": "esbuild src/index.js --bundle --minify --supported:template-literal=false --format=esm --platform=browser --target=es2022 --outfile=../../static/js/vendor/v9-supabase-auth.mjs && esbuild src/portal.js --bundle --minify --supported:template-literal=false --format=esm --platform=browser --target=es2022 --outfile=../v9-portal/supabase-client.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "2.95.0"
+    "@supabase/supabase-js": "2.112.4"
   },
   "devDependencies": {
     "esbuild": "0.28.1"
