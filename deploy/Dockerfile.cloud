@@ -15,7 +15,8 @@ COPY web/v9-portal ./web/v9-portal
 
 RUN useradd -m -u 1000 appuser \
     && mkdir -p /data \
-    && chown -R appuser:appuser /app /data
+    && chown -R appuser:appuser /app /data \
+    && chmod 0700 /data
 USER appuser
 
 ENV PYTHONUNBUFFERED=1 PORT=8080 V9_PRODUCTION_MODE=true

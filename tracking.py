@@ -115,7 +115,7 @@ def _guard(fn):
         try:
             return fn(*args, **kwargs)
         except requests.exceptions.RequestException as e:
-            logger.warning("Supabase 请求失败: %s", e)
+            logger.warning("Supabase 请求失败 (%s)", type(e).__name__)
             return jsonify({"error": "云端追踪暂不可达（网络或 Supabase 异常）",
                             "code": "supabase_unreachable"}), 503
 
@@ -266,6 +266,7 @@ def tracking_status():
         return jsonify({"configured": False, "reachable": False})
     reachable = True
     detail = ""
+    code = ""
     try:
         r = _sb_rest("GET", "tracked_topics", params={"select": "id", "limit": "1"}, timeout=8)
         reachable = r.ok
@@ -273,8 +274,13 @@ def tracking_status():
             detail = f"HTTP {r.status_code}"
     except requests.exceptions.RequestException as e:
         reachable = False
-        detail = str(e)[:200]
-    return jsonify({"configured": True, "reachable": reachable, "detail": detail})
+        detail = "云端追踪暂不可达"
+        code = "supabase_unreachable"
+        logger.warning("Supabase 状态探测失败 (%s)", type(e).__name__)
+    payload = {"configured": True, "reachable": reachable, "detail": detail}
+    if code:
+        payload["code"] = code
+    return jsonify(payload)
 
 
 @tracking_bp.route("/api/tracking/topics", methods=["GET"])

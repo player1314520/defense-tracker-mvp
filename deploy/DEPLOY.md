@@ -78,15 +78,30 @@ docker compose logs -f tracker
 
 ## 方案二：ngrok（快速测试，无需域名）
 
-`scripts/飞书机器人启动.bat` 从环境变量读取 ngrok 可执行文件和保留域名：
+将官方 `ngrok.exe` 放入本机 `PATH` 的绝对目录中；启动脚本只读取保留域名，
+并统一调用带本地文件、重解析点和启动前身份复验的守护程序：
 
 ```powershell
-$env:NGROK_EXE = 'C:\path\to\ngrok.exe'
 $env:NGROK_DOMAIN = 'your-ngrok-domain.example'
 .\scripts\飞书机器人启动.bat
 ```
 
 适合**本地开发 + 飞书机器人测试**，不适合长期公网运行。
+
+该守护程序的边界是：它不验证 ngrok 的 Authenticode Publisher 或官方发布哈希；
+首次选择仍遵循当前用户的 `PATH` 顺序；文件身份复验不能完全消除同一用户在最终
+检查与进程创建之间的极短替换窗口。因此它拒绝管理员/root 身份运行，安装来源与
+首次文件真实性仍须由本地操作员独立核验，生产入口应使用受控反向代理而不是 ngrok。
+
+### V9 本地开发数据库连续性
+
+本地开发会继续使用已经存在的旧临时数据库；全新环境才创建权限更严格的新目录。
+如果旧、新两个主库同时存在，启动会无条件安全阻断，不能因为两个主文件哈希相同就
+自动选择——SQLite 的已提交数据仍可能只位于 `-wal`。处理冲突必须先停止全部旧版与
+新版进程，再同时检查主库及 `-wal`、`-shm`、`-journal`、`-mj*`，用 SQLite 的正常
+checkpoint/backup 完成一致性副本并通过 `PRAGMA integrity_check`。确认 canonical 后，
+将另一套主库及其 sidecar 移到唯一且不覆盖的归档位置并记录 SHA-256；不要在应用启动
+路径中自动移动或删除。生产固定 `/data` 路径不使用这段开发兼容逻辑。
 
 ---
 

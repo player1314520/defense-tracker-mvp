@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 import json
 from pathlib import Path
+import sqlite3
 from zipfile import ZipFile
 
 import pytest
@@ -486,17 +487,41 @@ def test_consult_asset_preview_does_not_iframe_fake_pdf_placeholder(monkeypatch,
         "score": 88,
         "snippet": "Login required.",
     }])
+    private_marker = "credential=[private-value] at [private-path]"
     asset = consulting_agent.archive_source_asset(session["session_id"], evidence[0], {
         "title": "Restricted PDF",
         "url": "https://example.test/restricted.pdf",
-        "text": "该来源需要用户授权后才能归档。",
-        "snippet": "需要授权。",
+        "text": private_marker,
+        "snippet": private_marker,
         "document_type": "pdf",
         "content_type": "application/pdf",
         "word_count": 0,
-        "raw_bytes": "该来源需要用户授权后才能归档。".encode("utf-8"),
-        "is_fetched_original": False,
-    }, status="needs_user_input", failure_reason="403 Forbidden login required")
+        "raw_bytes": private_marker.encode("utf-8"),
+        "is_fetched_original": True,
+        "failure_code": "blocked",
+        "diagnosis": {
+            "code": "blocked",
+            "label": private_marker,
+            "advice": {"private": private_marker},
+        },
+    }, status="needs_user_input", failure_reason=private_marker)
+
+    with sqlite3.connect(tmp_path / "consult.sqlite3") as conn:
+        stored_paths = conn.execute(
+            """
+            SELECT local_path, text_path, metadata_path
+            FROM source_assets WHERE asset_id=?
+            """,
+            (asset["asset_id"],),
+        ).fetchone()
+    assert stored_paths is not None
+    for stored_path in stored_paths:
+        content = Path(stored_path).read_bytes()
+        assert private_marker.encode("utf-8") not in content
+    assert asset["local_path"] == ""
+    assert asset["text_path"] == ""
+    assert asset["metadata_path"] == ""
+    assert asset["checksum"] == ""
 
     preview = client.get(
         f"/api/consult/sessions/{session['session_id']}/assets/{asset['asset_id']}/preview"
@@ -508,6 +533,15 @@ def test_consult_asset_preview_does_not_iframe_fake_pdf_placeholder(monkeypatch,
     assert data["reader_mode"] == "blocked"
     assert data["file_is_real_pdf"] is False
     assert "用户授权" in data["text"]
+    assert private_marker not in json.dumps(data, ensure_ascii=False)
+    assert data["file_url"] == ""
+    assert data["download_url"] == ""
+
+    file_resp = client.get(
+        f"/api/consult/sessions/{session['session_id']}/assets/{asset['asset_id']}/file"
+    )
+    assert file_resp.status_code == 409
+    assert private_marker not in file_resp.get_data(as_text=True)
 
 
 def test_consult_real_pdf_file_allows_same_origin_reader_iframe(monkeypatch, tmp_path):
@@ -696,6 +730,48 @@ def test_consult_capture_to_target_archives_success_and_marks_restricted(monkeyp
     assert {asset["status"] for asset in assets} == {"archived", "needs_user_input"}
 
 
+def test_consult_capture_job_migrates_and_hides_legacy_exception_text(
+    monkeypatch, tmp_path
+):
+    db_file = tmp_path / "consult.sqlite3"
+    monkeypatch.setattr(consulting_agent, "CONSULTING_AGENT_DB_FILE", str(db_file))
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    _login_cookies(client)
+    session = consulting_agent.create_session("搜集1份公开来源")
+    job = consulting_agent.create_capture_job(session["session_id"], target_count=1)
+    private_detail = "timeout [private-path] https://api.test/?credential=[private-value]"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "UPDATE capture_jobs SET status='failed', stop_reason=? WHERE job_id=?",
+            (private_detail, job["job_id"]),
+        )
+        conn.commit()
+
+    response = client.get(
+        f"/api/consult/sessions/{session['session_id']}/capture_jobs/{job['job_id']}"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    returned = payload["job"]
+    assert returned["stop_reason"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert returned["stop_reason_label"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert (
+        tracker._consult_stop_reason_label(private_detail)
+        == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    )
+    assert private_detail not in json.dumps(payload, ensure_ascii=False)
+
+    consulting_agent.init_consulting_agent_db()
+    consulting_agent.init_consulting_agent_db()
+    with sqlite3.connect(db_file) as conn:
+        stored = conn.execute(
+            "SELECT stop_reason FROM capture_jobs WHERE job_id=?", (job["job_id"],)
+        ).fetchone()[0]
+    assert stored == consulting_agent.CAPTURE_FAILURE_FALLBACK
+
+
 def test_consult_capture_uses_browser_render_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(consulting_agent, "CONSULTING_AGENT_DB_FILE", str(tmp_path / "consult.sqlite3"))
     monkeypatch.setattr(consulting_agent, "SOURCE_ARCHIVE_DIR", str(tmp_path / "source_archive"), raising=False)
@@ -805,6 +881,92 @@ def test_consult_capture_defaults_to_fast_direct_mode(monkeypatch, tmp_path):
     assert data["diagnosis_cards"][0]["diagnosis"]["code"] == "timeout"
     assert data["current_phase"] == "完成本轮，仍需补抓"
     assert rendered_called["value"] is False
+
+
+def test_consult_archive_failure_hides_internal_exception_text(monkeypatch):
+    private_detail = "timeout at C:\\Users\\private\\source.pdf\r\nINJECTED"
+    evidence = {
+        "evidence_id": "evidence-safe-error",
+        "title": "Public report",
+        "url": "https://example.test/report",
+        "source": "Example",
+    }
+    captured = {}
+
+    monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda _url: (True, ""))
+    monkeypatch.setattr(
+        tracker.search_adapters,
+        "extract_url",
+        lambda _url, **_kwargs: (_ for _ in ()).throw(RuntimeError(private_detail)),
+    )
+
+    def fake_record(_session_id, _evidence, reason, _url, **kwargs):
+        captured.update({"reason": reason, **kwargs})
+        return {"asset_id": "asset-safe-error", "status": "failed"}
+
+    monkeypatch.setattr(consulting_agent, "record_source_asset_failure", fake_record)
+
+    _updated, _asset, failure = tracker._consult_archive_one("session", evidence)
+
+    assert failure["reason"] == "站点响应慢或连接超时"
+    assert failure["diagnosis"]["code"] == "timeout"
+    assert captured["reason"] == "站点响应慢或连接超时"
+    assert private_detail not in json.dumps(failure, ensure_ascii=False)
+    assert private_detail not in json.dumps(captured, ensure_ascii=False)
+
+
+@pytest.mark.parametrize(
+    "error,expected_status,expected_message",
+    [
+        (ValueError("invalid path C:\\Users\\private\\config\r\nINJECTED"), 400, "请求参数无效"),
+        (KeyError("private-session-identifier"), 404, "资源不存在"),
+    ],
+)
+def test_consult_error_response_does_not_reflect_exception_text(
+    error, expected_status, expected_message
+):
+    tracker.app.config["TESTING"] = True
+    with tracker.app.app_context():
+        response, status = tracker._consult_error_response(error)
+
+    assert status == expected_status
+    assert response.get_json() == {"error": expected_message}
+    assert str(error) not in response.get_data(as_text=True)
+
+
+def test_consult_capture_job_does_not_persist_internal_exception_text(monkeypatch):
+    private_detail = "failure at C:\\Users\\private\\capture.db\r\nINJECTED"
+    updates = []
+    monkeypatch.setattr(
+        consulting_agent,
+        "get_capture_job",
+        lambda _session_id, _job_id: {
+            "target_count": 1,
+            "batch_size": 1,
+            "max_rounds": 1,
+        },
+    )
+    monkeypatch.setattr(
+        consulting_agent,
+        "get_session",
+        lambda _session_id: (_ for _ in ()).throw(RuntimeError(private_detail)),
+    )
+    monkeypatch.setattr(
+        consulting_agent,
+        "update_capture_job",
+        lambda _job_id, **kwargs: updates.append(kwargs),
+    )
+    monkeypatch.setattr(
+        tracker,
+        "_consult_capture_counts",
+        lambda *_args: {"archived_count": 0, "target_count": 1},
+    )
+
+    tracker._run_consult_capture_job("session", "job")
+
+    assert updates[-1]["status"] == "failed"
+    assert updates[-1]["stop_reason"] == "抓取失败，原因待复核"
+    assert private_detail not in json.dumps(updates, ensure_ascii=False)
 
 
 def test_consult_web_search_uses_multi_provider_without_50_cap(monkeypatch, tmp_path):
@@ -1029,7 +1191,8 @@ def test_consult_extract_continues_after_one_url_failure(monkeypatch, tmp_path):
     assert data["archived_count"] == 1
     assert len(data["failures"]) == 1
     assert data["failures"][0]["title"] == "Blocked report"
-    assert "403" in data["failures"][0]["reason"]
+    assert data["failures"][0]["reason"] == "站点拒绝访问或需要授权"
+    assert "403" not in str(data["failures"])
 
 
 def test_consult_handoff_to_report_agent_filters_unfetched_targets(monkeypatch, tmp_path):

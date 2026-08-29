@@ -54,6 +54,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 try:
+    from pinned_http import UnsafeTargetError, _global_ip
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    os.sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from pinned_http import UnsafeTargetError, _global_ip  # type: ignore[no-redef]
+
+try:
     from scripts.verify_deployment_evidence import (
         CORE_PAYLOAD_FILES,
         PROBE_RESULT_CODES,
@@ -139,6 +145,10 @@ OBSERVATION_POLICIES = {
     "production": {"samples": 100, "interval_seconds": 60},
 }
 OBSERVATION_CONFIG_PATHS = {
+    "staging": Path("/etc/defense-tracker/staging.env"),
+    "production": Path("/etc/defense-tracker/production.env"),
+}
+ORIGIN_CONFIG_PATHS = {
     "staging": Path("/etc/defense-tracker/staging.env"),
     "production": Path("/etc/defense-tracker/production.env"),
 }
@@ -325,8 +335,7 @@ def _environment_value(name: str, environ: Mapping[str, str], label: str) -> str
     return value
 
 
-def _origin_from_environment(name: str, environ: Mapping[str, str]) -> str:
-    value = _environment_value(name, environ, "origin")
+def _canonical_origin(value: str) -> str:
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -352,6 +361,55 @@ def _origin_from_environment(name: str, environ: Mapping[str, str]) -> str:
     else:
         raise CollectionError("origin must be an exact lowercase public HTTPS origin")
     return value
+
+
+def _origin_from_environment(name: str, environ: Mapping[str, str]) -> str:
+    return _canonical_origin(_environment_value(name, environ, "origin"))
+
+
+def _fixed_deployment_origin(environment: str) -> str:
+    config_path = ORIGIN_CONFIG_PATHS[environment]
+    payload = _root_owned_readable_file(
+        config_path,
+        f"{environment} deployment origin configuration",
+        maximum=1024 * 1024,
+    )
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise CollectionError("deployment origin configuration is not UTF-8") from exc
+    domain: str | None = None
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if not line.startswith("PORTAL_DOMAIN="):
+            continue
+        if domain is not None:
+            raise CollectionError("deployment origin configuration contains duplicates")
+        value = line.removeprefix("PORTAL_DOMAIN=").strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if value != value.lower() or DNS_RE.fullmatch(value) is None:
+            raise CollectionError("deployment origin configuration is malformed")
+        domain = value
+    if domain is None:
+        raise CollectionError(
+            "deployment origin configuration is missing PORTAL_DOMAIN"
+        )
+    return _canonical_origin(f"https://{domain}")
+
+
+def _bound_deployment_origin(
+    environment: str, origin_env: str, environ: Mapping[str, str]
+) -> str:
+    supplied = _origin_from_environment(origin_env, environ)
+    allowed = _fixed_deployment_origin(environment)
+    if urlsplit(supplied).hostname != urlsplit(allowed).hostname:
+        raise CollectionError("origin differs from the protected deployment origin")
+    return supplied
 
 
 def _relative_origin_path(value: object, label: str) -> str:
@@ -871,18 +929,27 @@ def _resolve_public_endpoint(
     for family, socktype, protocol, _canonical, sockaddr in rows:
         if socktype != socket.SOCK_STREAM or protocol not in (0, socket.IPPROTO_TCP):
             continue
-        try:
-            address = ipaddress.ip_address(str(sockaddr[0]))
-        except ValueError as exc:
-            raise CollectionError("HTTPS origin resolved to an invalid address") from exc
-        if not address.is_global:
-            raise CollectionError("HTTPS origin resolved to a non-public address")
+        _validated_public_address(str(sockaddr[0]), dns_answer=True)
         candidate = (family, sockaddr)
         if candidate not in endpoints:
             endpoints.append(candidate)
     if not endpoints:
         raise CollectionError("HTTPS origin did not resolve to a public endpoint")
     return endpoints[0]
+
+
+def _validated_public_address(
+    value: str, *, dns_answer: bool
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    try:
+        return _global_ip(value, dns_answer=dns_answer)
+    except UnsafeTargetError as exc:
+        message = (
+            "HTTPS origin resolved to a non-public or unsafe address"
+            if dns_answer
+            else "HTTPS connection reached a non-public or unsafe peer"
+        )
+        raise CollectionError(message) from exc
 
 
 def _perform_https_request(
@@ -916,6 +983,7 @@ def _perform_https_request(
         request_headers["Content-Type"] = "application/json"
     started = time.monotonic()
     family, sockaddr = _resolve_public_endpoint(parsed.hostname, 443, timeout_seconds)
+    expected_peer = _validated_public_address(str(sockaddr[0]), dns_answer=True)
     remaining = timeout_seconds - (time.monotonic() - started)
     if remaining <= 0:
         raise CollectionError("HTTPS request exceeded the total deadline")
@@ -946,9 +1014,11 @@ def _perform_https_request(
         raw.connect(sockaddr)
         tls_socket = context.wrap_socket(raw, server_hostname=parsed.hostname)
         raw = None
-        peer_address = ipaddress.ip_address(str(tls_socket.getpeername()[0]))
-        if not peer_address.is_global:
-            raise CollectionError("HTTPS connection reached a non-public peer")
+        actual_peer = _validated_public_address(
+            str(tls_socket.getpeername()[0]), dns_answer=False
+        )
+        if actual_peer != expected_peer:
+            raise CollectionError("HTTPS connection peer differs from pinned DNS")
         tls_measurement = _tls_measurement(tls_socket, parsed.hostname)
         connection = http.client.HTTPSConnection(
             parsed.hostname,
@@ -1411,7 +1481,7 @@ def collect_probe(
     )
     timeout_seconds = _timeout(timeout_seconds, "probe", 120)
     environment_values = os.environ if environ is None else environ
-    origin = _origin_from_environment(origin_env, environment_values)
+    origin = _bound_deployment_origin(environment, origin_env, environment_values)
     checks = _load_probe_plan(
         plan_path,
         environment=environment,
@@ -1818,7 +1888,7 @@ def collect_observation(
     )
     http_timeout_seconds = _timeout(http_timeout_seconds, "observation HTTP", 120)
     environment_values = os.environ if environ is None else environ
-    origin = _origin_from_environment(origin_env, environment_values)
+    origin = _bound_deployment_origin(environment, origin_env, environment_values)
     path = _relative_origin_path(health_path, "observation health path")
     if path != "/health":
         raise CollectionError("observation health path must be the fixed /health route")

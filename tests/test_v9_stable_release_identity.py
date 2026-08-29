@@ -60,6 +60,64 @@ def test_finalizer_pins_digicert_public_certificate_and_reuses_identity_policy()
     assert "function Assert-CertificateChain" not in finalizer
 
 
+def test_stage_a_build_reuses_full_certificate_policy_before_any_signing():
+    stage_a = _read("scripts/Build-AndShip.ps1")
+
+    for variable in (
+        "DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256",
+        "DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS",
+        "DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256",
+        "DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS",
+        "DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256",
+    ):
+        assert variable in stage_a
+    assert ". (Join-Path $PSScriptRoot 'ReleaseCertificatePolicy.ps1')" in stage_a
+
+    policy = stage_a.index("$certificatePolicy = Get-ReleaseCertificatePolicy")
+    first_sign = stage_a.index("Invoke-SignAndVerify $stagedExe")
+    assert policy < first_sign
+    for binding in (
+        "-ExpectedSignerSubjects $ExpectedSignerSubjects",
+        "-ExpectedSignerSpkiSha256 $ExpectedSignerSpkiSha256",
+        "-ExpectedSignerIssuers $ExpectedSignerIssuers",
+        "-ExpectedSignerRootSha256 $ExpectedSignerRootSha256",
+    ):
+        assert binding in stage_a[policy:first_sign]
+
+    invoke = stage_a[
+        stage_a.index("function Invoke-SignAndVerify") : stage_a.index(
+            "function Invoke-DesktopSmokeTest"
+        )
+    ]
+    assert "[Parameter(Mandatory = $true)]$CertificatePolicy" in invoke
+    assert "Assert-ReleaseSignerCertificatePolicy" in invoke
+    assert "Assert-TrustedCertificateChain $signature.TimeStamperCertificate" in invoke
+    assert "function Assert-CertificateChain" not in stage_a
+    assert (
+        stage_a.count(
+            "$DigiCertKeyAlias $DigiCertCertificateFile $certificatePolicy"
+        )
+        == 3
+    )
+
+
+def test_stage_a_digicert_identity_and_file_hash_fail_before_signing():
+    stage_a = _read("scripts/Build-AndShip.ps1")
+
+    resolve_certificate = stage_a.index(
+        '$DigiCertCertificateFile = Resolve-RequiredTool $DigiCertCertificateFile'
+    )
+    validate_certificate = stage_a.index(
+        "$digicertCertificateIdentity = Assert-DigiCertCertificateFilePolicy",
+        resolve_certificate,
+    )
+    first_sign = stage_a.index("Invoke-SignAndVerify $stagedExe")
+    assert resolve_certificate < validate_certificate < first_sign
+    pre_sign_gate = stage_a[validate_certificate:first_sign]
+    assert "-ExpectedSha256 $ExpectedDigiCertCertificateFileSha256" in pre_sign_gate
+    assert "-Policy $certificatePolicy" in pre_sign_gate
+
+
 def test_stable_workflow_requires_protected_certificate_policy_inputs():
     workflow = _read(".github/workflows/v9-stable-release.yml")
 

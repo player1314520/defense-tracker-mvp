@@ -491,6 +491,97 @@ def test_docx_export_blocks_invalid_manual_edits():
     assert "要讯校验未通过" in response.get_json()["error"]
 
 
+@pytest.mark.parametrize("endpoint", [
+    "/api/brief/export_docx",
+    "/api/brief/export_docx_compiled",
+])
+def test_docx_exports_reject_oversized_text_without_internal_error(endpoint):
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = "brief-export-limit-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+    context = tracker._brief_source_context(
+        material_text="美国防务新闻2026年8月14日报道，美军组织联合演训。",
+        source_name="美国防务新闻",
+        source_title="美军组织联合演训",
+        publication_date="2026-08-14",
+        publication_date_verified=True,
+    )
+    evidence = tracker._brief_seal_source_context(context)
+    oversized = "x" * (tracker.MAX_BRIEF_TEXT_CHARS + 1)
+    payload = {"brief": oversized, "source_evidence": evidence}
+    if endpoint.endswith("_compiled"):
+        payload = {"briefs": [payload]}
+
+    response = client.post(
+        endpoint,
+        json=payload,
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code == 422
+    body = response.get_json()
+    assert "16 KiB" in str(body)
+
+
+@pytest.mark.parametrize(
+    "override,expected_error",
+    [
+        ({"body": "x" * (tracker.MAX_BRIEF_LINE_CHARS + 1)}, "4 KiB"),
+        ({"body": ["not", "text"]}, "必须是字符串"),
+    ],
+)
+def test_docx_export_rejects_unsafe_structured_overrides(
+    override, expected_error
+):
+    brief = """事件时间：近期
+价 值 点：测试
+
+标题值得关注
+
+据外媒报道，内容过短。
+（信息来源：外媒8月14日发文《测试》）
+报送人：           电话："""
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = "brief-export-override-limit-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+    context = tracker._brief_source_context(
+        material_text="美国防务新闻2026年8月14日报道，美军组织联合演训。",
+        source_name="美国防务新闻",
+        source_title="美军组织联合演训",
+        publication_date="2026-08-14",
+        publication_date_verified=True,
+    )
+    evidence = tracker._brief_seal_source_context(context)
+
+    response = client.post(
+        "/api/brief/export_docx",
+        json={"brief": brief, "source_evidence": evidence, **override},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code == 422
+    assert expected_error in response.get_json()["error"]
+
+
+@pytest.mark.parametrize("payload", [{"brief": ["not", "text"]}, []])
+def test_docx_export_rejects_non_object_or_non_string_brief(payload):
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = "brief-export-json-shape-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+
+    response = client.post(
+        "/api/brief/export_docx",
+        json=payload,
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code in {400, 422}
+    assert response.status_code != 500
+
+
 def test_docx_export_requires_untampered_server_signed_source_evidence():
     context = tracker._brief_source_context(
         material_text="美国防务新闻2026年8月14日报道，美军8月14日在西太平洋组织联合演训。",
@@ -785,6 +876,27 @@ def test_brief_validation_rejects_oversized_text_before_regex_parsing(monkeypatc
         tracker._validate_brief_text("x" * (tracker.MAX_BRIEF_TEXT_CHARS + 1))
     with pytest.raises(ValueError, match="4 KiB"):
         tracker._validate_brief_text("x" * (tracker.MAX_BRIEF_LINE_CHARS + 1))
+
+
+def test_brief_parser_enforces_central_size_limits_when_called_directly():
+    with pytest.raises(ValueError, match="16 KiB"):
+        tracker._parse_brief_text("x" * (tracker.MAX_BRIEF_TEXT_CHARS + 1))
+    with pytest.raises(ValueError, match="4 KiB"):
+        tracker._parse_brief_text("x" * (tracker.MAX_BRIEF_LINE_CHARS + 1))
+
+
+def test_brief_source_parser_handles_entries_without_backtracking_regex():
+    entries, invalid, raw = tracker._parse_brief_source_entries(
+        "（信息来源：美国防务新闻8月14日发文《联合演训动态》；"
+        "路透社8月15日发文《盟军后续部署》）"
+    )
+
+    assert invalid == []
+    assert raw.endswith("《盟军后续部署》")
+    assert entries == [
+        {"name": "美国防务新闻", "month": 8, "day": 14, "title": "联合演训动态"},
+        {"name": "路透社", "month": 8, "day": 15, "title": "盟军后续部署"},
+    ]
 
 
 def test_brief_json_and_sse_responses_hide_absolute_saved_path(monkeypatch, tmp_path):

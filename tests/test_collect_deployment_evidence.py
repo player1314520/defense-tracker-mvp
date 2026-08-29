@@ -50,6 +50,22 @@ def _collector_machine_identity(tmp_path, monkeypatch):
         "COLLECTOR_STATE_ROOT",
         tmp_path / "deployment-evidence-state",
     )
+    staging_config = tmp_path / "staging.env"
+    production_config = tmp_path / "production.env"
+    staging_config.write_text(
+        "PORTAL_DOMAIN=staging.example.test\n", encoding="utf-8"
+    )
+    production_config.write_text(
+        "PORTAL_DOMAIN=production.example.test\n", encoding="utf-8"
+    )
+    staging_config.chmod(0o600)
+    production_config.chmod(0o600)
+    monkeypatch.setattr(
+        collector,
+        "ORIGIN_CONFIG_PATHS",
+        {"staging": staging_config, "production": production_config},
+    )
+
     def test_evidence_root(root: Path) -> Path:
         if root.is_symlink():
             raise collector.CollectionError("test evidence root is unsafe")
@@ -863,6 +879,77 @@ def test_origin_must_be_exact_lowercase_public_https(tmp_path, monkeypatch, orig
         )
 
 
+def test_probe_rejects_unbound_origin_before_reading_request_secrets(
+    tmp_path, monkeypatch
+):
+    plan = tmp_path / "plan.json"
+    _plan(plan, "staging")
+
+    class SecretGuard(dict[str, str]):
+        def get(self, key, default=None):
+            if key in {"TEST_AUTH_TOKEN", "TEST_REQUEST_BODY"}:
+                pytest.fail("request secret was read before origin binding")
+            return super().get(key, default)
+
+    environment = SecretGuard(_env())
+    environment["STAGING_ORIGIN"] = "https://attacker.example.test"
+    monkeypatch.setattr(
+        collector,
+        "_perform_https_request",
+        lambda *args: pytest.fail("unbound origin reached the network"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "_running_portal_identity",
+        lambda **kwargs: pytest.fail("unbound origin reached runtime inspection"),
+    )
+
+    with pytest.raises(collector.CollectionError, match="protected deployment origin"):
+        collector.collect_probe(
+            evidence_root=tmp_path / "evidence",
+            environment="staging",
+            origin_env="STAGING_ORIGIN",
+            plan_path=plan,
+            release_commit=COMMIT,
+            candidate_run_id=RUN_ID,
+            portal_image_digest=IMAGE_DIGEST,
+            timeout_seconds=15,
+            environ=environment,
+        )
+
+
+def test_origin_binding_preserves_explicit_default_https_port():
+    environment = _env()
+    environment["STAGING_ORIGIN"] = "https://staging.example.test:443"
+
+    assert collector._bound_deployment_origin(
+        "staging", "STAGING_ORIGIN", environment
+    ) == "https://staging.example.test:443"
+
+
+def test_observation_rejects_unbound_origin_before_network(tmp_path, monkeypatch):
+    environment = _env()
+    environment["STAGING_ORIGIN"] = "https://attacker.example.test"
+    monkeypatch.setattr(
+        collector,
+        "_perform_https_request",
+        lambda *args: pytest.fail("unbound observation origin reached the network"),
+    )
+
+    with pytest.raises(collector.CollectionError, match="protected deployment origin"):
+        collector.collect_observation(
+            evidence_root=tmp_path / "evidence",
+            environment="staging",
+            origin_env="STAGING_ORIGIN",
+            health_path="/health",
+            release_commit=COMMIT,
+            candidate_run_id=RUN_ID,
+            portal_image_digest=IMAGE_DIGEST,
+            http_timeout_seconds=15,
+            environ=environment,
+        )
+
+
 def _command_env(value: str) -> str:
     return json.dumps([str(Path(sys.executable).resolve()), "-c", f"print({value!r})"])
 
@@ -1123,6 +1210,37 @@ def test_public_endpoint_resolution_rejects_any_private_answer(monkeypatch):
         collector._resolve_public_endpoint("staging.example.test", 443)
 
 
+@pytest.mark.parametrize(
+    "address",
+    [
+        "::ffff:8.8.8.8",
+        "2002:0808:0808::",
+        "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+        "::8.8.8.8",
+        "64:ff9b::808:808",
+        "64:ff9b:1::808:808",
+    ],
+)
+def test_public_endpoint_resolution_rejects_ipv6_transition_addresses(
+    monkeypatch, address
+):
+    monkeypatch.setattr(
+        collector.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                collector.socket.AF_INET6,
+                collector.socket.SOCK_STREAM,
+                collector.socket.IPPROTO_TCP,
+                "",
+                (address, 443, 0, 0),
+            )
+        ],
+    )
+    with pytest.raises(collector.CollectionError, match="non-public or unsafe address"):
+        collector._resolve_public_endpoint("staging.example.test", 443)
+
+
 def test_public_endpoint_resolution_is_inside_the_total_deadline(monkeypatch):
     def blocked_resolution(*args, **kwargs):
         collector.time.sleep(0.05)
@@ -1213,6 +1331,48 @@ def test_http_and_tls_are_measured_on_one_direct_socket_without_proxy(monkeypatc
     assert [event[0] for event in events].count("connect") == 1
     assert [event[0] for event in events].count("request") == 1
     assert ("request", "GET", "/health") in events
+
+
+def test_https_request_rejects_peer_that_differs_from_pinned_dns(monkeypatch):
+    class RawSocket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, endpoint):
+            assert endpoint == ("8.8.8.8", 443)
+
+        def close(self):
+            pass
+
+    class TlsSocket:
+        def getpeername(self):
+            return ("1.1.1.1", 443)
+
+        def close(self):
+            pass
+
+    class Context:
+        def wrap_socket(self, raw, server_hostname):
+            assert server_hostname == "staging.example.test"
+            return TlsSocket()
+
+    monkeypatch.setattr(
+        collector,
+        "_resolve_public_endpoint",
+        lambda host, port, timeout=30: (2, ("8.8.8.8", 443)),
+    )
+    monkeypatch.setattr(collector.socket, "socket", lambda *args: RawSocket())
+    monkeypatch.setattr(collector.ssl, "create_default_context", lambda: Context())
+    monkeypatch.setattr(
+        collector.http.client,
+        "HTTPSConnection",
+        lambda *args, **kwargs: pytest.fail("unmatched peer reached HTTP"),
+    )
+
+    with pytest.raises(collector.CollectionError, match="differs from pinned DNS"):
+        collector._perform_https_request(
+            "GET", "https://staging.example.test/health", {}, None, 5
+        )
 
 
 def test_https_request_enforces_one_total_wall_clock_deadline(monkeypatch):

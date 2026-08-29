@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -292,6 +293,216 @@ def test_capture_job_persists_progress_and_attempts(consult_db):
     assert loaded["partial_count"] == 1
     assert loaded["needs_user_input_count"] == 1
     assert loaded["attempts"][0]["query_text"] == "Red Sea UAV think tank report PDF"
+
+
+def test_capture_job_write_boundary_replaces_unknown_stop_reason(consult_db):
+    session = consulting_agent.create_session("搜集1份公开来源")
+    job = consulting_agent.create_capture_job(session["session_id"], target_count=1)
+    private_detail = "upstream failed at [private-path]?credential=[private-value]"
+
+    updated = consulting_agent.update_capture_job(
+        job["job_id"],
+        status="failed",
+        stop_reason=private_detail,
+    )
+
+    assert updated["stop_reason"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    with sqlite3.connect(consult_db) as conn:
+        stored = conn.execute(
+            "SELECT stop_reason FROM capture_jobs WHERE job_id=?", (job["job_id"],)
+        ).fetchone()[0]
+    assert stored == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert private_detail not in stored
+
+
+@pytest.mark.parametrize(
+    "reason",
+    tuple(consulting_agent.CAPTURE_STOP_REASON_LABELS),
+)
+def test_capture_job_stop_reason_allowlist_preserves_public_values(reason):
+    assert consulting_agent.normalize_capture_stop_reason(reason) == reason
+
+
+def test_capture_job_stop_reason_rejects_non_string_values():
+    assert (
+        consulting_agent.normalize_capture_stop_reason({"private": "detail"})
+        == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    )
+
+
+def test_consulting_db_init_maps_legacy_null_stop_reason_to_empty(consult_db):
+    with sqlite3.connect(consult_db) as conn:
+        conn.execute(
+            "CREATE TABLE capture_jobs (job_id TEXT PRIMARY KEY, stop_reason TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO capture_jobs (job_id, stop_reason) VALUES ('legacy-null', NULL)"
+        )
+        conn.commit()
+
+    consulting_agent.init_consulting_agent_db()
+    consulting_agent.init_consulting_agent_db()
+
+    with sqlite3.connect(consult_db) as conn:
+        stored = conn.execute(
+            "SELECT stop_reason FROM capture_jobs WHERE job_id='legacy-null'"
+        ).fetchone()[0]
+    assert stored == ""
+
+
+def test_source_failure_write_read_and_legacy_migration_hide_exception_text(
+    consult_db,
+):
+    session = consulting_agent.create_session("搜集1份公开来源")
+    evidence = consulting_agent.upsert_evidence(
+        session["session_id"],
+        [
+            {
+                "title": "Public report",
+                "source": "Public source",
+                "url": "https://example.test/report",
+                "channel": "web",
+            }
+        ],
+    )[0]
+    private_detail = "timeout [private-path] credential=[private-value]"
+    asset = consulting_agent.record_source_asset_failure(
+        session["session_id"],
+        evidence,
+        private_detail,
+        failure_code="too_short",
+        diagnosis={
+            "code": "too_short",
+            "label": private_detail,
+            "advice": {"private": private_detail},
+        },
+    )
+
+    assert asset["failure_reason"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert asset["payload"]["reason"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert asset["payload"]["failure_code"] == "too_short"
+    assert asset["payload"]["diagnosis"] == {
+        "code": "too_short",
+        "label": consulting_agent.CAPTURE_FAILURE_FALLBACK,
+    }
+    legacy_dir = consult_db.parent / "legacy-placeholder"
+    legacy_dir.mkdir()
+    legacy_local = legacy_dir / "original.pdf"
+    legacy_text = legacy_dir / "extracted.txt"
+    legacy_metadata = legacy_dir / "metadata.json"
+    legacy_local.write_bytes(("%PDF-1.4\n" + private_detail).encode("utf-8"))
+    legacy_text.write_text(private_detail, encoding="utf-8")
+    legacy_metadata.write_text(
+        json.dumps({"diagnosis": {"detail": private_detail}}),
+        encoding="utf-8",
+    )
+    with sqlite3.connect(consult_db) as conn:
+        conn.execute(
+            """
+            UPDATE source_assets
+            SET status='needs_user_input', failure_reason=?, payload_json=?,
+                local_path=?, text_path=?, metadata_path=?, checksum=?
+            WHERE asset_id=?
+            """,
+            (
+                private_detail,
+                json.dumps(
+                    {
+                        "reason": private_detail,
+                        "failure_code": "too_short",
+                        "diagnosis": {
+                            "code": "too_short",
+                            "label": private_detail,
+                            "advice": {"private": private_detail},
+                        },
+                        "text": private_detail,
+                        "snippet": private_detail,
+                        "nested": {"private": private_detail},
+                        "is_fetched_original": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                str(legacy_local),
+                str(legacy_text),
+                str(legacy_metadata),
+                "1" * 64,
+                asset["asset_id"],
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE events
+            SET payload_json=?
+            WHERE event_type='source_asset_failed'
+            """,
+            (
+                json.dumps(
+                    {
+                        "asset_id": asset["asset_id"],
+                        "evidence_id": evidence["evidence_id"],
+                        "reason": private_detail,
+                        "nested": {"private": private_detail},
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+        conn.execute(
+            "DELETE FROM local_migrations WHERE migration_id=?",
+            (consulting_agent.SOURCE_FAILURE_SCRUB_MIGRATION,),
+        )
+        conn.commit()
+
+    consulting_agent.init_consulting_agent_db()
+    consulting_agent.init_consulting_agent_db()
+
+    loaded = consulting_agent.get_source_asset(asset["asset_id"])
+    events = consulting_agent.get_events(session["session_id"])
+    serialized = json.dumps(
+        {"asset": loaded, "events": events}, ensure_ascii=False
+    )
+    assert loaded["failure_reason"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert loaded["payload"]["reason"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert loaded["payload"]["failure_code"] == "too_short"
+    assert loaded["payload"]["is_fetched_original"] is False
+    assert loaded["payload"]["placeholder_quarantined"] is True
+    assert loaded["payload"]["text"] == consulting_agent.SOURCE_ASSET_PLACEHOLDER_TEXT
+    assert loaded["payload"]["snippet"] == consulting_agent.SOURCE_ASSET_PLACEHOLDER_TEXT
+    assert loaded["payload"]["diagnosis"] == {
+        "code": "too_short",
+        "label": consulting_agent.CAPTURE_FAILURE_FALLBACK,
+    }
+    assert loaded["local_path"] == ""
+    assert loaded["text_path"] == ""
+    assert loaded["metadata_path"] == ""
+    assert loaded["checksum"] == ""
+    assert events[-1]["payload"]["reason"] == consulting_agent.CAPTURE_FAILURE_FALLBACK
+    assert private_detail not in serialized
+    with sqlite3.connect(consult_db) as conn:
+        stored = conn.execute(
+            """
+            SELECT failure_reason, payload_json
+            FROM source_assets
+            WHERE asset_id=?
+            """,
+            (asset["asset_id"],),
+        ).fetchone()
+        event_payload = conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type='source_asset_failed'
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()[0]
+    assert private_detail not in "".join(stored)
+    assert private_detail not in event_payload
+    assert legacy_local.exists()
+    assert legacy_text.exists()
+    assert legacy_metadata.exists()
+    assert private_detail in legacy_local.read_text(encoding="utf-8")
+    assert private_detail in legacy_text.read_text(encoding="utf-8")
+    assert private_detail in legacy_metadata.read_text(encoding="utf-8")
 
 
 def test_same_source_url_can_exist_in_different_sessions(consult_db):
