@@ -17,6 +17,7 @@ import hashlib
 import logging
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 from state import DATA_DIR
@@ -64,16 +65,27 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_device_name(device_name: str) -> str:
+    """Return the bounded, single-line device label used by storage and logs."""
+    raw = str(device_name or "未命名设备")
+    safe = "".join(
+        " " if unicodedata.category(char)[0] == "C" or char in "\u2028\u2029" else char
+        for char in raw
+    )
+    return (" ".join(safe.split()) or "未命名设备")[:64]
+
+
 def issue_device_token(device_name: str):
     """发放新设备 token。返回 (明文token, 行id)——明文仅此一次，库里只存哈希。"""
     plaintext = secrets.token_urlsafe(24)
+    normalized_name = _normalize_device_name(device_name)
     with _conn() as conn:
         cur = conn.execute(
             "INSERT INTO device_tokens(token_hash, hint, device_name, created_at) "
             "VALUES(?,?,?,?)",
-            (_hash(plaintext), plaintext[:6], (device_name or "未命名设备")[:64], _now()))
+            (_hash(plaintext), plaintext[:6], normalized_name, _now()))
         dev_id = cur.lastrowid
-    logger.info("设备 token 已发放: id=%s name=%s", dev_id, device_name)
+    logger.info("设备 token 已发放: id=%s name=%s", dev_id, normalized_name)
     return plaintext, dev_id
 
 

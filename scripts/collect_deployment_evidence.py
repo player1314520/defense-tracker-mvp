@@ -33,6 +33,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -55,7 +56,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 try:
     from scripts.verify_deployment_evidence import (
         CORE_PAYLOAD_FILES,
+        PROBE_RESULT_CODES,
         PRODUCTION_CHECKS,
+        PUBLIC_METADATA_PATHS,
         STAGING_CHECKS,
         _validate_backup_restore,
         _validate_observations,
@@ -64,7 +67,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from verify_deployment_evidence import (  # type: ignore[no-redef]
         CORE_PAYLOAD_FILES,
+        PROBE_RESULT_CODES,
         PRODUCTION_CHECKS,
+        PUBLIC_METADATA_PATHS,
         STAGING_CHECKS,
         _validate_backup_restore,
         _validate_observations,
@@ -82,6 +87,17 @@ DNS_RE = re.compile(
 HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
 SAFE_TLS_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:+/-]{1,128}$")
 NUMBER_RE = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+EVIDENCE_CHALLENGE_RE = re.compile(r"^[0-9a-f]{64}$")
+PORTAL_IMAGE_REFERENCE_RE = re.compile(
+    r"^[A-Za-z0-9._/-]+@(?P<digest>sha256:[0-9a-f]{64})$"
+)
+
+EVIDENCE_CHALLENGE_HEADER = "X-DefenseTracker-Evidence-Challenge"
+EXPECTED_SEMANTIC_VERSION = "9.0.0"
+EXPECTED_DISPLAY_VERSION = "V9"
+EXPECTED_RELEASE_TAG = "v9.0.0"
+EXPECTED_WIRE_COMPATIBILITY = "mvp-wire-v1"
+PORTAL_CONTAINER_NAME = "defense-tracker-mvp-portal-1"
 
 PROBE_PLAN_KEYS = {"schema", "environment", "checks"}
 PROBE_CHECK_KEYS = {"name", "method", "path", "headers", "body_env"}
@@ -102,6 +118,8 @@ OBSERVATION_KEYS = {
     "data_device_sha256",
     "backup_receipt_sha256",
     "response_sha256",
+    "challenge_sha256",
+    "semantic_code",
 }
 STEP_NAMES = (
     "restore_started",
@@ -133,6 +151,7 @@ OBSERVATION_CONFIG_NAMES = {
 RECOVERY_SCRIPT_RELATIVE = Path("deploy/mvp/bin/restore-dry-run.sh")
 RECOVERY_PRODUCTION_CONFIG = Path("/etc/defense-tracker/production.env")
 COLLECTOR_KEY_PATH = Path("/etc/defense-tracker/deployment-evidence.key")
+EVIDENCE_ROOT_BASE = Path("/var/lib/defense-tracker/deployment-evidence")
 COLLECTOR_STATE_ROOT = Path("/var/lib/defense-tracker/deployment-evidence-state")
 RECOVERY_INTEGRITY_QUERY = (
     b"select count(*) from pg_database where datistemplate = false;"
@@ -154,6 +173,7 @@ FORBIDDEN_REQUEST_HEADERS = {
     "host",
     "proxy-authorization",
     "transfer-encoding",
+    EVIDENCE_CHALLENGE_HEADER.lower(),
 }
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
@@ -169,6 +189,12 @@ RECOVERY_RECEIPT_KEYS = {
 
 class CollectionError(RuntimeError):
     """A fail-closed, redaction-safe collection failure."""
+
+
+def _tls_client_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
 
 
 @dataclass(frozen=True)
@@ -197,6 +223,7 @@ class HttpMeasurement:
     elapsed_ms: int
     observed_at_utc: str
     response_sha256: str
+    response_body: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -418,6 +445,10 @@ def _require_trusted_directory_fd(descriptor: int, label: str) -> None:
 def _ensure_root(root: Path) -> Path:
     """Open every POSIX path component without following links, then pin permissions."""
 
+    if root.parent != EVIDENCE_ROOT_BASE or SHA1_RE.fullmatch(root.name) is None:
+        raise CollectionError(
+            "evidence root must be the fixed release directory"
+        )
     if os.name == "nt":  # no equivalent owner/openat trust chain is implemented
         raise CollectionError("secure evidence collection requires a POSIX host")
 
@@ -888,7 +919,7 @@ def _perform_https_request(
     remaining = timeout_seconds - (time.monotonic() - started)
     if remaining <= 0:
         raise CollectionError("HTTPS request exceeded the total deadline")
-    context = ssl.create_default_context()
+    context = _tls_client_context()
     remaining = timeout_seconds - (time.monotonic() - started)
     if remaining <= 0:
         raise CollectionError("HTTPS request exceeded the total deadline")
@@ -961,8 +992,288 @@ def _perform_https_request(
             elapsed_ms=elapsed_ms,
             observed_at_utc=_utc(_utc_now()),
             response_sha256=_sha256_bytes(response_bytes),
+            response_body=response_bytes,
         ),
     )
+
+
+def _response_json(measurement: HttpMeasurement, label: str) -> dict[str, object]:
+    """Parse one bounded response without ever including its body in an error."""
+
+    if not isinstance(measurement.response_body, bytes):
+        raise CollectionError(f"{label} response body is unavailable")
+    if _sha256_bytes(measurement.response_body) != measurement.response_sha256:
+        raise CollectionError(f"{label} response digest differs from the received bytes")
+    try:
+        decoded = measurement.response_body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CollectionError(f"{label} response is not UTF-8 JSON") from exc
+    value = _strict_json_loads(decoded, f"{label} response")
+    if not isinstance(value, dict):
+        raise CollectionError(f"{label} response must be a JSON object")
+    return value
+
+
+def _validate_release_fields(
+    payload: Mapping[str, object], *, release_commit: str, label: str
+) -> None:
+    expected = {
+        "version": EXPECTED_SEMANTIC_VERSION,
+        "semantic_version": EXPECTED_SEMANTIC_VERSION,
+        "display_version": EXPECTED_DISPLAY_VERSION,
+        "release_tag": EXPECTED_RELEASE_TAG,
+        "build_commit": release_commit,
+        "wire_compatibility": EXPECTED_WIRE_COMPATIBILITY,
+    }
+    if any(payload.get(name) != value for name, value in expected.items()):
+        raise CollectionError(f"{label} release metadata differs from this release")
+
+
+def _validate_public_metadata_response(
+    name: str,
+    measurement: HttpMeasurement,
+    *,
+    release_commit: str,
+    challenge: str,
+) -> None:
+    payload = _response_json(measurement, f"public {name}")
+    common = {
+        "version",
+        "semantic_version",
+        "display_version",
+        "release_tag",
+        "build_commit",
+        "wire_compatibility",
+        "evidence_challenge",
+    }
+    if name in {"health", "api_status"}:
+        expected_keys = common | {"status", "mode", "sync_backend"}
+        _exact_keys(payload, expected_keys, f"public {name} response")
+        if (
+            payload.get("status") != "ok"
+            or payload.get("mode") != "ciphertext-only"
+            or payload.get("sync_backend") != "supabase"
+        ):
+            raise CollectionError(f"public {name} service semantics differ")
+    elif name == "portal_config":
+        expected_keys = common | {
+            "configured",
+            "url",
+            "publishable_key",
+            "invited_signup_enabled",
+            "access_applications_enabled",
+            "account_limit",
+            "daily_event_limit",
+            "deployment_mode",
+        }
+        _exact_keys(payload, expected_keys, "public portal_config response")
+        api_url = payload.get("url")
+        publishable_key = payload.get("publishable_key")
+        try:
+            parsed_api_url = urlsplit(str(api_url))
+            api_port = parsed_api_url.port
+        except ValueError as exc:
+            raise CollectionError("public portal_config API origin is malformed") from exc
+        if (
+            payload.get("configured") is not True
+            or payload.get("invited_signup_enabled") is not False
+            or type(payload.get("access_applications_enabled")) is not bool
+            or payload.get("account_limit") != 100
+            or payload.get("daily_event_limit") != 1000
+            or payload.get("deployment_mode") != "mvp"
+            or not isinstance(api_url, str)
+            or api_url != api_url.lower()
+            or parsed_api_url.scheme != "https"
+            or parsed_api_url.hostname is None
+            or DNS_RE.fullmatch(parsed_api_url.hostname) is None
+            or parsed_api_url.username is not None
+            or parsed_api_url.password is not None
+            or api_port not in (None, 443)
+            or parsed_api_url.path
+            or parsed_api_url.query
+            or parsed_api_url.fragment
+            or not isinstance(publishable_key, str)
+            or not publishable_key.startswith("sb_publishable_")
+            or not 20 <= len(publishable_key) <= 512
+        ):
+            raise CollectionError("public portal_config service semantics differ")
+    else:  # pragma: no cover - all callers use the fixed mapping
+        raise CollectionError("unknown public metadata contract")
+    _validate_release_fields(payload, release_commit=release_commit, label=f"public {name}")
+    if not hmac.compare_digest(str(payload.get("evidence_challenge", "")), challenge):
+        raise CollectionError(f"public {name} challenge response differs")
+
+
+def _validate_probe_response(
+    name: str,
+    measurement: HttpMeasurement,
+    *,
+    environment: str,
+    origin: str,
+    release_commit: str,
+    portal_image_digest: str,
+    challenge: str,
+) -> str:
+    payload = _response_json(measurement, f"probe {name}")
+    expected_keys = {
+        "schema",
+        "check",
+        "result",
+        "result_code",
+        "environment",
+        "origin",
+        "semantic_version",
+        "release_commit",
+        "wire_compatibility",
+        "portal_image_digest",
+        "evidence_challenge",
+    }
+    _exact_keys(payload, expected_keys, f"probe {name} response")
+    expected_code = PROBE_RESULT_CODES[name]
+    if (
+        payload.get("schema") != 1
+        or payload.get("check") != name
+        or payload.get("result") != "pass"
+        or payload.get("result_code") != expected_code
+        or payload.get("environment") != environment
+        or payload.get("origin") != origin
+        or payload.get("semantic_version") != EXPECTED_SEMANTIC_VERSION
+        or payload.get("release_commit") != release_commit
+        or payload.get("wire_compatibility") != EXPECTED_WIRE_COMPATIBILITY
+        or payload.get("portal_image_digest") != portal_image_digest
+        or not hmac.compare_digest(str(payload.get("evidence_challenge", "")), challenge)
+    ):
+        raise CollectionError(f"probe {name} response semantics differ")
+    return expected_code
+
+
+def _running_portal_identity(
+    *,
+    environment: str,
+    origin: str,
+    release_commit: str,
+    portal_image_digest: str,
+) -> dict[str, object]:
+    """Read selected, non-secret identity fields from the running container."""
+
+    container_name = PORTAL_CONTAINER_NAME
+    docker = shutil.which("docker", path=SAFE_COMMAND_ENVIRONMENT["PATH"])
+    if docker is None:
+        raise CollectionError("trusted Docker client is unavailable")
+    docker_path = _require_root_controlled_path(Path(docker), "Docker client")
+    template = (
+        '{"image_reference":{{json .Config.Image}},'
+        '"image_id":{{json .Image}},'
+        '"release_commit":{{json (index .Config.Labels "org.opencontainers.image.revision")}},'
+        '"wire_compatibility":{{json (index .Config.Labels '
+        '"io.defensetracker.mvp.backend-wire-compatibility")}},'
+        '"running":{{json .State.Running}},'
+        '"health":{{json .State.Health.Status}}}'
+    )
+    measurement = run_command(
+        [
+            str(docker_path),
+            "container",
+            "inspect",
+            "--format",
+            template,
+            container_name,
+        ],
+        timeout_seconds=30,
+    )
+    if measurement.exit_code != 0 or measurement.stderr:
+        raise CollectionError("running Portal container identity could not be measured")
+    try:
+        decoded = measurement.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise CollectionError("running Portal container identity is not UTF-8") from exc
+    identity = _strict_json_loads(decoded, "running Portal container identity")
+    if not isinstance(identity, dict):
+        raise CollectionError("running Portal container identity must be an object")
+    _exact_keys(
+        identity,
+        {
+            "image_reference",
+            "image_id",
+            "release_commit",
+            "wire_compatibility",
+            "running",
+            "health",
+        },
+        "running Portal container identity",
+    )
+    reference = identity.get("image_reference")
+    image_id = identity.get("image_id")
+    match = PORTAL_IMAGE_REFERENCE_RE.fullmatch(reference) if isinstance(reference, str) else None
+    if (
+        match is None
+        or not isinstance(image_id, str)
+        or IMAGE_DIGEST_RE.fullmatch(image_id) is None
+        or match.group("digest") != portal_image_digest
+        or identity.get("release_commit") != release_commit
+        or identity.get("wire_compatibility") != EXPECTED_WIRE_COMPATIBILITY
+        or identity.get("running") is not True
+        or identity.get("health") != "healthy"
+    ):
+        raise CollectionError("running Portal container identity differs from this release")
+    image_template = (
+        '{"image_id":{{json .Id}},'
+        '"repo_digests":{{json .RepoDigests}},'
+        '"release_commit":{{json (index .Config.Labels "org.opencontainers.image.revision")}},'
+        '"wire_compatibility":{{json (index .Config.Labels '
+        '"io.defensetracker.mvp.backend-wire-compatibility")}}}'
+    )
+    image_measurement = run_command(
+        [
+            str(docker_path),
+            "image",
+            "inspect",
+            "--format",
+            image_template,
+            image_id,
+        ],
+        timeout_seconds=30,
+    )
+    if image_measurement.exit_code != 0 or image_measurement.stderr:
+        raise CollectionError("running Portal image identity could not be measured")
+    try:
+        decoded_image = image_measurement.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise CollectionError("running Portal image identity is not UTF-8") from exc
+    image_identity = _strict_json_loads(decoded_image, "running Portal image identity")
+    if not isinstance(image_identity, dict):
+        raise CollectionError("running Portal image identity must be an object")
+    _exact_keys(
+        image_identity,
+        {"image_id", "repo_digests", "release_commit", "wire_compatibility"},
+        "running Portal image identity",
+    )
+    repo_digests = image_identity.get("repo_digests")
+    if (
+        image_identity.get("image_id") != image_id
+        or not isinstance(repo_digests, list)
+        or not repo_digests
+        or any(
+            not isinstance(item, str)
+            or PORTAL_IMAGE_REFERENCE_RE.fullmatch(item) is None
+            for item in repo_digests
+        )
+        or reference not in repo_digests
+        or image_identity.get("release_commit") != release_commit
+        or image_identity.get("wire_compatibility") != EXPECTED_WIRE_COMPATIBILITY
+    ):
+        raise CollectionError("running Portal image RepoDigest differs from this release")
+    return {
+        "environment": environment,
+        "origin": origin,
+        "container_name": container_name,
+        "image_reference": reference,
+        "image_digest": match.group("digest"),
+        "image_id": image_id,
+        "release_commit": release_commit,
+        "wire_compatibility": EXPECTED_WIRE_COMPATIBILITY,
+        "state": "healthy",
+    }
 
 
 def _load_probe_plan(
@@ -1107,33 +1418,95 @@ def collect_probe(
         origin=origin,
         environ=environment_values,
     )
+    runtime_portal = _running_portal_identity(
+        environment=environment,
+        origin=origin,
+        release_commit=release_commit,
+        portal_image_digest=portal_image_digest,
+    )
+    challenge = secrets.token_hex(32)
+    if EVIDENCE_CHALLENGE_RE.fullmatch(challenge) is None:
+        raise CollectionError("probe challenge generator returned an invalid value")
+    challenge_sha256 = _sha256_bytes(challenge.encode("ascii"))
     root = _ensure_root(evidence_root)
     output = root / f"{environment}-probe.json"
     started = _utc_now()
     tls: TlsMeasurement | None = None
+    public_metadata: list[dict[str, object]] = []
     observed_checks: list[dict[str, object]] = []
-    for check in checks:
-        connection_tls, measurement = _perform_https_request(
-            str(check["method"]),
-            str(check["url"]),
-            check["headers"],  # type: ignore[arg-type]
-            check["body"],  # type: ignore[arg-type]
-            timeout_seconds,
-        )
+
+    def accept_connection(
+        connection_tls: TlsMeasurement,
+        measurement: HttpMeasurement,
+        *,
+        label: str,
+    ) -> None:
+        nonlocal tls
         if tls is None:
             tls = connection_tls
         elif connection_tls.peer_certificate_sha256 != tls.peer_certificate_sha256:
             raise CollectionError("probe responses used different TLS certificates")
+        if (
+            isinstance(measurement.elapsed_ms, bool)
+            or not isinstance(measurement.elapsed_ms, int)
+            or not 0 < measurement.elapsed_ms <= 120_000
+            or SHA256_RE.fullmatch(measurement.response_sha256) is None
+        ):
+            raise CollectionError(f"{label} live HTTP measurement is malformed")
+
+    for name, path in PUBLIC_METADATA_PATHS.items():
+        connection_tls, measurement = _perform_https_request(
+            "GET",
+            origin + path,
+            {EVIDENCE_CHALLENGE_HEADER: challenge},
+            None,
+            timeout_seconds,
+        )
+        accept_connection(connection_tls, measurement, label=f"public {name}")
+        if measurement.status_code != 200:
+            raise CollectionError(f"public {name} returned an unexpected status")
+        _validate_public_metadata_response(
+            name,
+            measurement,
+            release_commit=release_commit,
+            challenge=challenge,
+        )
+        public_metadata.append(
+            {
+                "name": name,
+                "method": "GET",
+                "url": origin + path,
+                "status_code": measurement.status_code,
+                "elapsed_ms": measurement.elapsed_ms,
+                "observed_at_utc": measurement.observed_at_utc,
+                "response_sha256": measurement.response_sha256,
+            }
+        )
+
+    for check in checks:
+        request_headers = dict(check["headers"])  # type: ignore[arg-type]
+        request_headers[EVIDENCE_CHALLENGE_HEADER] = challenge
+        connection_tls, measurement = _perform_https_request(
+            str(check["method"]),
+            str(check["url"]),
+            request_headers,
+            check["body"],  # type: ignore[arg-type]
+            timeout_seconds,
+        )
+        accept_connection(connection_tls, measurement, label=f"probe {check['name']}")
         if measurement.status_code != check["expected_status"]:
             raise CollectionError(
                 f"live probe returned an unexpected status for {check['name']}"
             )
-        if (
-            isinstance(measurement.elapsed_ms, bool)
-            or not 0 < measurement.elapsed_ms <= 120_000
-            or SHA256_RE.fullmatch(measurement.response_sha256) is None
-        ):
-            raise CollectionError("live HTTP measurement is malformed")
+        result_code = _validate_probe_response(
+            str(check["name"]),
+            measurement,
+            environment=environment,
+            origin=origin,
+            release_commit=release_commit,
+            portal_image_digest=portal_image_digest,
+            challenge=challenge,
+        )
         observed_checks.append(
             {
                 "name": check["name"],
@@ -1143,6 +1516,7 @@ def collect_probe(
                 "elapsed_ms": measurement.elapsed_ms,
                 "observed_at_utc": measurement.observed_at_utc,
                 "response_sha256": measurement.response_sha256,
+                "result_code": result_code,
             }
         )
     if tls is None:  # Exact route validation guarantees at least one check.
@@ -1151,12 +1525,12 @@ def collect_probe(
     if completed < started or completed - started > timedelta(minutes=30):
         raise CollectionError("probe duration is invalid")
     _validate_tls_measurement(tls, origin=origin, started=started, completed=completed)
-    for check in observed_checks:
+    for check in [*public_metadata, *observed_checks]:
         observed = _parse_utc(check["observed_at_utc"], "HTTP observation time")
         if not started <= observed <= completed:
             raise CollectionError("HTTP observation time is outside the probe interval")
     payload = {
-        "schema": 2,
+        "schema": 3,
         "environment": environment,
         "release_commit": release_commit,
         "candidate_run_id": candidate_run_id,
@@ -1165,6 +1539,9 @@ def collect_probe(
         "started_at_utc": _utc(started),
         "completed_at_utc": _utc(completed),
         "tls": tls.as_dict(),
+        "challenge_sha256": challenge_sha256,
+        "runtime_portal": runtime_portal,
+        "public_metadata": public_metadata,
         "checks": observed_checks,
     }
     with _root_lock(root):
@@ -1450,14 +1827,21 @@ def collect_observation(
     probe_path = root / f"{environment}-probe.json"
     probe = _load_json(probe_path, f"{environment} probe", maximum=8 * 1024 * 1024)
     probe_digest = _sha256_file(probe_path, f"{environment} probe")
+    runtime_portal = _running_portal_identity(
+        environment=environment,
+        origin=origin,
+        release_commit=release_commit,
+        portal_image_digest=portal_image_digest,
+    )
     if (
-        probe.get("schema") != 2
+        probe.get("schema") != 3
         or probe.get("environment") != environment
         or probe.get("release_commit") != release_commit
         or probe.get("candidate_run_id") != candidate_run_id
         or probe.get("portal_image_digest") != portal_image_digest
         or probe.get("origin") != origin
         or not isinstance(probe.get("tls"), dict)
+        or probe.get("runtime_portal") != runtime_portal
     ):
         raise CollectionError("observation probe binding differs from this collection")
     probe_certificate = probe["tls"].get("peer_certificate_sha256")
@@ -1471,8 +1855,15 @@ def collect_observation(
         previous_time: datetime | None = None
         next_deadline = time.monotonic()
         for index in range(int(policy["samples"])):
+            challenge = secrets.token_hex(32)
+            if EVIDENCE_CHALLENGE_RE.fullmatch(challenge) is None:
+                raise CollectionError("observation challenge generator returned an invalid value")
             tls, measurement = _perform_https_request(
-                "GET", origin + path, {}, None, http_timeout_seconds
+                "GET",
+                origin + path,
+                {EVIDENCE_CHALLENGE_HEADER: challenge},
+                None,
+                http_timeout_seconds,
             )
             if tls.peer_certificate_sha256 != probe_certificate:
                 raise CollectionError("observation TLS certificate differs from the probe")
@@ -1498,12 +1889,18 @@ def collect_observation(
                 or not 0 <= backup_age < 26
             ):
                 raise CollectionError("live observation is outside the acceptance policy")
+            _validate_public_metadata_response(
+                "health",
+                measurement,
+                release_commit=release_commit,
+                challenge=challenge,
+            )
             if previous_time is not None and observed <= previous_time:
                 raise CollectionError("observation timestamp must increase strictly")
             previous_time = observed
             records.append(
                 {
-                    "schema": 2,
+                    "schema": 3,
                     "environment": environment,
                     "release_commit": release_commit,
                     "candidate_run_id": candidate_run_id,
@@ -1518,6 +1915,8 @@ def collect_observation(
                     "data_device_sha256": data_device_sha256,
                     "backup_receipt_sha256": backup_receipt_sha256,
                     "response_sha256": measurement.response_sha256,
+                    "challenge_sha256": _sha256_bytes(challenge.encode("ascii")),
+                    "semantic_code": "PUBLIC_HEALTH_OK",
                 }
             )
             if index + 1 < int(policy["samples"]):
@@ -1529,6 +1928,13 @@ def collect_observation(
                 raise CollectionError("staging observation window is shorter than 24 hours")
         if probe_digest != _sha256_file(probe_path, f"{environment} probe"):
             raise CollectionError("probe changed during the observation window")
+        if _running_portal_identity(
+            environment=environment,
+            origin=origin,
+            release_commit=release_commit,
+            portal_image_digest=portal_image_digest,
+        ) != runtime_portal:
+            raise CollectionError("running Portal identity changed during observation")
         _atomic_write(output, b"".join(_canonical_json(row) for row in records), replace_existing=False)
         _record_collected_artifact(
             evidence_root=root,

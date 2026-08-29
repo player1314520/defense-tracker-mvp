@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.release_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Reject direct origin access without disclosing protected targets
@@ -77,6 +77,7 @@ jobs:
 
   collect-live-evidence:
     name: Export collector-signed schema 2 from the evidence host
+    needs: verify-origin-isolation
     if: github.ref == 'refs/heads/main'
     environment: v9-production-evidence
     runs-on: [self-hosted, Linux, X64, defense-deploy-auditor]
@@ -90,7 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.release_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Export the fixed collector-signed schema 2 file set
@@ -157,7 +158,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.release_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5

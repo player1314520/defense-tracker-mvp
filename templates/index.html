@@ -30,6 +30,7 @@
   <link rel="stylesheet" href="/static/css/states-editorial.css">
   <link rel="stylesheet" href="/static/css/command-hub-v9.css">
   <link rel="stylesheet" href="/static/css/v9-cloud.css">
+  <link rel="stylesheet" href="/static/css/credential-notice.css">
 </head>
 <body>
 
@@ -53,6 +54,7 @@
     <button class="v9-action v9-icon-action" id="v9HelpBtn" type="button" title="打开使用引导">?</button>
     <button class="v9-action" id="v9TourBtn" type="button">引导</button>
     <button class="v9-action" id="v9CloudBtn" type="button">账户</button>
+    <button class="credential-security-button" id="credentialNoticeButton" type="button" aria-controls="credentialNotice" hidden>凭据安全</button>
     <div class="ed-vline"></div>
     <div class="v9-clock-wrap">
       <span id="clock" class="clock"></span>
@@ -78,6 +80,14 @@
     <span>UPDATED <strong id="statUpdate">—</strong></span>
   </div>
 </div>
+
+<section class="credential-notice" id="credentialNotice" role="alert" aria-labelledby="credentialNoticeTitle" tabindex="-1" hidden>
+  <div>
+    <strong id="credentialNoticeTitle">飞书凭据需要轮换并撤销旧值</strong>
+    <p id="credentialNoticeText"></p>
+  </div>
+  <button id="credentialNoticeDismiss" type="button" aria-label="暂时关闭飞书凭据轮换提醒">暂时关闭</button>
+</section>
 
 <main class="v9-workspace">
   <aside class="v9-rail">
@@ -1164,6 +1174,7 @@
         <button class="v9-primary" type="submit">发送邮箱登录链接</button>
         <small>邮件可在默认浏览器打开；验证码只回到本机固定 loopback 端口，PKCE verifier 与 Refresh Token 均由 Windows DPAPI 保护。</small>
       </form>
+      <button class="v9-secondary" id="workspaceLogout" type="button">退出本地工作区</button>
       <div id="v9CloudWorkspace" hidden>
         <label>当前组织<select id="v9CloudOrganization"></select></label>
         <p class="v9-cloud-device-line" id="v9CloudDevices">正在读取设备状态…</p>
@@ -1217,6 +1228,7 @@
 
 <!-- 前端按 Tab 拆分为多文件，经典 <script> 顺序加载（共享全局作用域，保持内联 onclick 全局可见 + showTab 链式 override 顺序）。改前为单文件 app.js。 -->
 <script nonce="{{ g.csp_nonce }}" src="/static/js/util.js"></script>
+<script nonce="{{ g.csp_nonce }}" src="/static/js/credential-notice.js"></script>
 <script nonce="{{ g.csp_nonce }}" src="/static/js/core.js"></script>
 <script nonce="{{ g.csp_nonce }}" src="/static/js/news.js"></script>
 <script nonce="{{ g.csp_nonce }}" src="/static/js/china.js"></script>

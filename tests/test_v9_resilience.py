@@ -194,3 +194,22 @@ def test_default_log_filter_redacts_credentials():
     assert "abcdefghijklmnop" not in rendered
     assert "sk-secretvalue" not in rendered
     assert rendered.count("[REDACTED]") == 2
+
+
+def test_default_log_filter_forces_untrusted_values_to_one_line():
+    from v9.redaction import SecretRedactionFilter
+
+    record = logging.LogRecord(
+        "test",
+        logging.WARNING,
+        __file__,
+        1,
+        "upstream failed\r\nFORGED level=INFO\u2028next\x00entry",
+        (),
+        None,
+    )
+
+    assert SecretRedactionFilter().filter(record) is True
+    rendered = record.getMessage()
+    assert rendered == "upstream failed FORGED level=INFO next entry"
+    assert not any(character in rendered for character in "\r\n\u2028\u2029\x00")

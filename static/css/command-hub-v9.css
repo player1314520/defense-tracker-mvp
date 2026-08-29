@@ -513,6 +513,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   #v9SearchBtn { width: 44px; min-width: 44px; padding: 0; font-size: 0; }
   #v9SearchBtn .v9-kbd { font-size: 13px; }
   .topbar { min-height: 92px !important; padding: 16px !important; }
+  .topbar-left { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+  .ed-title-wrap { min-width: 0; }
+  .topbar-right { flex: 0 0 auto; }
   .topbar .logo { font-size: 21px !important; }
   .topbar .tagline { letter-spacing: 2px !important; }
   .v9-action { padding: 0 10px; margin-right: 6px; }
@@ -562,6 +565,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .v9-onboarding-steps { grid-template-columns: 1fr; }
   .v9-onboarding-card > footer { align-items: flex-start; flex-direction: column; }
   .footer { margin-left: 0; }
+}
+
+@media (max-width: 480px) {
+  .topbar { gap: 8px; padding: 12px !important; }
+  .ed-mark { width: 40px !important; height: 40px !important; }
+  .ed-mark span { font-size: 22px !important; }
+  .topbar .logo { font-size: 17px !important; white-space: nowrap; }
+  .topbar .tagline { display: none !important; }
+  .v9-action { margin-right: 4px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

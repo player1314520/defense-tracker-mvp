@@ -113,10 +113,11 @@ async function ensureCloudAiCredentialActive(context) {
 }
 
 async function checkAiConfig() {
+  if (globalThis.__WORKSPACE_LOGGING_OUT__) return;
   try {
     const cloudContext = currentCloudAiContext();
     if (cloudContext) await ensureCloudAiCredentialActive(cloudContext);
-    const data = await apiFetch('/api/ai/config').then(r => r.json());
+    const data = await apiFetch('/api/ai/config', {}, {toast: false}).then(r => r.json());
     aiEnabled = data.enabled;
     if (data.provider && LLM_PROVIDERS.some(p => p.id === data.provider)) {
       selectProvider(data.provider);
@@ -133,6 +134,7 @@ async function checkAiConfig() {
       el.style.color = aiEnabled ? '#34d399' : '#f59e0b';
     }
   } catch(e) {
+    if (globalThis.__WORKSPACE_LOGGING_OUT__) return;
     aiEnabled = false;
     const el = document.getElementById('aiStatusText');
     if (el) {

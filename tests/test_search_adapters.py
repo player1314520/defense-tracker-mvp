@@ -2,6 +2,7 @@ import json
 import logging
 
 import pytest
+import requests
 
 import search_adapters
 
@@ -341,23 +342,18 @@ def test_extract_url_rechecks_each_redirect_hop_for_ssrf(monkeypatch):
         def __init__(self, status, headers=None):
             self.status_code = status
             self.headers = headers or {}
+            self.cookies = requests.cookies.RequestsCookieJar()
 
         def close(self):
             pass
 
     def fake_get(url, **kwargs):
         seen.append(url)
-        assert kwargs.get("allow_redirects") is False  # 关键：不得自动跟随重定向
         if "start" in url:
             return _Resp(302, {"Location": "http://169.254.169.254/latest/meta-data/"})
         return _Resp(200)
 
-    monkeypatch.setattr(
-        search_adapters,
-        "_ssrf_http_session",
-        lambda: type("FakeSession", (), {"get": lambda self, url, **kwargs: fake_get(url, **kwargs)})(),
-    )
-    monkeypatch.setattr(search_adapters, "_validate_connected_peer", lambda _response: None)
+    monkeypatch.setattr(search_adapters, "pinned_get", fake_get)
 
     def ssrf_check(u):
         if "169.254" in u or "127.0.0.1" in u or "localhost" in u:
@@ -372,74 +368,42 @@ def test_extract_url_rechecks_each_redirect_hop_for_ssrf(monkeypatch):
     assert seen == ["http://public.test/start"]
 
 
-def test_extract_url_rejects_private_or_unverifiable_connected_peer(monkeypatch):
-    class _Resp:
-        status_code = 200
-        headers = {}
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(
-        search_adapters,
-        "_ssrf_http_session",
-        lambda: type("FakeSession", (), {"get": lambda self, *args, **kwargs: _Resp()})(),
-    )
-    check = lambda _url: (True, "")
-
-    monkeypatch.setattr(search_adapters, "_connected_peer_ip", lambda _response: "10.0.0.9")
-    with pytest.raises(RuntimeError, match="重绑定到私有地址"):
-        search_adapters._safe_stream_get(
-            "https://public.test/report", {}, 1, check,
-        )
-
-    monkeypatch.setattr(
-        search_adapters,
-        "_connected_peer_ip",
-        lambda _response: (_ for _ in ()).throw(RuntimeError("无法核验远端连接地址")),
-    )
-    with pytest.raises(RuntimeError, match="无法核验远端连接地址"):
-        search_adapters._safe_stream_get(
-            "https://public.test/report", {}, 1, check,
-        )
-
-
 def test_extract_url_accepts_public_peer_and_validates_every_redirect_hop(monkeypatch):
     seen_urls = []
-    validated_responses = []
+    checked_urls = []
 
     class _Resp:
         def __init__(self, status, location=""):
             self.status_code = status
             self.headers = {"Location": location} if location else {}
+            self.cookies = requests.cookies.RequestsCookieJar()
 
         def close(self):
             pass
 
+    first = _Resp(302, "/second")
+    first.cookies.set("redirect_gate", "open", domain="public.test", path="/")
     responses = iter([
-        _Resp(302, "/second"),
+        first,
         _Resp(302, "https://cdn.public.test/final"),
         _Resp(200),
     ])
 
     def fake_get(url, **kwargs):
         seen_urls.append(url)
-        assert kwargs["allow_redirects"] is False
+        if url.endswith("/second"):
+            prepared = requests.Request("GET", url, cookies=kwargs["cookies"]).prepare()
+            assert prepared.headers["Cookie"] == "redirect_gate=open"
         return next(responses)
 
-    monkeypatch.setattr(
-        search_adapters,
-        "_ssrf_http_session",
-        lambda: type("FakeSession", (), {"get": lambda self, url, **kwargs: fake_get(url, **kwargs)})(),
-    )
+    monkeypatch.setattr(search_adapters, "pinned_get", fake_get)
 
-    def public_peer(response):
-        validated_responses.append(response)
-        return "93.184.216.34"
+    def public_target(url):
+        checked_urls.append(url)
+        return True, ""
 
-    monkeypatch.setattr(search_adapters, "_connected_peer_ip", public_peer)
     response = search_adapters._safe_stream_get(
-        "https://public.test/start", {}, 1, lambda _url: (True, ""),
+        "https://public.test/start", {}, 1, public_target,
     )
 
     assert response.status_code == 200
@@ -448,12 +412,42 @@ def test_extract_url_accepts_public_peer_and_validates_every_redirect_hop(monkey
         "https://public.test/second",
         "https://cdn.public.test/final",
     ]
-    assert len(validated_responses) == 3
+    assert checked_urls == seen_urls
+
+
+def test_extract_redirect_cookie_is_not_sent_to_unrelated_domain(monkeypatch):
+    sent_cookie_headers = []
+
+    class _Resp:
+        def __init__(self, status, location=""):
+            self.status_code = status
+            self.headers = {"Location": location} if location else {}
+            self.cookies = requests.cookies.RequestsCookieJar()
+
+        def close(self):
+            pass
+
+    first = _Resp(302, "https://unrelated.test/final")
+    first.cookies.set("redirect_gate", "open", domain="public.test", path="/")
+    responses = iter([first, _Resp(200)])
+
+    def fake_get(url, **kwargs):
+        prepared = requests.Request("GET", url, cookies=kwargs["cookies"]).prepare()
+        sent_cookie_headers.append(prepared.headers.get("Cookie"))
+        return next(responses)
+
+    monkeypatch.setattr(search_adapters, "pinned_get", fake_get)
+    response = search_adapters._safe_stream_get(
+        "https://public.test/start",
+        {},
+        1,
+        lambda _url: (True, ""),
+    )
+
+    assert response.status_code == 200
+    assert sent_cookie_headers == [None, None]
 
 
 def test_extract_transport_is_proxy_free_and_render_fallback_is_disabled(monkeypatch):
-    monkeypatch.setattr(search_adapters._SSRF_HTTP_LOCAL, "session", None, raising=False)
-
-    assert search_adapters._ssrf_http_session().trust_env is False
     with pytest.raises(RuntimeError, match="浏览器渲染兜底已禁用"):
         search_adapters.extract_url_rendered("https://example.test/report")

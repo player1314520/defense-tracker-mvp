@@ -8,12 +8,10 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-  actions: read
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+# No workflow-wide credential is granted. The currently reachable isolation
+# blocker needs no token; future downstream jobs retain only their own minimum
+# permissions and remain unreachable while that blocker fails.
+permissions: {}
 
 concurrency:
   group: v9-signed-candidate
@@ -27,10 +25,34 @@ env:
   FINAL_CANDIDATE_DIR: dist/candidates/v9.0.0/${{ inputs.release_sha }}
 
 jobs:
+  signing-isolation-gate:
+    name: Signing isolation prerequisites (blocked)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Refuse credential access until three isolated execution roles exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          blocker='{"schema":"defense-tracker/signing-isolation-blocker/v1","status":"blocked","code":"SIGNING_ISOLATION_NOT_PROVISIONED","missing":["credentialless-build-scan-controller","hash-only-nonexecuting-signing-runner","credentialless-restricted-egress-smoke-vm","controller-deregistration-destruction-receipt"]}'
+          printf '%s\n' "$blocker"
+          {
+            printf '%s\n' '### Signed candidate blocked'
+            printf '%s\n' '```json'
+            printf '%s\n' "$blocker"
+            printf '%s\n' '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 78
+
   verify-source:
     name: Verify protected source and CI
+    needs: signing-isolation-gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -65,7 +87,7 @@ jobs:
             echo "::error::Pinned Gitleaks full-history scan failed; sensitive findings are intentionally not printed."
             exit 1
           fi
-      - name: Require exact current main and six successful CI checks
+      - name: Require exact current main and all nine protected checks
         env:
           GITHUB_TOKEN: ${{ github.token }}
         shell: bash
@@ -84,10 +106,18 @@ jobs:
 
   prepare-installer-review:
     name: Sign reviewed application and prepare unsigned installer
-    needs: verify-source
+    needs:
+      - signing-isolation-gate
+      - verify-source
     environment: v9-trusted-signing
     runs-on: [self-hosted, Windows, X64, defense-v9-candidate-ephemeral]
     timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       AZURE_CORE_OUTPUT: none
       DEFENSE_TRACKER_BUILD_PYTHON: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON }}
@@ -102,6 +132,11 @@ jobs:
       DEFENSE_TRACKER_AZURE_SIGNING_METADATA: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_METADATA }}
       DEFENSE_TRACKER_DIGICERT_KEY_ALIAS: ${{ vars.DEFENSE_TRACKER_DIGICERT_KEY_ALIAS }}
       DEFENSE_TRACKER_DIGICERT_CERT_FILE: ${{ vars.DEFENSE_TRACKER_DIGICERT_CERT_FILE }}
+      DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256: ${{ vars.DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256 }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256 }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256 }}
       DEFENSE_TRACKER_BUILD_PYTHON_SHA256: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON_SHA256 }}
       DEFENSE_TRACKER_SIGNTOOL_SHA256: ${{ vars.DEFENSE_TRACKER_SIGNTOOL_SHA256 }}
       DEFENSE_TRACKER_ISCC_SHA256: ${{ vars.DEFENSE_TRACKER_ISCC_SHA256 }}
@@ -168,6 +203,12 @@ jobs:
     environment: v9-installer-signing-review
     runs-on: [self-hosted, Windows, X64, defense-v9-installer-ephemeral]
     timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       AZURE_CORE_OUTPUT: none
       DEFENSE_TRACKER_BUILD_PYTHON: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON }}
@@ -182,6 +223,11 @@ jobs:
       DEFENSE_TRACKER_AZURE_SIGNING_METADATA: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_METADATA }}
       DEFENSE_TRACKER_DIGICERT_KEY_ALIAS: ${{ vars.DEFENSE_TRACKER_DIGICERT_KEY_ALIAS }}
       DEFENSE_TRACKER_DIGICERT_CERT_FILE: ${{ vars.DEFENSE_TRACKER_DIGICERT_CERT_FILE }}
+      DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256: ${{ vars.DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256 }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256 }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256 }}
       DEFENSE_TRACKER_BUILD_PYTHON_SHA256: ${{ vars.DEFENSE_TRACKER_BUILD_PYTHON_SHA256 }}
       DEFENSE_TRACKER_SIGNTOOL_SHA256: ${{ vars.DEFENSE_TRACKER_SIGNTOOL_SHA256 }}
       DEFENSE_TRACKER_ISCC_SHA256: ${{ vars.DEFENSE_TRACKER_ISCC_SHA256 }}

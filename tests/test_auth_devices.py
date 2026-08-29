@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """设备 token（auth_devices）：发放/校验/吊销 单测 + 端点冒烟。"""
 import importlib
+import logging
 
 import pytest
 
@@ -54,6 +55,21 @@ def test_hash_stored_not_plaintext(devices):
         row = conn.execute("SELECT token_hash FROM device_tokens").fetchone()
     assert row["token_hash"] != plaintext
     assert len(row["token_hash"]) == 64  # sha256 hex
+
+
+def test_device_name_is_bounded_and_single_line_in_storage_and_logs(devices, caplog):
+    supplied = "终端\r\n伪造日志\u2028" + ("A" * 100)
+
+    with caplog.at_level(logging.INFO, logger="auth_devices"):
+        devices.issue_device_token(supplied)
+
+    stored = devices.list_devices()[0]["device_name"]
+    assert stored == "终端 伪造日志 " + ("A" * 56)
+    assert len(stored) == 64
+    assert "\r" not in stored and "\n" not in stored and "\u2028" not in stored
+    assert caplog.records[-1].getMessage().endswith(f"name={stored}")
+    assert "\r" not in caplog.records[-1].getMessage()
+    assert "\n" not in caplog.records[-1].getMessage()
 
 
 def test_endpoints_issue_and_revoke(monkeypatch, tmp_path):

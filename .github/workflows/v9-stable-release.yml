@@ -53,6 +53,11 @@ jobs:
       PORTAL_IMAGE_RUN_ID: ${{ inputs.portal_image_run_id }}
       DEFENSE_TRACKER_PUBLISHER: ${{ vars.DEFENSE_TRACKER_PUBLISHER }}
       DEFENSE_TRACKER_SIGNTOOL: ${{ vars.DEFENSE_TRACKER_SIGNTOOL }}
+      DEFENSE_TRACKER_SIGNTOOL_SHA256: ${{ vars.DEFENSE_TRACKER_SIGNTOOL_SHA256 }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256 }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS }}
+      DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256 }}
       DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE: ${{ vars.DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE }}
       DEPLOYMENT_COLLECTOR_KEY_ID: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_KEY_ID }}
       DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 }}
@@ -65,7 +70,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           clean: true
-      - name: Require exact current main, CI and trusted source workflows
+      - name: Require exact current main, protected checks and trusted source workflows
         shell: powershell
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -94,7 +99,7 @@ jobs:
           python scripts/verify_release_checks.py `
             --repository $env:GITHUB_REPOSITORY `
             --sha $env:RELEASE_SHA
-          if ($LASTEXITCODE -ne 0) { throw "Required CI is not green." }
+          if ($LASTEXITCODE -ne 0) { throw "Required protected checks are not green." }
           $candidate = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CANDIDATE_RUN_ID" | ConvertFrom-Json
           if ($candidate.conclusion -ne 'success' -or
               $candidate.head_sha -ne $env:RELEASE_SHA -or
@@ -194,7 +199,12 @@ jobs:
           .\scripts\Verify-ReleaseAuthenticode.ps1 `
             -AssetRoot candidate `
             -PublisherName $env:DEFENSE_TRACKER_PUBLISHER `
-            -SignToolPath $env:DEFENSE_TRACKER_SIGNTOOL
+            -SignToolPath $env:DEFENSE_TRACKER_SIGNTOOL `
+            -ExpectedSignToolSha256 $env:DEFENSE_TRACKER_SIGNTOOL_SHA256 `
+            -ExpectedSignerSubjects $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS `
+            -ExpectedSignerSpkiSha256 $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256 `
+            -ExpectedSignerIssuers $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS `
+            -ExpectedSignerRootSha256 $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256
       - name: Verify deployment evidence provenance is bound to its workflow, ref and SHA
         shell: powershell
         run: |
@@ -261,10 +271,20 @@ jobs:
           }
       - name: Create complete draft, verify it, then publish once
         shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
           $tag = python -c "from product_version import PRODUCT_VERSION; print(PRODUCT_VERSION.release_tag)"
           if ($tag -ne 'v9.0.0') { throw "Unexpected release tag." }
+          git fetch --no-tags origin main
+          if ($LASTEXITCODE -ne 0 -or (git rev-parse refs/remotes/origin/main) -cne $env:RELEASE_SHA) {
+            throw "Protected main moved before release creation."
+          }
+          python scripts/verify_release_checks.py `
+            --repository $env:GITHUB_REPOSITORY `
+            --sha $env:RELEASE_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Protected checks changed before release creation." }
           $existingTag = git ls-remote --tags origin "refs/tags/$tag"
           if ($LASTEXITCODE -ne 0) { throw "Unable to verify the remote release tag namespace." }
           if (-not [string]::IsNullOrWhiteSpace($existingTag)) {
@@ -284,35 +304,121 @@ jobs:
             "This release contains the signed Windows installer, portable application, SHA-256 list, schema-2 manifest, SPDX 2.3 SBOM and third-party notices. Full desktop features remain local; the web Portal is the authenticated collaboration surface."
           )
           $notes | Set-Content -LiteralPath release-notes.md -Encoding UTF8
-          $assets = @(Get-ChildItem candidate -File | Sort-Object Name | ForEach-Object { $_.FullName })
-          if ($assets.Count -ne 6) { throw "Fixed release asset count is not six." }
+          $expectedAssetNames = @(
+            "DefenseTracker-Setup-v9.0.0-windows-x64.exe",
+            "DefenseTracker-v9.0.0-windows-x64-portable.zip",
+            "DefenseTracker-v9.0.0.spdx.json",
+            "SHA256SUMS.txt",
+            "THIRD_PARTY_NOTICES.md",
+            "release-manifest.json"
+          ) | Sort-Object
+          $candidateEntries = @(Get-ChildItem -LiteralPath candidate -Force)
+          if ($candidateEntries.Count -ne 6 -or
+              @($candidateEntries | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0 -or
+              (Compare-Object $expectedAssetNames @($candidateEntries.Name | Sort-Object)).Count -ne 0) {
+            throw "Candidate does not contain exactly the six fixed regular release assets."
+          }
+          $expectedAssets = @{}
+          foreach ($name in $expectedAssetNames) {
+            $path = Join-Path candidate $name
+            $item = Get-Item -LiteralPath $path
+            $expectedAssets[$name] = [ordered]@{
+              digest = 'sha256:' + (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              bytes = [int64]$item.Length
+            }
+          }
+          function Assert-RemoteReleaseAssets {
+            param([Parameter(Mandatory = $true)]$Release,[Parameter(Mandatory = $true)][string]$Phase)
+            $remoteNames = @($Release.assets | ForEach-Object { [string]$_.name } | Sort-Object)
+            if ($Release.assets.Count -ne 6 -or
+                (Compare-Object $expectedAssetNames $remoteNames).Count -ne 0) {
+              throw "$Phase release asset names differ from the fixed six-file contract."
+            }
+            foreach ($asset in $Release.assets) {
+              $expected = $expectedAssets[[string]$asset.name]
+              if ($null -eq $expected -or $asset.state -cne 'uploaded' -or
+                  [string]$asset.digest -cne [string]$expected.digest -or
+                  [int64]$asset.size -ne [int64]$expected.bytes) {
+                throw "$Phase release asset digest/size mismatch: $($asset.name)"
+              }
+            }
+          }
+          function Assert-DownloadedReleaseAssets {
+            param([Parameter(Mandatory = $true)][string]$ReleaseTag,[Parameter(Mandatory = $true)][string]$Phase)
+            $downloadParent = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+            $downloadRoot = Join-Path $downloadParent ("defensetracker-release-download-$Phase-" + [guid]::NewGuid().ToString('N'))
+            try {
+              New-Item -ItemType Directory -Path $downloadRoot | Out-Null
+              gh release download $ReleaseTag --dir $downloadRoot
+              if ($LASTEXITCODE -ne 0) { throw "$Phase release asset download failed." }
+              $downloaded = @(Get-ChildItem -LiteralPath $downloadRoot -Force)
+              if ($downloaded.Count -ne 6 -or
+                  @($downloaded | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0 -or
+                  (Compare-Object $expectedAssetNames @($downloaded.Name | Sort-Object)).Count -ne 0) {
+                throw "$Phase downloaded release names differ from the fixed six-file contract."
+              }
+              foreach ($name in $expectedAssetNames) {
+                $path = Join-Path $downloadRoot $name
+                $actualDigest = 'sha256:' + (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+                $actualBytes = [int64](Get-Item -LiteralPath $path).Length
+                if ($actualDigest -cne [string]$expectedAssets[$name].digest -or
+                    $actualBytes -ne [int64]$expectedAssets[$name].bytes) {
+                  throw "$Phase downloaded release bytes differ: $name"
+                }
+              }
+            } finally {
+              if (Test-Path -LiteralPath $downloadRoot -PathType Container) {
+                $resolved = [System.IO.Path]::GetFullPath($downloadRoot)
+                if (-not $resolved.StartsWith($downloadParent) -or
+                    [System.IO.Path]::GetFileName($resolved) -cnotmatch '^defensetracker-release-download-[a-z-]+-[0-9a-f]{32}$') {
+                  throw 'Refusing to remove an unexpected release verification directory.'
+                }
+                Get-ChildItem -LiteralPath $resolved -Force -Recurse | Select-Object FullName,Length | Out-Null
+                Remove-Item -LiteralPath $resolved -Recurse -Force
+              }
+            }
+          }
+          $assets = @($expectedAssetNames | ForEach-Object { (Get-Item -LiteralPath (Join-Path candidate $_)).FullName })
           & gh release create $tag --draft --target $env:RELEASE_SHA `
             --title "DefenseTracker $tag" --notes-file release-notes.md @assets
           if ($LASTEXITCODE -ne 0) { throw "Draft release creation failed." }
           $draft = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if ($draft.draft -ne $true -or $draft.assets.Count -ne 6 -or
-              $draft.target_commitish -ne $env:RELEASE_SHA) {
+          if ($draft.draft -ne $true -or $draft.target_commitish -cne $env:RELEASE_SHA) {
             throw "Draft release is incomplete or targets the wrong commit."
           }
-          foreach ($asset in $draft.assets) {
-            $local = Join-Path candidate $asset.name
-            $expectedDigest = 'sha256:' + (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($asset.state -ne 'uploaded' -or $asset.digest -ne $expectedDigest) {
-              throw "Draft asset digest mismatch: $($asset.name)"
-            }
-          }
+          Assert-RemoteReleaseAssets $draft 'draft'
+          Assert-DownloadedReleaseAssets $tag 'draft'
           $prematureTag = git ls-remote --tags origin "refs/tags/$tag"
           if ($LASTEXITCODE -ne 0) { throw "Unable to reverify the remote release tag namespace." }
           if (-not [string]::IsNullOrWhiteSpace($prematureTag)) {
             throw "A release tag appeared before immutable publication; refusing to continue."
           }
+          $draftBeforePublish = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if ($draftBeforePublish.draft -ne $true -or
+              $draftBeforePublish.target_commitish -cne $env:RELEASE_SHA) {
+            throw "Draft release changed before publication."
+          }
+          Assert-RemoteReleaseAssets $draftBeforePublish 'draft-before-publish'
+          Assert-DownloadedReleaseAssets $tag 'draft-before-publish'
           gh release edit $tag --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw "Draft publication failed." }
-          $published = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if ($published.draft -ne $false -or $published.immutable -ne $true -or
-              $published.assets.Count -ne 6 -or
-              $published.target_commitish -ne $env:RELEASE_SHA) {
-            throw "Published release is not immutable or differs from the approved commit/assets."
+          $publishedBeforeImmutableCheck = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if ($publishedBeforeImmutableCheck.draft -ne $false -or
+              $publishedBeforeImmutableCheck.target_commitish -cne $env:RELEASE_SHA) {
+            throw "Published release differs from the approved commit."
           }
+          Assert-RemoteReleaseAssets $publishedBeforeImmutableCheck 'published-before-immutable-check'
+          Assert-DownloadedReleaseAssets $tag 'published-before-immutable-check'
+          if ($publishedBeforeImmutableCheck.immutable -ne $true) {
+            throw "Published release did not become immutable."
+          }
+          $publishedAfterImmutableCheck = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
+          if ($publishedAfterImmutableCheck.draft -ne $false -or
+              $publishedAfterImmutableCheck.immutable -ne $true -or
+              $publishedAfterImmutableCheck.target_commitish -cne $env:RELEASE_SHA) {
+            throw "Published release changed while confirming immutability."
+          }
+          Assert-RemoteReleaseAssets $publishedAfterImmutableCheck 'published-after-immutable-check'
+          Assert-DownloadedReleaseAssets $tag 'published-after-immutable-check'
           git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"
           if ((git rev-list -n 1 $tag) -ne $env:RELEASE_SHA) { throw "Published tag does not point to the release commit." }

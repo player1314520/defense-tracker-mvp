@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 import sys
@@ -53,6 +54,25 @@ FORBIDDEN_ARTIFACT_SUFFIXES = {
     ".xlsx",
     ".zip",
 }
+FORBIDDEN_RASTER_IMAGE_SUFFIXES = {
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+ALLOWED_SVG_SHA256 = {
+    "static/img/v9-world-map.svg": (
+        "c2dcd1228265b67b2219cbbeebb15b3e45f8169f36fc18d6e336ea6cff2c6e6f"
+    ),
+}
+SVG_EMBED_PATTERN = re.compile(r"<\s*image\b|data\s*:\s*image/", re.IGNORECASE)
 EMAIL_PATTERN = re.compile(
     r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63})"
@@ -112,8 +132,12 @@ def audit(root: Path) -> list[str]:
         if name.endswith((".key", ".pem", ".p12", ".pfx")):
             issues.append(f"private-key filename: {normalized}")
             continue
-        if Path(name).suffix.lower() in FORBIDDEN_ARTIFACT_SUFFIXES:
+        suffix = Path(name).suffix.lower()
+        if suffix in FORBIDDEN_ARTIFACT_SUFFIXES:
             issues.append(f"generated or binary artifact: {normalized}")
+            continue
+        if suffix in FORBIDDEN_RASTER_IMAGE_SUFFIXES:
+            issues.append(f"unapproved raster image: {normalized}")
             continue
 
         path = root / Path(normalized)
@@ -122,12 +146,24 @@ def audit(root: Path) -> list[str]:
         except OSError as exc:
             issues.append(f"unreadable tracked file: {normalized} ({exc.__class__.__name__})")
             continue
+        if suffix == ".svg":
+            expected_hash = ALLOWED_SVG_SHA256.get(normalized)
+            if expected_hash is None:
+                issues.append(f"unapproved SVG image: {normalized}")
+                continue
+            if hashlib.sha256(raw).hexdigest() != expected_hash:
+                issues.append(f"SVG hash mismatch: {normalized}")
+                continue
         if b"\0" in raw:
+            issues.append(f"unapproved binary file: {normalized}")
             continue
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
+            issues.append(f"non-UTF-8 tracked file: {normalized}")
             continue
+        if suffix == ".svg" and SVG_EMBED_PATTERN.search(text):
+            issues.append(f"SVG embeds raster or external image data: {normalized}")
         for match in EMAIL_PATTERN.finditer(text):
             address = match.group(0).lower()
             domain = match.group(1).lower()

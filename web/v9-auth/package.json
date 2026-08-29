@@ -4,6 +4,7 @@
   "version": "9.0.0",
   "type": "module",
   "scripts": {
+    "prebuild": "node scripts/verify-version.mjs",
     "build": "esbuild src/index.js --bundle --minify --supported:template-literal=false --format=esm --platform=browser --target=es2022 --outfile=../../static/js/vendor/v9-supabase-auth.mjs && esbuild src/portal.js --bundle --minify --supported:template-literal=false --format=esm --platform=browser --target=es2022 --outfile=../v9-portal/supabase-client.mjs"
   },
   "dependencies": {

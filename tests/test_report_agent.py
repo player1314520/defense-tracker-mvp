@@ -551,6 +551,7 @@ def test_draft_messages_include_sod_writing_requirements(agent_db, monkeypatch, 
         "每段遵循PARA结构，并建立FACT-DATA-CITE证据链。",
         encoding="utf-8",
     )
+    monkeypatch.setattr(report_agent, "_WRITING_SPEC_ROOT", tmp_path)
     monkeypatch.setattr(report_agent, "REPORT_AGENT_WRITING_SPEC_FILE", str(spec_file), raising=False)
     project = report_agent.create_project("台海战略分析报告", "strategic", topic="台海")
     evidence = report_agent.upsert_project_evidence(project["project_id"], [_candidate()])
@@ -562,6 +563,74 @@ def test_draft_messages_include_sod_writing_requirements(agent_db, monkeypatch, 
     assert "技术—能力—规则" in prompt
     assert "PARA" in prompt
     assert "FACT-DATA-CITE" in prompt
+    assert str(spec_file) not in prompt
+
+
+def test_writing_spec_override_cannot_read_outside_public_docs(
+    monkeypatch, tmp_path
+):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("must-not-reach-an-ai-provider", encoding="utf-8")
+    monkeypatch.setattr(report_agent, "_WRITING_SPEC_ROOT", docs)
+    monkeypatch.setattr(
+        report_agent,
+        "REPORT_AGENT_WRITING_SPEC_FILE",
+        str(secret),
+    )
+
+    with pytest.raises(ValueError, match="writing specification file is unsafe"):
+        report_agent.load_report_writing_requirements()
+
+
+def test_writing_spec_rejects_oversized_file(monkeypatch, tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    oversized = docs / "oversized.md"
+    oversized.write_bytes(b"x" * (report_agent._WRITING_SPEC_MAX_BYTES + 1))
+    monkeypatch.setattr(report_agent, "_WRITING_SPEC_ROOT", docs)
+    monkeypatch.setattr(
+        report_agent,
+        "REPORT_AGENT_WRITING_SPEC_FILE",
+        str(oversized),
+    )
+
+    with pytest.raises(ValueError, match="writing specification file is unsafe"):
+        report_agent.load_report_writing_requirements()
+
+
+def test_writing_spec_rejects_file_swap_between_check_and_open(
+    monkeypatch, tmp_path
+):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    spec = docs / "spec.md"
+    replacement = docs / "replacement.md"
+    spec.write_text("approved public requirements", encoding="utf-8")
+    replacement.write_text("must-not-reach-an-ai-provider", encoding="utf-8")
+    real_open = report_agent.os.open
+    swapped = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == spec and not swapped:
+            swapped = True
+            spec.unlink()
+            replacement.replace(spec)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(report_agent, "_WRITING_SPEC_ROOT", docs)
+    monkeypatch.setattr(
+        report_agent,
+        "REPORT_AGENT_WRITING_SPEC_FILE",
+        str(spec),
+    )
+    monkeypatch.setattr(report_agent.os, "open", racing_open)
+
+    with pytest.raises(ValueError, match="writing specification file is unsafe"):
+        report_agent.load_report_writing_requirements()
+    assert swapped
 
 
 def test_agent_ui_uses_complete_report_button():
@@ -592,6 +661,31 @@ def test_extract_target_word_count_and_sanitize_forbidden_terms():
     assert "机密" not in cleaned
     assert "秘密" not in cleaned
     assert "报告" in cleaned
+
+
+def test_report_text_rejects_oversized_payload_and_line_before_regexes(monkeypatch):
+    original_sub = report_agent.re.sub
+
+    def reject_regex(*_args, **_kwargs):
+        pytest.fail("overlong report text must not reach regexes")
+
+    monkeypatch.setattr(report_agent.re, "sub", reject_regex)
+    with pytest.raises(ValueError, match="2 MiB"):
+        report_agent.sanitize_report_text("x" * (report_agent.MAX_REPORT_TEXT_CHARS + 1))
+    with pytest.raises(ValueError, match="32 KiB"):
+        report_agent.sanitize_report_text("x" * (report_agent.MAX_REPORT_LINE_CHARS + 1))
+    monkeypatch.setattr(report_agent.re, "sub", original_sub)
+
+
+def test_create_project_rejects_overlong_request_before_topic_regexes(agent_db, monkeypatch):
+    monkeypatch.setattr(
+        report_agent,
+        "_derive_topic_from_request",
+        lambda _value: pytest.fail("overlong requests must not reach topic regexes"),
+    )
+
+    with pytest.raises(ValueError, match="4096"):
+        report_agent.create_project(client_request="x" * 4097)
 
 
 def test_assert_report_exportable_ignores_word_count_in_body():

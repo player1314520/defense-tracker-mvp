@@ -1,6 +1,7 @@
 import copy
 import importlib
 import sys
+from io import BytesIO
 
 import pytest
 
@@ -760,6 +761,192 @@ def test_imported_source_text_is_not_written_to_quality_training_db(monkeypatch)
     assert response.status_code == 200, response.get_json()
     assert response.get_json()["article_id"].startswith("import-")
     assert quality_calls == []
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    (
+        "C:" + r"\Users\placeholder\DefenseTracker\brief.docx",
+        "/home/private-user/DefenseTracker/brief.docx",
+    ),
+)
+def test_public_brief_saved_name_is_cross_platform_basename(private_path):
+    assert tracker._public_brief_saved_name(private_path) == "brief.docx"
+
+
+def test_brief_validation_rejects_oversized_text_before_regex_parsing(monkeypatch):
+    monkeypatch.setattr(
+        tracker,
+        "_parse_brief_text",
+        lambda _value: pytest.fail("oversized brief must not reach parsers"),
+    )
+
+    with pytest.raises(ValueError, match="16 KiB"):
+        tracker._validate_brief_text("x" * (tracker.MAX_BRIEF_TEXT_CHARS + 1))
+    with pytest.raises(ValueError, match="4 KiB"):
+        tracker._validate_brief_text("x" * (tracker.MAX_BRIEF_LINE_CHARS + 1))
+
+
+def test_brief_json_and_sse_responses_hide_absolute_saved_path(monkeypatch, tmp_path):
+    private_path = tmp_path / "private-user" / "brief.docx"
+    trusted_article = {
+        "title": "美军在西太平洋组织联合演训",
+        "summary": "美国防务新闻2026年8月14日报道，美军8月14日在西太平洋组织联合演训。",
+        "source": "Defense News",
+        "source_cn": "美国防务新闻",
+        "date": "2026-08-14T00:00:00+00:00",
+        "publication_date_verified": True,
+        "link": "https://example.com/private-path-test",
+    }
+    monkeypatch.setitem(tracker.cache, "news", [trusted_article])
+    monkeypatch.setitem(tracker.AI_CONFIG, "api_key", "test-key")
+    monkeypatch.setattr(tracker, "_check_rate", lambda *args, **kwargs: True)
+    monkeypatch.setattr(tracker, "_call_ai", lambda *args, **kwargs: _valid_text())
+    monkeypatch.setattr(
+        tracker, "_persist_brief_to_disk", lambda *args, **kwargs: str(private_path)
+    )
+    monkeypatch.setattr(
+        tracker, "record_quality_generation", lambda *args, **kwargs: "article-id"
+    )
+    client = tracker.app.test_client()
+    csrf = "saved-path-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+    headers = {tracker.CSRF_HEADER: csrf}
+
+    generated = client.post(
+        "/api/brief/generate",
+        json={"article": {"link": trusted_article["link"]}},
+        headers=headers,
+    )
+    streamed = client.post(
+        "/api/brief/batch",
+        json={"count": 1, "articles": [{"link": trusted_article["link"]}]},
+        headers=headers,
+    )
+
+    assert generated.status_code == 200, generated.get_json()
+    assert generated.get_json()["saved_to"] == "brief.docx"
+    stream_text = streamed.get_data(as_text=True)
+    assert '"saved_to": "brief.docx"' in stream_text
+    assert str(private_path.parent) not in generated.get_data(as_text=True)
+    assert str(private_path.parent) not in stream_text
+
+
+def test_import_text_response_hides_absolute_saved_path(monkeypatch, tmp_path):
+    private_path = tmp_path / "private-user" / "imported.docx"
+    monkeypatch.setitem(tracker.AI_CONFIG, "api_key", "test-key")
+    monkeypatch.setattr(tracker, "_check_rate", lambda *args, **kwargs: True)
+    monkeypatch.setattr(tracker, "_call_ai", lambda *args, **kwargs: _valid_text())
+    monkeypatch.setattr(
+        tracker, "_persist_brief_to_disk", lambda *args, **kwargs: str(private_path)
+    )
+    client = tracker.app.test_client()
+    csrf = "import-saved-path-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+
+    response = client.post(
+        "/api/brief/import_text",
+        json={
+            "title": "美军在西太平洋组织联合演训",
+            "text": "美国防务新闻2026年8月14日报道，美军8月14日在西太平洋组织联合演训，并披露跨域协同和保障安排。",
+            "source": "美国防务新闻",
+            "pub_date": "2026-08-14",
+        },
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()["saved_to"] == "imported.docx"
+    assert str(private_path.parent) not in response.get_data(as_text=True)
+
+
+def test_import_url_and_file_responses_hide_absolute_saved_path(
+    monkeypatch, tmp_path
+):
+    private_path = tmp_path / "private-user" / "imported.docx"
+    extracted = {
+        "title": "美军在西太平洋组织联合演训",
+        "body": "美国防务新闻2026年8月14日报道，美军8月14日在西太平洋组织联合演训，并披露跨域协同和保障安排。",
+        "source": "美国防务新闻",
+        "pub_date": "2026-08-14",
+    }
+    monkeypatch.setitem(tracker.AI_CONFIG, "api_key", "test-key")
+    monkeypatch.setattr(tracker, "_check_rate", lambda *args, **kwargs: True)
+    monkeypatch.setattr(tracker, "_call_ai", lambda *args, **kwargs: _valid_text())
+    monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda *_args: (True, ""))
+    monkeypatch.setattr(tracker, "_extract_url_content", lambda *_args: extracted)
+    monkeypatch.setattr(tracker, "_extract_file_text", lambda *_args: extracted)
+    monkeypatch.setattr(
+        tracker, "_persist_brief_to_disk", lambda *args, **kwargs: str(private_path)
+    )
+    client = tracker.app.test_client()
+    csrf = "import-url-file-saved-path-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+    headers = {tracker.CSRF_HEADER: csrf}
+
+    from_url = client.post(
+        "/api/brief/import_url",
+        json={"url": "https://example.test/report"},
+        headers=headers,
+    )
+    from_file = client.post(
+        "/api/brief/import_file",
+        data={
+            "file": (BytesIO(b"source"), "report.txt"),
+            "source": "美国防务新闻",
+            "pub_date": "2026-08-14",
+        },
+        headers=headers,
+        content_type="multipart/form-data",
+    )
+
+    for response in (from_url, from_file):
+        assert response.status_code == 200, response.get_json()
+        assert response.get_json()["saved_to"] == "imported.docx"
+        assert str(private_path.parent) not in response.get_data(as_text=True)
+
+
+def test_brief_api_error_does_not_echo_or_log_absolute_path(
+    monkeypatch, tmp_path, caplog
+):
+    private_path = tmp_path / "private-user" / "failed.docx"
+    trusted_article = {
+        "title": "美军在西太平洋组织联合演训",
+        "summary": "美国防务新闻2026年8月14日报道，美军8月14日在西太平洋组织联合演训。",
+        "source": "Defense News",
+        "source_cn": "美国防务新闻",
+        "date": "2026-08-14T00:00:00+00:00",
+        "publication_date_verified": True,
+        "link": "https://example.com/private-error-test",
+    }
+    monkeypatch.setitem(tracker.cache, "news", [trusted_article])
+    monkeypatch.setitem(tracker.AI_CONFIG, "api_key", "test-key")
+    monkeypatch.setattr(tracker, "_check_rate", lambda *args, **kwargs: True)
+
+    def fail(*args, **kwargs):
+        raise OSError(f"cannot write {private_path}")
+
+    monkeypatch.setattr(tracker, "_call_ai", fail)
+    client = tracker.app.test_client()
+    csrf = "brief-error-path-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+
+    with caplog.at_level("ERROR", logger=tracker.logger.name):
+        response = client.post(
+            "/api/brief/generate",
+            json={"article": {"link": trusted_article["link"]}},
+            headers={tracker.CSRF_HEADER: csrf},
+        )
+        streamed = client.post(
+            "/api/brief/batch",
+            json={"count": 1, "articles": [{"link": trusted_article["link"]}]},
+            headers={tracker.CSRF_HEADER: csrf},
+        )
+
+    assert response.status_code == 500
+    assert str(private_path) not in response.get_data(as_text=True)
+    assert str(private_path) not in streamed.get_data(as_text=True)
+    assert str(private_path) not in caplog.text
 
 
 def test_local_feishu_stops_before_card_and_docx_for_invalid_brief(monkeypatch):

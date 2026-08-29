@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 from dataclasses import dataclass, replace
@@ -20,6 +21,12 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 
 DPAPI_MASTER_KEY_MAGIC = b"DefenseTracker-V9-DPAPI\x00"
+_RECORD_CONTENT_COMMITMENT_DOMAIN = (
+    b"DefenseTracker-V9-record-ciphertext-commitment-v1\x00"
+)
+_BLOB_CONTENT_COMMITMENT_DOMAIN = (
+    b"DefenseTracker-V9-blob-ciphertext-commitment-v1\x00"
+)
 
 
 def _b64(value: bytes) -> str:
@@ -58,6 +65,24 @@ def _record_key_aad(
     return (
         f"v9:record-key:1:{org_id}:{record_id}:{record_type}:{version}:{key_version}"
     ).encode("utf-8")
+
+
+def _record_content_commitment(
+    *,
+    org_id: str,
+    record_id: str,
+    record_type: str,
+    version: int,
+    nonce: bytes,
+    ciphertext: bytes,
+) -> str:
+    """Commit to randomized ciphertext without fingerprinting its plaintext."""
+    return hashlib.sha256(
+        _RECORD_CONTENT_COMMITMENT_DOMAIN
+        + _record_content_aad(org_id, record_id, record_type, version)
+        + nonce
+        + ciphertext
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -178,7 +203,14 @@ def encrypt_record(
         nonce=nonce,
         wrapped_data_key=wrapped_data_key,
         wrap_nonce=wrap_nonce,
-        content_hash=hashlib.sha256(plaintext).hexdigest(),
+        content_hash=_record_content_commitment(
+            org_id=org_id,
+            record_id=record_id,
+            record_type=record_type,
+            version=version,
+            nonce=nonce,
+            ciphertext=ciphertext,
+        ),
     )
 
 
@@ -208,7 +240,18 @@ def decrypt_record(org_key: bytes, envelope: RecordEnvelope) -> Any:
             envelope.version,
         ),
     )
-    if hashlib.sha256(plaintext).hexdigest() != envelope.content_hash:
+    current_commitment = _record_content_commitment(
+        org_id=envelope.org_id,
+        record_id=envelope.record_id,
+        record_type=envelope.record_type,
+        version=envelope.version,
+        nonce=envelope.nonce,
+        ciphertext=envelope.ciphertext,
+    )
+    legacy_commitment = hashlib.sha256(plaintext).hexdigest()
+    if not hmac.compare_digest(
+        current_commitment, envelope.content_hash
+    ) and not hmac.compare_digest(legacy_commitment, envelope.content_hash):
         raise ValueError("record content hash mismatch")
     return json.loads(plaintext.decode("utf-8"))
 
@@ -245,6 +288,18 @@ def _blob_content_aad(org_id: str, object_id: str) -> bytes:
     return f"v9:blob-content:1:{org_id}:{object_id}".encode()
 
 
+def _blob_content_commitment(
+    *, org_id: str, object_id: str, nonce: bytes, ciphertext: bytes
+) -> str:
+    """Commit to randomized blob ciphertext without fingerprinting plaintext."""
+    return hashlib.sha256(
+        _BLOB_CONTENT_COMMITMENT_DOMAIN
+        + _blob_content_aad(org_id, object_id)
+        + nonce
+        + ciphertext
+    ).hexdigest()
+
+
 def _blob_key_aad(org_id: str, object_id: str, key_version: int) -> bytes:
     return f"v9:blob-key:1:{org_id}:{object_id}:{key_version}".encode()
 
@@ -276,7 +331,12 @@ def encrypt_blob(
         nonce=nonce,
         wrapped_data_key=wrapped_data_key,
         wrap_nonce=wrap_nonce,
-        content_hash=hashlib.sha256(plaintext).hexdigest(),
+        content_hash=_blob_content_commitment(
+            org_id=org_id,
+            object_id=object_id,
+            nonce=nonce,
+            ciphertext=ciphertext,
+        ),
     )
 
 
@@ -293,7 +353,16 @@ def decrypt_blob(org_key: bytes, envelope: BlobEnvelope) -> bytes:
         envelope.ciphertext,
         _blob_content_aad(envelope.org_id, envelope.object_id),
     )
-    if hashlib.sha256(plaintext).hexdigest() != envelope.content_hash:
+    current_commitment = _blob_content_commitment(
+        org_id=envelope.org_id,
+        object_id=envelope.object_id,
+        nonce=envelope.nonce,
+        ciphertext=envelope.ciphertext,
+    )
+    legacy_commitment = hashlib.sha256(plaintext).hexdigest()
+    if not hmac.compare_digest(
+        current_commitment, envelope.content_hash
+    ) and not hmac.compare_digest(legacy_commitment, envelope.content_hash):
         raise ValueError("blob content hash mismatch")
     return plaintext
 

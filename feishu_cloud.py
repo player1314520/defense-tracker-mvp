@@ -17,6 +17,7 @@
   FEISHU_EVENT_LEASE_SECONDS  后台任务租约秒数（默认 900，范围 30-3600）
   FEISHU_WEBHOOK_ALLOW_TOKEN_ONLY=1  仅本地开发兼容旧 token-only 回调
   AI_BASE_URL            AI 服务地址（默认 https://api.deepseek.com）
+  AI_ALLOWED_HOSTS       额外允许的 AI HTTPS 主机名（逗号分隔，不支持通配符/IP）
   AI_MODEL               模型名称（默认 deepseek-chat）
   PORT                   监听端口（默认 5000）
 
@@ -48,6 +49,7 @@ from urllib.parse import urlparse, urljoin
 
 import feedparser
 import requests
+from pinned_http import UnsafeTargetError, pinned_get
 from bs4 import BeautifulSoup
 from docx import Document as DocxDocument
 from docx.shared import Pt, Emu
@@ -70,6 +72,7 @@ from feishu_webhook_security import (
     validate_event_identity,
     verify_signed_request,
 )
+from v9.redaction import install_redaction_filter
 
 try:
     import trafilatura
@@ -82,6 +85,7 @@ except ImportError:
 # ════════════════════════════════════════════════════════════
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("feishu_cloud")
+install_redaction_filter(logger)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_WEBHOOK_BODY_BYTES
@@ -100,6 +104,7 @@ FEISHU_CONFIG = {
 AI_CONFIG = {
     "api_key":     os.environ.get("AI_API_KEY", ""),
     "base_url":    os.environ.get("AI_BASE_URL", "https://api.deepseek.com"),
+    "allowed_hosts": os.environ.get("AI_ALLOWED_HOSTS", ""),
     "model":       os.environ.get("AI_MODEL", "deepseek-chat"),
     "max_tokens":  1024,
     "temperature": 0.4,
@@ -139,6 +144,8 @@ PUSH_CONFIG = {
 MAX_FETCH_BYTES = 5 * 1024 * 1024
 MAX_FEISHU_DOWNLOAD_BYTES = 10 * 1024 * 1024
 MAX_REDIRECTS = 5
+MAX_MESSAGE_TEXT_CHARS = 8192
+MAX_RENAME_FILENAME_BYTES = 120
 
 # ════════════════════════════════════════════════════════════
 # 启动校验：必填环境变量
@@ -407,7 +414,11 @@ def _get_tenant_token() -> str:
                 # 清空缓存，避免后续请求使用失效 token
                 _token_cache["token"] = ""
                 _token_cache["expire"] = 0
-                logger.warning("tenant_token 获取失败 (attempt %d/3): %s", attempt + 1, e)
+                logger.warning(
+                    "tenant_token 获取失败 attempt=%d error_type=%s",
+                    attempt + 1,
+                    type(e).__name__,
+                )
                 if attempt < 2:
                     time.sleep(1 * (attempt + 1))  # 1s, 2s 退避
         raise RuntimeError(f"飞书Token获取失败（3次重试后放弃）: {last_err}")
@@ -424,7 +435,7 @@ def _feishu_post(path: str, payload: dict) -> dict:
     data = r.json()
     code = data.get("code", -1)
     if code != 0:
-        logger.warning("飞书 API %s 返回错误 code=%s msg=%s", path, code, data.get("msg"))
+        logger.warning("飞书 API %s 返回错误 code=%s", path, code)
     return data
 
 
@@ -438,7 +449,7 @@ def send_text(chat_id: str, text: str) -> bool:
         })
         return data.get("code") == 0
     except Exception as e:
-        logger.error("send_text 失败: %s", e)
+        logger.error("send_text 失败 error_type=%s", type(e).__name__)
         return False
 
 
@@ -452,7 +463,7 @@ def send_card(chat_id: str, card: dict) -> bool:
         })
         return data.get("code") == 0
     except Exception as e:
-        logger.error("send_card 失败: %s", e)
+        logger.error("send_card 失败 error_type=%s", type(e).__name__)
         return False
 
 
@@ -486,64 +497,23 @@ def _read_limited_response(resp: requests.Response, max_bytes: int = MAX_FETCH_B
         resp.close()
 
 
-_SSRF_HTTP_LOCAL = threading.local()
-
-
-def _ssrf_http_session() -> requests.Session:
-    """One direct, proxy-free Session per worker thread for untrusted URLs."""
-    session = getattr(_SSRF_HTTP_LOCAL, "session", None)
-    if session is None:
-        session = requests.Session()
-        session.trust_env = False
-        _SSRF_HTTP_LOCAL.session = session
-    return session
-
-
-def _connected_peer_ip(resp: requests.Response) -> str:
-    raw = getattr(resp, "raw", None)
-    candidates = [
-        getattr(getattr(raw, "_connection", None), "sock", None),
-        getattr(
-            getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None),
-            "_sock",
-            None,
-        ),
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            peer = candidate.getpeername()
-            if peer and peer[0]:
-                return str(peer[0])
-        except (AttributeError, OSError, TypeError):
-            continue
-    raise requests.RequestException("无法核验远端连接地址")
-
-
-def _validate_connected_peer(resp: requests.Response) -> None:
-    try:
-        peer_ip = _connected_peer_ip(resp)
-        blocked, blocked_addr = _is_blocked_addr(peer_ip)
-    except Exception:
-        resp.close()
-        raise
-    if blocked:
-        resp.close()
-        raise requests.RequestException(f"连接被重绑定到私有地址: {blocked_addr}")
-
-
 def _safe_get_once(url: str, headers: dict, timeout: int, max_bytes: int = MAX_FETCH_BYTES) -> requests.Response:
     current = url
+    redirect_cookies = requests.cookies.RequestsCookieJar()
     for redirect_idx in range(MAX_REDIRECTS + 1):
         safe, reason = _is_ssrf_safe(current)
         if not safe:
             raise requests.RequestException(f"URL不安全: {reason}")
-        resp = _ssrf_http_session().get(
-            current, headers=headers, timeout=timeout,
-            allow_redirects=False, stream=True,
-        )
-        _validate_connected_peer(resp)
+        try:
+            resp = pinned_get(
+                current,
+                headers=headers,
+                cookies=redirect_cookies,
+                timeout=timeout,
+            )
+        except UnsafeTargetError as exc:
+            raise requests.RequestException(str(exc)) from exc
+        redirect_cookies.update(resp.cookies)
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location")
             resp.close()
@@ -653,16 +623,136 @@ def _extract_url_content(url: str) -> dict:
 # AI 调用
 # ════════════════════════════════════════════════════════════
 
-def _is_anthropic_endpoint() -> bool:
-    return "api.anthropic.com" in AI_CONFIG["base_url"].lower()
+_AI_REQUEST_ID_HEADERS = ("x-request-id", "request-id", "x-amzn-requestid")
+_AI_REQUEST_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+)
+_AI_LOG_KINDS = frozenset({"chat", "multimodal"})
+_AI_LOG_REASONS = frozenset({"MISSING_CHOICES", "EMPTY_CONTENT"})
+_AI_OFFICIAL_HOSTS = frozenset({
+    "api.anthropic.com",
+    "api.deepseek.com",
+    "api.openai.com",
+})
+
+
+def _safe_ai_request_id(response) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    try:
+        normalized_headers = {str(key).casefold(): value for key, value in headers.items()}
+    except AttributeError:
+        normalized_headers = {}
+    for header in _AI_REQUEST_ID_HEADERS:
+        value = str(normalized_headers.get(header) or "").strip()
+        if value and len(value) <= 128 and all(ch in _AI_REQUEST_ID_CHARS for ch in value):
+            return value
+    return "unavailable"
+
+
+def _log_ai_upstream_anomaly(response, *, kind: str, reason: str, level: int) -> None:
+    safe_kind = kind if kind in _AI_LOG_KINDS else "unknown"
+    safe_reason = reason if reason in _AI_LOG_REASONS else "UNKNOWN"
+    status = getattr(response, "status_code", 0)
+    status = status if isinstance(status, int) and 100 <= status <= 599 else 0
+    logger.log(
+        level,
+        "AI upstream anomaly status=%d request_id=%s kind=%s reason=%s",
+        status,
+        _safe_ai_request_id(response),
+        safe_kind,
+        safe_reason,
+    )
+
+def _normalize_ai_hostname(value: str, *, setting: str) -> str:
+    raw = str(value or "").strip()
+    if raw.endswith("."):
+        raw = raw[:-1]
+    if raw.endswith("."):
+        raise ValueError(f"{setting} 包含无效主机名")
+    if not raw or any(ord(ch) < 33 or ord(ch) == 127 for ch in raw):
+        raise ValueError(f"{setting} 包含无效主机名")
+    try:
+        ipaddress.ip_address(raw)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"{setting} 不允许 IP 地址")
+    try:
+        hostname = raw.encode("idna").decode("ascii").casefold()
+    except UnicodeError as exc:
+        raise ValueError(f"{setting} 包含无效主机名") from exc
+    labels = hostname.split(".")
+    if len(hostname) > 253 or len(labels) < 2:
+        raise ValueError(f"{setting} 包含无效主机名")
+    for label in labels:
+        if (
+            not 1 <= len(label) <= 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (ch.isascii() and (ch.isalnum() or ch == "-")) for ch in label)
+        ):
+            raise ValueError(f"{setting} 包含无效主机名")
+    if hostname.endswith((".local", ".localhost", ".internal", ".lan", ".home")):
+        raise ValueError(f"{setting} 不允许本地主机名")
+    return hostname
+
+
+def _parse_ai_allowed_hosts(value: str) -> frozenset[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return frozenset()
+    entries = raw.split(",")
+    if any(not entry.strip() for entry in entries):
+        raise ValueError("AI_ALLOWED_HOSTS 包含空主机名")
+    return frozenset(
+        _normalize_ai_hostname(entry, setting="AI_ALLOWED_HOSTS")
+        for entry in entries
+    )
+
+
+def _validated_ai_base_url() -> tuple[str, str]:
+    raw = str(AI_CONFIG.get("base_url") or "").strip()
+    if not raw or any(ch.isspace() or ord(ch) == 127 for ch in raw):
+        raise ValueError("AI_BASE_URL 无效")
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("AI_BASE_URL 无效") from exc
+    if parsed.scheme.casefold() != "https":
+        raise ValueError("AI_BASE_URL 必须使用 HTTPS")
+    if (
+        not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("AI_BASE_URL 不得包含凭据、参数、查询或片段")
+    if port not in (None, 443):
+        raise ValueError("AI_BASE_URL 仅允许标准 HTTPS 端口")
+    hostname = _normalize_ai_hostname(parsed.hostname or "", setting="AI_BASE_URL")
+    allowed_hosts = _AI_OFFICIAL_HOSTS | _parse_ai_allowed_hosts(
+        AI_CONFIG.get("allowed_hosts", "")
+    )
+    if hostname not in allowed_hosts:
+        raise ValueError("AI_BASE_URL 主机未获授权")
+    path = parsed.path.rstrip("/")
+    return f"https://{hostname}{path}", hostname
+
+
+def _is_anthropic_endpoint(hostname: str) -> bool:
+    return hostname == "api.anthropic.com"
 
 
 def _call_ai(messages: list, temperature: float = 0.4) -> str:
     """调用 LLM API（OpenAI兼容 / Anthropic原生）"""
     if not AI_CONFIG["api_key"]:
         raise ValueError("AI API Key 未配置")
+    base, hostname = _validated_ai_base_url()
 
-    if _is_anthropic_endpoint():
+    if _is_anthropic_endpoint(hostname):
         headers = {
             "x-api-key": AI_CONFIG["api_key"],
             "anthropic-version": "2023-06-01",
@@ -683,7 +773,7 @@ def _call_ai(messages: list, temperature: float = 0.4) -> str:
         }
         if system_msg:
             payload["system"] = system_msg
-        url = AI_CONFIG["base_url"].rstrip("/") + "/v1/messages"
+        url = base + "/v1/messages"
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
         content = resp.json().get("content", [])
@@ -702,7 +792,6 @@ def _call_ai(messages: list, temperature: float = 0.4) -> str:
         "max_tokens": AI_CONFIG["max_tokens"],
         "temperature": temperature,
     }
-    base = AI_CONFIG["base_url"].rstrip("/")
     if base.endswith("/v1"):
         url = base + "/chat/completions"
     elif "/v1" in base or "/paas/v4" in base or "/compatible-mode" in base or "/api/v3" in base:
@@ -710,18 +799,21 @@ def _call_ai(messages: list, temperature: float = 0.4) -> str:
     else:
         url = base + "/v1/chat/completions"
 
-    _ssl_verify = not any(h in base for h in ["simpleai.com.cn"])
-    resp = requests.post(url, headers=headers, json=payload, timeout=180, verify=_ssl_verify)
+    resp = requests.post(url, headers=headers, json=payload, timeout=180)
     resp.raise_for_status()
     result = resp.json()
     choices = result.get("choices")
     if not choices or not isinstance(choices, list):
-        logger.error("AI 响应缺少 choices: %s", str(result)[:300])
+        _log_ai_upstream_anomaly(
+            resp, kind="chat", reason="MISSING_CHOICES", level=logging.ERROR,
+        )
         raise ValueError("AI 返回格式异常：缺少 choices 字段")
     msg = choices[0].get("message", {})
     text = msg.get("content") or msg.get("reasoning_content") or ""
     if not text.strip():
-        logger.warning("AI 返回空内容: finish_reason=%s", choices[0].get("finish_reason"))
+        _log_ai_upstream_anomaly(
+            resp, kind="chat", reason="EMPTY_CONTENT", level=logging.WARNING,
+        )
     return text
 
 
@@ -796,8 +888,9 @@ def _call_ai_with_image(
     """调用多模态 AI（图片+文字），支持 Anthropic 和 OpenAI 格式"""
     if not AI_CONFIG["api_key"]:
         raise ValueError("AI API Key 未配置")
+    base, hostname = _validated_ai_base_url()
 
-    if _is_anthropic_endpoint():
+    if _is_anthropic_endpoint(hostname):
         headers = {
             "x-api-key": AI_CONFIG["api_key"],
             "anthropic-version": "2023-06-01",
@@ -817,7 +910,7 @@ def _call_ai_with_image(
         }
         if system_prompt:
             payload["system"] = system_prompt
-        url = AI_CONFIG["base_url"].rstrip("/") + "/v1/messages"
+        url = base + "/v1/messages"
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
         content = resp.json().get("content", [])
@@ -843,15 +936,15 @@ def _call_ai_with_image(
             "temperature": 0.4,
             "messages": messages,
         }
-        base = AI_CONFIG["base_url"].rstrip("/")
         url = base + "/v1/chat/completions" if not base.endswith("/v1") else base + "/chat/completions"
-        resp = requests.post(url, headers=headers, json=payload, timeout=180,
-                             verify=not any(h in base for h in ["simpleai.com.cn"]))
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
         result = resp.json()
         choices = result.get("choices")
         if not choices or not isinstance(choices, list):
-            logger.error("多模态 AI 响应缺少 choices: %s", str(result)[:300])
+            _log_ai_upstream_anomaly(
+                resp, kind="multimodal", reason="MISSING_CHOICES", level=logging.ERROR,
+            )
             raise ValueError("AI 返回格式异常：缺少 choices 字段")
         return choices[0].get("message", {}).get("content", "")
 
@@ -1022,6 +1115,8 @@ _BRIEF_RELATIVE_EVENT_WORDS = (
 )
 
 _BRIEF_TITLE_ENDINGS = ("值得警惕", "值得关注")
+MAX_BRIEF_TEXT_CHARS = 16 * 1024
+MAX_BRIEF_LINE_CHARS = 4 * 1024
 
 _BRIEF_EVENT_DATE_RE = re.compile(
     r"(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
@@ -1270,6 +1365,12 @@ def _brief_body_attributions(body: str) -> list[dict]:
 
 def _validate_brief_text(brief: str, evidence: dict | None = None) -> dict:
     """执行独立云端飞书发送前的轻量机械规则校验。"""
+    if not isinstance(brief, str):
+        return {"valid": False, "errors": ["要讯文本必须是字符串"], "parsed": {}}
+    if len(brief) > MAX_BRIEF_TEXT_CHARS:
+        return {"valid": False, "errors": ["要讯文本超过 16 KiB 字符限制"], "parsed": {}}
+    if any(len(line) > MAX_BRIEF_LINE_CHARS for line in brief.splitlines()):
+        return {"valid": False, "errors": ["要讯文本单行超过 4 KiB 字符限制"], "parsed": {}}
     parsed = _parse_brief_for_validation(brief)
     errors = []
     event_time = parsed["event_time"]
@@ -1759,7 +1860,10 @@ def upload_file(file_name: str, file_data: bytes, file_type: str = "stream") -> 
         return data["data"]["file_key"]
 
     # 第二次尝试：ASCII fallback（保留原文件名中的英文关键词）
-    logger.warning("飞书上传第一次失败 (%s)，尝试 ASCII fallback", last_err)
+    logger.warning(
+        "飞书上传第一次失败 error_type=%s，尝试 ASCII fallback",
+        type(last_err).__name__,
+    )
     fallback_name = _ascii_fallback_name(matched_ext, original=file_name)
     data = _do_upload(fallback_name)
     if data.get("code") == 0:
@@ -2045,26 +2149,68 @@ def _process_file_async(chat_id: str, message_id: str, file_key: str, file_name:
         send_card(chat_id, _build_error_card("文件处理失败"))
 
 
-_RENAME_INTENT_RE = re.compile(
-    r'(?:把\s*)?(?:导出\s*(?:的)?\s*)?(?:docx|DOCX|word|文件|要讯)?\s*'
-    r'(?:文件名|名字|标题|title|filename|文件标题)\s*'
-    r'(?:改(?:成|为)?|设(?:为|成)?|命名(?:为)?|叫|为)\s*'
-    r'[「『"（(\[]*\s*([^，。！？!?\n」』"）)\]]+?)\s*[」』"）)\]]*\s*$',
-    re.IGNORECASE
-)
+_RENAME_DIRECT_PREFIXES = ("导出文件名", "重命名", "导出名", "文件名")
+_RENAME_LABELS = ("文件标题", "filename", "文件名", "title", "名字", "标题")
+_RENAME_ACTIONS = ("命名为", "改成", "改为", "设为", "设成", "命名", "改", "设", "叫", "为")
+_RENAME_DOCUMENT_TYPES = ("docx", "word", "文件", "要讯")
+_RENAME_EDGE_CHARS = " \t\r\n:：=「」『』\"“”()（）[]【】"
+_RENAME_FORBIDDEN_CHARS = frozenset("，。！？!?\r\n\x00」』\"”）)]】")
+
+
+def _consume_rename_keyword(value: str, keywords: tuple[str, ...]) -> str | None:
+    remaining = value.lstrip()
+    folded = remaining.casefold()
+    for keyword in keywords:
+        if folded.startswith(keyword.casefold()):
+            return remaining[len(keyword):]
+    return None
+
+
+def _validate_rename_candidate(value: str) -> str:
+    candidate = value.strip().strip(_RENAME_EDGE_CHARS).strip()
+    if not candidate or any(ch in _RENAME_FORBIDDEN_CHARS for ch in candidate):
+        return ""
+    upload_name = candidate if candidate.casefold().endswith(".docx") else candidate + ".docx"
+    if len(upload_name.encode("utf-8")) > MAX_RENAME_FILENAME_BYTES:
+        return ""
+    return candidate
 
 def _try_extract_rename(text: str) -> str | None:
-    """从自然语言中识别 "把文件名改成 XXX" 意图。"""
+    """Deterministically parse bounded filename-rename instructions."""
+    if not isinstance(text, str) or len(text) > MAX_MESSAGE_TEXT_CHARS:
+        return None
     t = text.strip()
-    for prefix in ("文件名", "重命名", "导出名", "导出文件名"):
+    if not t:
+        return None
+
+    for prefix in _RENAME_DIRECT_PREFIXES:
         if t.startswith(prefix):
-            rest = t[len(prefix):].lstrip(" :：=").strip(" 「」『』\"“”()（）")
-            if rest:
-                return rest
-    m = _RENAME_INTENT_RE.search(t)
-    if m:
-        return m.group(1).strip(" 「」『』\"“”()（）")
-    return None
+            rest = t[len(prefix):]
+            if prefix != "文件名" or not rest or rest[0].isspace() or rest[0] in ":：=":
+                return _validate_rename_candidate(rest)
+
+    remaining = _consume_rename_keyword(t, ("把",))
+    if remaining is None:
+        remaining = t
+    exported = _consume_rename_keyword(remaining, ("导出",))
+    if exported is not None:
+        remaining = exported
+        possessive = _consume_rename_keyword(remaining, ("的",))
+        if possessive is not None:
+            remaining = possessive
+
+    after_label = _consume_rename_keyword(remaining, _RENAME_LABELS)
+    if after_label is None:
+        after_type = _consume_rename_keyword(remaining, _RENAME_DOCUMENT_TYPES)
+        if after_type is not None:
+            after_label = _consume_rename_keyword(after_type, _RENAME_LABELS)
+    if after_label is None:
+        return None
+
+    after_action = _consume_rename_keyword(after_label, _RENAME_ACTIONS)
+    if after_action is None:
+        return None
+    return _validate_rename_candidate(after_action)
 
 
 def _refine_async(chat_id: str, instruction: str):
@@ -2548,9 +2694,15 @@ def feishu_webhook():
 
     try:
         content = json.loads(message.get("content", "{}"))
-        text = content.get("text", "").strip()
+        raw_text = content.get("text", "")
     except Exception:
         return _ack_webhook_event(event_lease)
+    if not isinstance(raw_text, str):
+        return _ack_webhook_event(event_lease)
+    if len(raw_text) > MAX_MESSAGE_TEXT_CHARS:
+        logger.warning("text message ignored (TEXT_TOO_LONG)")
+        return _ack_webhook_event(event_lease)
+    text = raw_text.strip()
 
     # ── @机器人 群聊支持：剥离 @mention 占位符 ──────────
     mentions = content.get("mentions") if isinstance(content, dict) else None
@@ -2622,7 +2774,13 @@ def feishu_webhook():
 
     # ── 文件名重命名意图（无论有无会话都可识别）────────────
     rename_to = _try_extract_rename(text)
-    if rename_to:
+    if rename_to is not None:
+        if not rename_to:
+            send_text(
+                chat_id,
+                "文件名不能为空，且 UTF-8 编码后不得超过 120 字节（含 .docx）。",
+            )
+            return _ack_webhook_event(event_lease)
         sanitized = _sanitize_feishu_filename(
             rename_to if rename_to.lower().endswith(".docx") else f"{rename_to}.docx"
         )

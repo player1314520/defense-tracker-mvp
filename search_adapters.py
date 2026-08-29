@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import os
 import re
-import ipaddress
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Callable
@@ -19,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from document_safety import extract_docx_text_safe, extract_pdf_text_isolated
+from pinned_http import pinned_get
 
 try:
     import trafilatura
@@ -966,8 +965,9 @@ def _read_limited_response(resp: requests.Response, max_bytes: int) -> bytes:
 # ── SSRF 防护 ────────────────────────────────────────────────────────
 # search_adapters 不能 import app（循环依赖），由 app.py 启动时注入
 # set_ssrf_check(_is_ssrf_safe)。注入后 extract_url 对首跳及每个重定向目标
-# 做 DNS 预检，并在连接建立后核验真实 peer IP；浏览器渲染兜底因无法核验
-# Chromium 的实际 peer IP 而 fail closed。
+# 做调用方策略预检；实际传输由 pinned_http 在同一次 DNS 解析后固定公网
+# sockaddr，并在发送任何 HTTP 字节前核验 peer。浏览器渲染兜底因无法
+# 提供同等连接固定与核验能力而 fail closed。
 _SSRF_CHECK: "Callable[[str], tuple] | None" = None
 MAX_EXTRACT_REDIRECTS = 5
 
@@ -990,72 +990,21 @@ _EXTRACT_HEADERS = {
 }
 
 
-_SSRF_HTTP_LOCAL = threading.local()
-
-
-def _ssrf_http_session() -> requests.Session:
-    session = getattr(_SSRF_HTTP_LOCAL, "session", None)
-    if session is None:
-        session = requests.Session()
-        session.trust_env = False
-        _SSRF_HTTP_LOCAL.session = session
-    return session
-
-
-def _connected_peer_ip(resp: requests.Response) -> str:
-    raw = getattr(resp, "raw", None)
-    candidates = [
-        getattr(getattr(raw, "_connection", None), "sock", None),
-        getattr(
-            getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None),
-            "_sock",
-            None,
-        ),
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            peer = candidate.getpeername()
-            if peer and peer[0]:
-                return str(peer[0])
-        except (AttributeError, OSError, TypeError):
-            continue
-    raise RuntimeError("无法核验远端连接地址")
-
-
-def _validate_connected_peer(resp: requests.Response) -> None:
-    peer = ipaddress.ip_address(_connected_peer_ip(resp))
-    if (
-        peer.is_loopback or peer.is_private or peer.is_link_local
-        or peer.is_multicast or peer.is_reserved or peer.is_unspecified
-    ):
-        try:
-            resp.close()
-        except Exception:
-            pass
-        raise RuntimeError(f"连接被重绑定到私有地址: {peer}")
-
-
 def _safe_stream_get(url, headers, timeout, ssrf_check):
-    """逐跳 SSRF 复检 + 禁用自动重定向的流式 GET（对齐 app.py:_safe_get_once）。"""
+    """逐跳策略复检 + DNS 固定的无代理流式 GET。"""
     current = url
+    redirect_cookies = requests.cookies.RequestsCookieJar()
     for redirect_idx in range(MAX_EXTRACT_REDIRECTS + 1):
         ok, reason = ssrf_check(current)
         if not ok:
             raise RuntimeError(f"URL不安全: {reason}")
-        resp = _ssrf_http_session().get(
-            current, timeout=timeout, stream=True,
-            allow_redirects=False, headers=headers,
+        resp = pinned_get(
+            current,
+            timeout=timeout,
+            headers=headers,
+            cookies=redirect_cookies,
         )
-        try:
-            _validate_connected_peer(resp)
-        except Exception:
-            try:
-                resp.close()
-            except Exception:
-                pass
-            raise
+        redirect_cookies.update(resp.cookies)
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location")
             resp.close()

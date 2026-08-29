@@ -17,10 +17,11 @@ _PATTERNS = (
         """
     ),
 )
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
 
 
 def redact_text(value: str) -> str:
-    text = str(value)
+    text = _CONTROL_CHARACTERS.sub(" ", str(value))
     text = _PATTERNS[0].sub("Bearer [REDACTED]", text)
     text = _PATTERNS[1].sub("[REDACTED]", text)
     text = _PATTERNS[2].sub(

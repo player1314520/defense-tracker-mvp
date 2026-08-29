@@ -22,7 +22,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from state import CONFIG_DIR, DATA_DIR, VAULT_DIR  # noqa: E402
+from state import (  # noqa: E402
+    CONFIG_DIR,
+    DATA_DIR,
+    VAULT_DIR,
+    migrate_legacy_supabase_vault,
+    resolve_supabase_config_path,
+)
 from v9.service import V9Service  # noqa: E402
 from v9.supabase_client import (  # noqa: E402
     SessionVault,
@@ -91,33 +97,22 @@ def _harden_private_file(path: Path) -> None:
 
 
 def _supabase_config_path() -> Path:
-    candidates: list[Path] = []
-    explicit = os.environ.get("DEFENSE_TRACKER_SUPABASE_CONFIG", "").strip()
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_app_data:
-        candidates.append(
-            Path(local_app_data)
-            / "DefenseTracker"
-            / "config"
-            / ".supabase_v9_config.json"
-        )
-    candidates.append(Path(CONFIG_DIR) / ".supabase_v9_config.json")
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved.is_file():
-            return resolved
-    raise FileNotFoundError("Supabase V9 configuration is not available")
+    selected = resolve_supabase_config_path(
+        environ=os.environ,
+        config_dir=CONFIG_DIR,
+    )
+    if selected is None:
+        raise FileNotFoundError("Supabase V9 configuration is not available")
+    return selected
 
 
 def _authenticated_cloud_session() -> SupabaseSessionManager:
     config_path = _supabase_config_path()
     settings = SupabaseSettings.load(config_path)
-    runtime_root = config_path.parent.parent
+    migrate_legacy_supabase_vault(config_path, VAULT_DIR)
     return SupabaseSessionManager(
         settings,
-        SessionVault(runtime_root / "vault"),
+        SessionVault(VAULT_DIR),
         SupabaseHttpClient(settings),
     )
 

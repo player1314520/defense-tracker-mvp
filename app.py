@@ -3,7 +3,7 @@
 DefenseTracker V9 - legacy scoring schema + authenticated workspace
 实时抓取防务数据 · 写作要点优先评分(0-10★) · 3D地球仪热点 · AI在线分析 · PLA专项追踪 · 要讯自动写作
 """
-import re, sys, json, os, sqlite3, hashlib, hmac, feedparser, requests, smtplib, mimetypes, zipfile, time
+import re, sys, json, os, sqlite3, hashlib, hmac, feedparser, requests, smtplib, mimetypes, zipfile, time, stat
 # 允许 `py app.py` 直接启动：作 __main__ 时把自身注册为 "app" 模块，令 quality.py 的 `import app`
 # 解析到本运行模块，避免 __main__/app 双份实例触发循环 import（gunicorn/launcher/pytest 走 by-name
 # import，此处 __name__ != "__main__" 故为 no-op，既有启动路径不受影响）。
@@ -15,13 +15,17 @@ from contextlib import contextmanager
 
 # 共享运行时状态/基础常量统一在 state.py（叶子模块，零行为变更，详见该文件）。
 from state import (
-    CONFIG_DIR, DATA_DIR, VAULT_DIR,
+    CONFIG_DIR, DATA_DIR, VAULT_DIR, RUNTIME_LAYOUT,
     _rate_store, _rate_lock,
     cache, cache_lock,
     feed_health, feed_health_lock,
     NEWS_DAYS, NEWS_CACHE_TTL_HOURS, NEWS_CACHE_MAX,
     canonical_article_id,
+    migrate_legacy_supabase_vault,
+    resolve_supabase_config_path,
+    ensure_runtime_layout,
 )
+ensure_runtime_layout(RUNTIME_LAYOUT)
 from io import BytesIO
 from flask import (
     Flask, jsonify, render_template, request, Response, stream_with_context,
@@ -39,6 +43,7 @@ import report_agent
 import search_adapters
 import auth_devices
 import document_safety
+from pinned_http import UnsafeTargetError, pinned_get
 from product_version import PRODUCT_VERSION, current_build_commit
 from v9.ai_providers import (
     UnsupportedAiProvider,
@@ -604,30 +609,25 @@ try:
         global _V9_CLOUD_SESSION
         if _V9_CLOUD_SESSION is not None:
             return _V9_CLOUD_SESSION
-        explicit = os.environ.get("DEFENSE_TRACKER_SUPABASE_CONFIG", "").strip()
-        candidates = []
-        if explicit:
-            candidates.append(explicit)
-        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_app_data:
-            candidates.append(os.path.join(
-                local_app_data,
-                "DefenseTracker",
-                "config",
-                ".supabase_v9_config.json",
-            ))
-        candidates.append(os.path.join(CONFIG_DIR, ".supabase_v9_config.json"))
-        config_path = next(
-            (path for path in candidates if os.path.isfile(path)),
-            None,
+        config_path = resolve_supabase_config_path(
+            environ=os.environ,
+            config_dir=CONFIG_DIR,
         )
         if config_path is None:
             return None
         with _V9_CLOUD_LOCK:
             if _V9_CLOUD_SESSION is None:
                 settings = SupabaseSettings.load(config_path)
-                runtime_root = os.path.dirname(os.path.dirname(config_path))
-                vault = SessionVault(os.path.join(runtime_root, "vault"))
+                migration = migrate_legacy_supabase_vault(
+                    config_path,
+                    VAULT_DIR,
+                )
+                if migration["copied"]:
+                    logger.info(
+                        "Supabase 会话保险库兼容迁移完成：新增 %s",
+                        migration["copied"],
+                    )
+                vault = SessionVault(VAULT_DIR)
                 _V9_CLOUD_SESSION = SupabaseSessionManager(
                     settings,
                     vault,
@@ -656,9 +656,27 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════
 # AI 配置（支持 OpenAI 兼容 API：OpenAI / DeepSeek / Ollama 等）
 # ══════════════════════════════════════════════════════════════
+from protected_secrets import (
+    ProtectedValueStore,
+    read_private_json,
+    write_private_json_atomic,
+)
+
 _AI_CONFIG_FILE = os.path.join(CONFIG_DIR, ".ai_config.json")
 _AI_CONFIG_KEY_FILE = os.path.join(CONFIG_DIR, ".ai_config.key")
+_AI_CONFIG_KEY_PURPOSE = "local-config-fernet-root"
 _AI_CIPHER = None
+
+
+def _is_valid_fernet_key(value: bytes) -> bool:
+    if not CRYPTO_AVAILABLE or not isinstance(value, bytes):
+        return False
+    try:
+        Fernet(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
 
 def _load_or_create_ai_cipher():
     """Return Fernet cipher for at-rest AI key encryption, or None if unavailable."""
@@ -670,22 +688,68 @@ def _load_or_create_ai_cipher():
         return None
     key = os.environ.get("AI_CONFIG_FERNET_KEY", "").strip()
     try:
-        if not key and os.path.exists(_AI_CONFIG_KEY_FILE):
-            with open(_AI_CONFIG_KEY_FILE, "r", encoding="utf-8") as f:
-                key = f.read().strip()
-        if not key:
-            key = Fernet.generate_key().decode("ascii")
-            with open(_AI_CONFIG_KEY_FILE, "w", encoding="utf-8") as f:
-                f.write(key)
-            try:
-                os.chmod(_AI_CONFIG_KEY_FILE, 0o600)
-            except OSError:
-                pass
-        _AI_CIPHER = Fernet(key.encode("ascii"))
+        if key:
+            key_bytes = key.encode("ascii")
+        else:
+            if sys.platform != "win32":
+                logger.warning(
+                    "本地凭据持久化不可用；非 Windows 环境必须显式设置 "
+                    "AI_CONFIG_FERNET_KEY"
+                )
+                return None
+            store = ProtectedValueStore(
+                _AI_CONFIG_KEY_FILE,
+                purpose=_AI_CONFIG_KEY_PURPOSE,
+            )
+            loaded = store.load_or_migrate_legacy(_is_valid_fernet_key)
+            if loaded is None:
+                key_bytes = Fernet.generate_key()
+                store.save(key_bytes)
+            else:
+                key_bytes = loaded.value
+                if loaded.migrated:
+                    logger.warning(
+                        "旧版本地加密密钥已迁移到 Windows 当前用户保护存储；"
+                        "旧备份仍需安全处置"
+                    )
+        _AI_CIPHER = Fernet(key_bytes)
         return _AI_CIPHER
     except Exception:
         logger.warning("初始化 AI 配置加密失败，已拒绝明文降级")
         return None
+
+
+def _migrate_legacy_ai_key_file() -> None:
+    """Migrate an existing Windows raw key even when no config is loaded yet."""
+
+    global _AI_CIPHER
+    environment_key_configured = bool(
+        os.environ.get("AI_CONFIG_FERNET_KEY", "").strip()
+    )
+    if not os.path.exists(_AI_CONFIG_KEY_FILE):
+        return
+    if sys.platform != "win32":
+        logger.warning(
+            "非 Windows 环境已忽略旧式本地加密密钥；请安全处置旧文件和备份"
+        )
+        return
+    try:
+        loaded = ProtectedValueStore(
+            _AI_CONFIG_KEY_FILE,
+            purpose=_AI_CONFIG_KEY_PURPOSE,
+        ).load_or_migrate_legacy(_is_valid_fernet_key)
+        if loaded is None:
+            return
+        if not environment_key_configured:
+            _AI_CIPHER = Fernet(loaded.value)
+        if loaded.migrated:
+            logger.warning(
+                "旧版本地加密密钥已迁移到 Windows 当前用户保护存储；"
+                "旧备份仍需安全处置"
+            )
+    except Exception:
+        logger.warning("旧版本地加密密钥迁移失败；已拒绝使用不安全的本地密钥")
+
 
 def _encrypt_ai_secret(value: str) -> str:
     if not value:
@@ -701,15 +765,18 @@ def _decrypt_ai_secret(value: str) -> str:
     if not value:
         return ""
     if not value.startswith("fernet:"):
+        if sys.platform != "win32":
+            logger.warning("非 Windows 环境拒绝加载未加密的本地凭据")
+            return ""
         return value
     cipher = _load_or_create_ai_cipher()
     if not cipher:
-        logger.warning("AI API Key 已加密，但当前无法解密；请检查 AI_CONFIG_FERNET_KEY 或 .ai_config.key")
+        logger.warning("本地加密凭据当前无法解密；已拒绝明文降级")
         return ""
     try:
         return cipher.decrypt(value[len("fernet:"):].encode("ascii")).decode("utf-8")
     except InvalidToken:
-        logger.warning("AI API Key 解密失败：密钥不匹配或配置文件损坏")
+        logger.warning("本地加密凭据解密失败；已忽略无效密文")
         return ""
 
 def _load_ai_config() -> dict:
@@ -733,16 +800,35 @@ def _load_ai_config() -> dict:
     }
     if os.path.exists(_AI_CONFIG_FILE):
         try:
-            saved = json.load(open(_AI_CONFIG_FILE, encoding="utf-8"))
+            saved = read_private_json(_AI_CONFIG_FILE)
             saved_key = ""
-            if saved.get("api_key"):
-                saved_key = _decrypt_ai_secret(saved["api_key"])
-            elif saved.get("api_key_enc"):
-                saved_key = _decrypt_ai_secret(saved["api_key_enc"])
+            saved_secret = saved.get("api_key") or saved.get("api_key_enc") or ""
+            legacy_plaintext = bool(
+                saved_secret and not str(saved_secret).startswith("fernet:")
+            )
+            if saved_secret:
+                saved_key = _decrypt_ai_secret(saved_secret)
             saved_selection = resolve_provider(
                 saved.get("provider") or base["provider"],
                 saved.get("model") or base["model"],
             )
+            if legacy_plaintext and saved_key:
+                try:
+                    write_private_json_atomic(
+                        _AI_CONFIG_FILE,
+                        {
+                            "provider": saved_selection.provider,
+                            "model": saved_selection.model_id,
+                            "api_key": _encrypt_ai_secret(saved_key),
+                        },
+                    )
+                    logger.warning(
+                        "旧版明文 AI 凭据已迁移到受保护的本地配置；"
+                        "旧备份仍需安全处置"
+                    )
+                except Exception:
+                    logger.warning("旧版明文 AI 凭据迁移失败；已拒绝加载")
+                    saved_key = ""
             base.update({
                 "api_key": saved_key or base["api_key"],
                 "provider": saved_selection.provider,
@@ -751,7 +837,7 @@ def _load_ai_config() -> dict:
                     "/chat/completions", 1
                 )[0],
             })
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except Exception:
             logger.warning("AI configuration was ignored because it is invalid")
     return base
 
@@ -767,13 +853,13 @@ def _save_ai_config() -> bool:
         }
         if AI_CONFIG.get("api_key"):
             payload["api_key"] = _encrypt_ai_secret(AI_CONFIG["api_key"])
-        with open(_AI_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        write_private_json_atomic(_AI_CONFIG_FILE, payload)
         return True
     except Exception:
         logger.warning("保存 AI 配置失败；未启用明文降级")
         return False
 
+_migrate_legacy_ai_key_file()
 AI_CONFIG = _load_ai_config()
 
 
@@ -907,6 +993,7 @@ def _lease_ai_runtime():
 # ══════════════════════════════════════════════════════════════
 SEARCH_CONFIG_FILE = os.path.join(CONFIG_DIR, ".search_config.json")
 SEARCH_CONFIG_SECRET_FIELDS = ("tavily_api_key", "brave_api_key", "serpapi_api_key")
+_SEARCH_CONFIG_LOCK = threading.RLock()
 
 
 def _load_search_config() -> dict:
@@ -918,34 +1005,57 @@ def _load_search_config() -> dict:
     }
     if os.path.exists(SEARCH_CONFIG_FILE):
         try:
-            saved = json.load(open(SEARCH_CONFIG_FILE, encoding="utf-8"))
+            saved = read_private_json(SEARCH_CONFIG_FILE)
+            legacy_plaintext_fields = []
             for field in SEARCH_CONFIG_SECRET_FIELDS:
                 enc_field = f"{field}_enc"
-                if saved.get(enc_field):
-                    saved[field] = _decrypt_ai_secret(saved.get(enc_field) or "")
-                elif saved.get(field):
-                    saved[field] = _decrypt_ai_secret(saved[field]) if str(saved[field]).startswith("fernet:") else saved[field]
+                saved_secret = saved.get(enc_field) or saved.get(field) or ""
+                if saved_secret:
+                    if not str(saved_secret).startswith("fernet:"):
+                        legacy_plaintext_fields.append(field)
+                    saved[field] = _decrypt_ai_secret(saved_secret)
+                saved.pop(enc_field, None)
+            if legacy_plaintext_fields:
+                migratable = any(
+                    saved.get(field) for field in legacy_plaintext_fields
+                )
+                if migratable:
+                    candidate = {**base, **saved}
+                    if _save_search_config(candidate):
+                        logger.warning(
+                            "旧版明文搜索凭据已迁移到受保护的本地配置；"
+                            "旧备份仍需安全处置"
+                        )
+                    else:
+                        logger.warning("旧版明文搜索凭据迁移失败；已拒绝加载")
+                        for field in legacy_plaintext_fields:
+                            saved[field] = ""
+                else:
+                    for field in legacy_plaintext_fields:
+                        saved[field] = ""
             base.update({k: v for k, v in saved.items() if v})
-        except Exception as e:
-            logger.warning("加载联网搜索配置失败: %s", e)
+        except Exception:
+            logger.warning("加载联网搜索配置失败；已忽略无效的本地搜索配置")
     return base
 
 
-def _save_search_config():
+def _save_search_config(config: dict | None = None) -> bool:
+    config = SEARCH_CONFIG if config is None else config
     try:
         payload = {
             "default_providers": [
-                p for p in SEARCH_CONFIG.get("default_providers", ["tavily", "brave", "serpapi"])
+                p for p in config.get("default_providers", ["tavily", "brave", "serpapi"])
                 if p in ("tavily", "brave", "serpapi")
             ],
         }
         for field in SEARCH_CONFIG_SECRET_FIELDS:
-            if SEARCH_CONFIG.get(field):
-                payload[f"{field}_enc"] = _encrypt_ai_secret(SEARCH_CONFIG[field])
-        with open(SEARCH_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("保存联网搜索配置失败: %s", e)
+            if config.get(field):
+                payload[f"{field}_enc"] = _encrypt_ai_secret(config[field])
+        write_private_json_atomic(SEARCH_CONFIG_FILE, payload)
+        return True
+    except Exception:
+        logger.warning("保存联网搜索配置失败；未启用明文降级")
+        return False
 
 
 def _masked_search_config_status() -> dict:
@@ -991,23 +1101,40 @@ def _load_email_config() -> dict:
     }
     if os.path.exists(_EMAIL_CONFIG_FILE):
         try:
-            saved = json.load(open(_EMAIL_CONFIG_FILE, encoding="utf-8"))
-            if saved.get("smtp_password"):
-                saved["smtp_password"] = _decrypt_ai_secret(saved["smtp_password"])
-            if saved.get("smtp_password_enc") and not saved.get("smtp_password"):
-                saved["smtp_password"] = _decrypt_ai_secret(saved["smtp_password_enc"])
+            saved = read_private_json(_EMAIL_CONFIG_FILE)
+            saved_secret = (
+                saved.get("smtp_password")
+                or saved.get("smtp_password_enc")
+                or ""
+            )
+            legacy_plaintext = bool(
+                saved_secret and not str(saved_secret).startswith("fernet:")
+            )
+            if saved_secret:
+                saved["smtp_password"] = _decrypt_ai_secret(saved_secret)
+            saved.pop("smtp_password_enc", None)
+            if legacy_plaintext and saved.get("smtp_password"):
+                candidate = {**base, **saved}
+                if _save_email_config(candidate):
+                    logger.warning(
+                        "旧版明文 SMTP 凭据已迁移到受保护的本地配置；"
+                        "旧备份仍需安全处置"
+                    )
+                else:
+                    logger.warning("旧版明文 SMTP 凭据迁移失败；已拒绝加载")
+                    saved["smtp_password"] = ""
             if "to_addrs" in saved:
                 saved["to_addrs"] = _split_email_addrs(saved["to_addrs"])
             base.update({k: v for k, v in saved.items() if v not in ("", None, [])})
             base["smtp_port"] = int(base.get("smtp_port") or 465)
             base["enabled"] = bool(base.get("enabled")) and bool(base.get("to_addrs"))
-        except Exception as e:
-            logger.warning("加载邮件配置失败: %s", e)
+        except Exception:
+            logger.warning("加载邮件配置失败；已忽略无效的本地邮件配置")
     return base
 
 def _save_email_config(config: dict | None = None):
     """Persist email config without writing the app password in clear text when crypto is available."""
-    config = config or EMAIL_CONFIG
+    config = EMAIL_CONFIG if config is None else config
     try:
         payload = {
             "enabled": bool(config.get("enabled")),
@@ -1021,10 +1148,11 @@ def _save_email_config(config: dict | None = None):
         }
         if config.get("smtp_password"):
             payload["smtp_password"] = _encrypt_ai_secret(config["smtp_password"])
-        with open(_EMAIL_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("保存邮件配置失败: %s", e)
+        write_private_json_atomic(_EMAIL_CONFIG_FILE, payload)
+        return True
+    except Exception:
+        logger.warning("保存邮件配置失败；未启用明文降级")
+        return False
 
 EMAIL_CONFIG = _load_email_config()
 
@@ -1076,7 +1204,7 @@ RSS_FEEDS = [
     # ── 🇹🇼 台湾防务专项（v7.0 新增）──────────────────────────────
     {"name": "Taipei Times",         "name_cn": "台北时报",          "url": "https://www.taipeitimes.com/xml/index.rss",                    "region": "🇹🇼 台湾",   "region_en": "Taiwan",   "color": "#06B6D4", "tier": 1, "focus": "taiwan"},
     # ── 🇨🇳 中国大陆官方信息源（v7.6 新增 - PLA战备/政策/装备追踪）──────────
-    {"name": "SCMP China",           "name_cn": "南华早报中国版",     "url": "http://www.scmp.com/rss/2/feed/",                              "region": "🇭🇰 香港",   "region_en": "HK",       "color": "#B91C1C", "tier": 1, "focus": "china"},
+    {"name": "SCMP China",           "name_cn": "南华早报中国版",     "url": "https://www.scmp.com/rss/2/feed/",                             "region": "🇭🇰 香港",   "region_en": "HK",       "color": "#B91C1C", "tier": 1, "focus": "china"},
     {"name": "People's Daily EN",   "name_cn": "人民日报英文",      "url": "https://feedx.net/rss/people.xml",                             "region": "🇨🇳 中国",   "region_en": "China",    "color": "#DC2626", "tier": 1, "focus": "china", "is_prc_state": True},
     {"name": "China Daily EN",      "name_cn": "中国日报英文",      "url": "https://feedx.net/rss/chinadaily.xml",                         "region": "🇨🇳 中国",   "region_en": "China",    "color": "#B91C1C", "tier": 2, "focus": "china", "is_prc_state": True},
     {"name": "Cipher Brief",         "name_cn": "密码简报",           "url": "https://www.thecipherbrief.com/feed",                          "region": "🇺🇸 美国",   "region_en": "USA",      "color": "#DC2626", "tier": 1, "focus": "strategy"},
@@ -1466,64 +1594,23 @@ def _read_limited_response(resp: requests.Response, max_bytes: int = MAX_FETCH_B
         resp.close()
 
 
-_SSRF_HTTP_LOCAL = threading.local()
-
-
-def _ssrf_http_session() -> requests.Session:
-    """One direct, proxy-free Session per worker thread for untrusted URLs."""
-    session = getattr(_SSRF_HTTP_LOCAL, "session", None)
-    if session is None:
-        session = requests.Session()
-        session.trust_env = False
-        _SSRF_HTTP_LOCAL.session = session
-    return session
-
-
-def _connected_peer_ip(resp: requests.Response) -> str:
-    raw = getattr(resp, "raw", None)
-    candidates = [
-        getattr(getattr(raw, "_connection", None), "sock", None),
-        getattr(
-            getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None),
-            "_sock",
-            None,
-        ),
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            peer = candidate.getpeername()
-            if peer and peer[0]:
-                return str(peer[0])
-        except (AttributeError, OSError, TypeError):
-            continue
-    raise requests.RequestException("无法核验远端连接地址")
-
-
-def _validate_connected_peer(resp: requests.Response) -> None:
-    try:
-        peer_ip = _connected_peer_ip(resp)
-        blocked, blocked_addr = _is_blocked_addr(peer_ip)
-    except Exception:
-        resp.close()
-        raise
-    if blocked:
-        resp.close()
-        raise requests.RequestException(f"连接被重绑定到私有地址: {blocked_addr}")
-
-
 def _safe_get_once(url: str, headers: dict, timeout: int) -> requests.Response:
     current = url
+    redirect_cookies = requests.cookies.RequestsCookieJar()
     for redirect_idx in range(MAX_REDIRECTS + 1):
         safe, reason = _is_ssrf_safe(current)
         if not safe:
             raise requests.RequestException(f"URL不安全: {reason}")
-        resp = _ssrf_http_session().get(
-            current, headers=headers, timeout=timeout,
-            allow_redirects=False, stream=True,
-        )
-        _validate_connected_peer(resp)
+        try:
+            resp = pinned_get(
+                current,
+                headers=headers,
+                cookies=redirect_cookies,
+                timeout=timeout,
+            )
+        except UnsafeTargetError as exc:
+            raise requests.RequestException(str(exc)) from exc
+        redirect_cookies.update(resp.cookies)
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location")
             resp.close()
@@ -1582,6 +1669,61 @@ def _public_http_url(value: str) -> str:
     return parsed._replace(fragment="").geturl()
 
 
+_FEED_FAILURE_CODES = frozenset({
+    "connection_error",
+    "fetch_error",
+    "http_error",
+    "processing_error",
+    "timeout",
+    "too_many_redirects",
+    "unsafe_url",
+})
+
+
+class _FeedUrlRejected(ValueError):
+    pass
+
+
+def _feed_failure_metadata(error: BaseException) -> tuple[str, int | None]:
+    """Map an upstream failure to fixed local metadata without retaining its text."""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        status = None
+    if isinstance(error, _FeedUrlRejected):
+        code = "unsafe_url"
+    elif isinstance(error, requests.Timeout):
+        code = "timeout"
+    elif isinstance(error, requests.ConnectionError):
+        code = "connection_error"
+    elif isinstance(error, requests.TooManyRedirects):
+        code = "too_many_redirects"
+    elif isinstance(error, requests.HTTPError):
+        code = "http_error"
+    elif isinstance(error, requests.RequestException):
+        code = "fetch_error"
+    else:
+        code = "processing_error"
+    return code, status
+
+
+def _public_feed_failure_metadata(health: dict) -> tuple[str, int | None]:
+    """Normalize both current and legacy in-memory health entries for the API."""
+    candidate = health.get("last_error_code") or health.get("last_err") or ""
+    if isinstance(candidate, str) and candidate in _FEED_FAILURE_CODES:
+        code = candidate
+    else:
+        streak = health.get("fail_streak")
+        has_failure = (
+            isinstance(streak, int) and not isinstance(streak, bool) and streak > 0
+        )
+        code = "fetch_error" if has_failure else ""
+    status = health.get("last_http_status")
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        status = None
+    return code, status
+
+
 def fetch_feed(fi: dict) -> list:
     arts = []
     name = fi["name"]
@@ -1593,7 +1735,7 @@ def fetch_feed(fi: dict) -> list:
     try:
         safe, reason = _is_ssrf_safe(fi["url"])
         if not safe:
-            raise ValueError(f"RSS源URL不安全: {reason}")
+            raise _FeedUrlRejected("RSS source URL rejected")
         r = _fetch_with_retry(fi["url"], timeout=TIMEOUT, retries=retries_n)
         parsed  = feedparser.parse(r.content)
         cutoff  = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS)
@@ -1626,20 +1768,30 @@ def fetch_feed(fi: dict) -> list:
             })
         # 记录成功
         with feed_health_lock:
-            h = feed_health.setdefault(name, {"ok_cnt":0,"fail_cnt":0,"last_ok_ts":None,"last_err":"","fail_streak":0})
+            h = feed_health.setdefault(name, {"ok_cnt":0,"fail_cnt":0,"last_ok_ts":None,"last_err":"","last_error_code":"","last_http_status":None,"fail_streak":0})
             h["ok_cnt"] += 1
             h["last_ok_ts"] = datetime.now(timezone.utc).isoformat()
             h["fail_streak"] = 0
             h["last_err"] = ""
+            h["last_error_code"] = ""
+            h["last_http_status"] = None
             h["article_cnt"] = len(arts)
     except Exception as ex:
-        err_msg = str(ex)[:200]
-        logger.warning("Feed %s error: %s", name, err_msg)
+        error_code, http_status = _feed_failure_metadata(ex)
+        logger.warning(
+            "Feed %s failed code=%s http_status=%s",
+            name,
+            error_code,
+            http_status if http_status is not None else "none",
+        )
         with feed_health_lock:
-            h = feed_health.setdefault(name, {"ok_cnt":0,"fail_cnt":0,"last_ok_ts":None,"last_err":"","fail_streak":0})
+            h = feed_health.setdefault(name, {"ok_cnt":0,"fail_cnt":0,"last_ok_ts":None,"last_err":"","last_error_code":"","last_http_status":None,"fail_streak":0})
             h["fail_cnt"] += 1
             h["fail_streak"] = h.get("fail_streak", 0) + 1
-            h["last_err"] = err_msg
+            # last_err remains a fixed-code compatibility alias for existing clients.
+            h["last_err"] = error_code
+            h["last_error_code"] = error_code
+            h["last_http_status"] = http_status
     return arts
 
 def _normalize_for_dedup(text: str) -> str:
@@ -1789,10 +1941,13 @@ def favicon():
     """Avoid a noisy browser 404 without exposing an unauthenticated asset."""
     return Response(status=204)
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
+@require_auth
 def logout():
+    session_token = request.cookies.get(AUTH_COOKIE) or ""
+    if not _revoke_auth_session(session_token):
+        return jsonify({"error": "未授权"}), 401
     _clear_active_cloud_ai_credentials()
-    _revoke_auth_session(request.cookies.get(AUTH_COOKIE) or "")
     resp = make_response(redirect(url_for("login" if AUTH_REQUIRED else "index")))
     resp.delete_cookie(AUTH_COOKIE)
     resp.delete_cookie(CSRF_COOKIE)
@@ -1864,11 +2019,15 @@ def api_feeds_health():
         if status == "healthy": healthy += 1
         elif status == "unhealthy": unhealthy += 1
         elif status == "dead": dead += 1
+        error_code, http_status = _public_feed_failure_metadata(h)
         feeds_info.append({
             "name": n, "name_cn": fi.get("name_cn", n), "region": fi.get("region", ""),
             "url": fi.get("url", ""), "tier": fi.get("tier", 2),
             "ok_cnt": ok, "fail_cnt": fail, "fail_streak": streak,
-            "last_ok_ts": h.get("last_ok_ts"), "last_err": h.get("last_err", ""),
+            "last_ok_ts": h.get("last_ok_ts"),
+            "last_err": error_code,
+            "last_error_code": error_code,
+            "last_http_status": http_status,
             "article_cnt": h.get("article_cnt", 0), "status": status,
         })
     feeds_info.sort(key=lambda x: (x["status"] != "dead", x["status"] != "unhealthy", -x["fail_streak"]))
@@ -2112,7 +2271,10 @@ def _call_ai(messages, stream=False, temperature=None, max_tokens=None):
         result = resp.json()
         choices = result.get("choices")
         if not choices or not isinstance(choices, list):
-            logger.error("AI 响应缺少 choices: %s", str(result)[:300])
+            logger.error(
+                "AI 响应缺少 choices payload_type=%s",
+                type(result).__name__,
+            )
             raise ValueError("AI 返回格式异常：缺少 choices 字段")
         msg = choices[0].get("message", {})
         # 兼容部分中转代理返回 reasoning_content 而 content 为空的情况
@@ -2286,12 +2448,12 @@ def api_ai_analyze():
         return jsonify({"result": result, "mode": mode, "model": _ai_model_id()})
 
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI API 请求失败: {e.response.status_code} - {e.response.text[:200]}"}), 502
+        return jsonify({"error": f"AI API 请求失败: {e.response.status_code}"}), 502
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        logger.error("AI analyze error: %s", e)
-        return jsonify({"error": f"分析失败: {str(e)[:200]}"}), 500
+        logger.error("AI analyze error_type=%s", type(e).__name__)
+        return jsonify({"error": "分析失败"}), 500
 
 @app.route("/api/ai/stream", methods=["POST"])
 @require_auth
@@ -2545,6 +2707,8 @@ def _build_brief_user_prompt(article: dict) -> str:
 直接输出要讯全文，不要任何解释说明。"""
 
 BRIEF_WARNING_WORDS = ("值得警惕", "值得关注")
+MAX_BRIEF_TEXT_CHARS = 16 * 1024
+MAX_BRIEF_LINE_CHARS = 4 * 1024
 BRIEF_MARKDOWN_RE = re.compile(r"(?:^|\s)(#{1,6}\s|\*\*|__|```|~~~|^\s*[-*+]\s)", re.MULTILINE)
 
 BRIEF_RELATIVE_EVENT_WORDS = ("近期", "近日", "日前", "最近", "当前", "本月", "今年")
@@ -3198,6 +3362,12 @@ def _validate_brief(parsed: dict, *, source_context: dict | None = None) -> dict
 
 def _validate_brief_text(brief: str, *, source_context: dict | None = None) -> dict:
     """从原始要讯文本直接校验（先解析再校验）"""
+    if not isinstance(brief, str):
+        raise ValueError("要讯文本必须是字符串")
+    if len(brief) > MAX_BRIEF_TEXT_CHARS:
+        raise ValueError("要讯文本超过 16 KiB 字符限制")
+    if any(len(line) > MAX_BRIEF_LINE_CHARS for line in brief.splitlines()):
+        raise ValueError("要讯文本单行超过 4 KiB 字符限制")
     parsed = _parse_brief_text(brief)
     result = _validate_brief(parsed, source_context=source_context)
     result["parsed"] = parsed
@@ -3413,6 +3583,22 @@ def _safe_filename(name: str, max_len: int = 60) -> str:
     name = name.strip() or "要讯"
     return name[:max_len]
 
+
+def _public_brief_saved_name(saved_path: str) -> str:
+    """Return a truthy, display-safe save marker without exposing its directory."""
+    value = str(saved_path or "").strip()
+    if not value:
+        return ""
+    # Treat both Windows and POSIX separators as private path boundaries even
+    # when the server is running on the other platform.
+    basename = value.replace("\\", "/").rsplit("/", 1)[-1]
+    return _safe_filename(basename, max_len=180) or "saved"
+
+
+def _brief_error_type(error: BaseException) -> str:
+    """Log a stable diagnostic category, never exception text containing PII/paths."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "", type(error).__name__)[:64] or "Error"
+
 # ══════════════════════════════════════════════════════════════
 # 要讯自动落盘：每次生成完顺手写一份 .docx 到 素材库/每日新闻/
 # dev 保留项目内素材库；EXE 写入 %LOCALAPPDATA%\DefenseTracker\vault。
@@ -3446,10 +3632,10 @@ def _persist_brief_to_disk(brief_text: str, output_dir: str | None = None,
         fpath = os.path.join(output_dir, fname)
         with open(fpath, "wb") as f:
             f.write(buf.getvalue())
-        logger.info("[brief auto-save] %s", fpath)
+        logger.info("[brief auto-save] saved")
         return fpath
     except Exception as e:
-        logger.warning("[brief auto-save] failed: %s", e)
+        logger.warning("[brief auto-save] failed error_type=%s", _brief_error_type(e))
         return ""
 
 def _build_brief_docx_compiled(parsed_list: list) -> BytesIO:
@@ -3564,7 +3750,7 @@ def _write_daily_compiled_docx(briefs: list[dict], output_dir: str, now: datetim
     fpath = os.path.join(output_dir, f"要讯汇编_{now.strftime('%Y%m%d')}_共{len(parsed_list)}篇.docx")
     with open(fpath, "wb") as f:
         f.write(buf.getvalue())
-    logger.info("[daily brief compiled] %s", fpath)
+    logger.info("[daily brief compiled] saved")
     return fpath
 
 class DailyBriefIngestError(RuntimeError):
@@ -3977,7 +4163,8 @@ def _send_daily_brief_email(summary: list[dict], attachment_paths: list[str],
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = config["from_addr"]
-    msg["To"] = ", ".join(_split_email_addrs(config.get("to_addrs", [])))
+    recipients = _split_email_addrs(config.get("to_addrs", []))
+    msg["To"] = ", ".join(recipients)
     msg["Date"] = formatdate(localtime=True)
     msg.set_content("\n".join(lines))
 
@@ -4007,8 +4194,11 @@ def _send_daily_brief_email(summary: list[dict], attachment_paths: list[str],
             smtp.starttls()
         smtp.login(config["smtp_user"], config["smtp_password"])
         smtp.send_message(msg)
-    logger.info("[daily brief email] sent to %s", msg["To"])
-    return {"sent": True, "to": _split_email_addrs(config.get("to_addrs", [])), "attachments": attached}
+    logger.info(
+        "[daily brief email] sent recipient_count=%d attachment_count=%d",
+        len(recipients), len(attached),
+    )
+    return {"sent": True, "to": recipients, "attachments": attached}
 
 def run_daily_brief_job(count: int = 5, now: datetime | None = None,
                         send_email: bool = False, include_prc: bool = False) -> dict:
@@ -4026,7 +4216,7 @@ def run_daily_brief_job(count: int = 5, now: datetime | None = None,
     try:
         refresh_news()
     except Exception as e:
-        logger.warning("[daily brief] refresh_news failed: %s", e)
+        logger.warning("[daily brief] refresh_news failed error_type=%s", _brief_error_type(e))
         errors.append({"stage": "refresh", "error": str(e)[:200]})
 
     articles = []
@@ -4037,7 +4227,7 @@ def run_daily_brief_job(count: int = 5, now: datetime | None = None,
                 include_prc=include_prc,
             )
         except Exception as e:
-            logger.warning("[daily brief] candidate selection failed: %s", e)
+            logger.warning("[daily brief] candidate selection failed error_type=%s", _brief_error_type(e))
             errors.append({"stage": "selection", "error": str(e)[:200]})
 
     briefs = []
@@ -4048,7 +4238,7 @@ def run_daily_brief_job(count: int = 5, now: datetime | None = None,
         try:
             similar = find_similar_generations(title, days=7)
         except Exception as e:
-            logger.warning("[daily brief] dedupe failed for %s: %s", title, e)
+            logger.warning("[daily brief] dedupe failed error_type=%s", _brief_error_type(e))
             errors.append({"stage": "dedupe", "title": title, "error": str(e)[:200]})
             continue
         if similar:
@@ -4057,7 +4247,7 @@ def run_daily_brief_job(count: int = 5, now: datetime | None = None,
         try:
             generated = _generate_brief_for_article(article, output_dir=output_dir, now=now)
         except Exception as e:
-            logger.warning("[daily brief] generate failed for %s: %s", title, e)
+            logger.warning("[daily brief] generate failed error_type=%s", _brief_error_type(e))
             errors.append({"stage": "generate", "title": title, "error": str(e)[:200]})
             continue
         validation = generated.get("validation") if isinstance(generated, dict) else None
@@ -4086,7 +4276,7 @@ def run_daily_brief_job(count: int = 5, now: datetime | None = None,
             if not compiled_path:
                 errors.append({"stage": "compile", "error": "compiled_output_unavailable"})
         except Exception as e:
-            logger.warning("[daily brief] compile failed: %s", e)
+            logger.warning("[daily brief] compile failed error_type=%s", _brief_error_type(e))
             errors.append({"stage": "compile", "error": str(e)[:200]})
 
     package_complete = (
@@ -4103,7 +4293,7 @@ def run_daily_brief_job(count: int = 5, now: datetime | None = None,
         try:
             email_result = _send_daily_brief_email(briefs, attachments, email_config=EMAIL_CONFIG)
         except Exception as e:
-            logger.warning("[daily brief] email failed: %s", e)
+            logger.warning("[daily brief] email failed error_type=%s", _brief_error_type(e))
             email_result = {"sent": False, "reason": str(e)[:200]}
 
     status = "ok" if package_complete else ("partial" if briefs else "failed")
@@ -4334,20 +4524,27 @@ def _todays_output_files():
         ("auto", os.path.join(_DAILY_BRIEF_OUTPUT_ROOT, today)),
     ]
     for kind, d in scan:
-        if not os.path.isdir(d):
+        root = os.path.realpath(os.path.abspath(d))
+        if not os.path.isdir(root):
             continue
-        for name in os.listdir(d):
-            if not name.lower().endswith(".docx") or name.startswith("~$"):
-                continue
-            if kind == "manual" and not name.startswith(today):
-                continue  # 素材库按文件名日期前缀过滤出"今日"
-            p = os.path.join(d, name)
-            try:
-                st = os.stat(p)
-            except OSError:
-                continue
-            out.append({"name": name, "kind": kind, "size": st.st_size,
-                        "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%H:%M")})
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if not name.lower().endswith(".docx") or name.startswith("~$"):
+                        continue
+                    if kind == "manual" and not name.startswith(today):
+                        continue  # 素材库按文件名日期前缀过滤出"今日"
+                    try:
+                        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    out.append({"name": name, "kind": kind, "size": st.st_size,
+                                "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%H:%M")})
+        except OSError:
+            continue
     out.sort(key=lambda x: x["mtime"], reverse=True)
     return out
 
@@ -4357,20 +4554,94 @@ def api_brief_today_files():
     return jsonify({"files": _todays_output_files(),
                     "date": datetime.now().strftime("%Y-%m-%d")})
 
+
+def _brief_download_root(kind: str) -> str:
+    if kind == "manual":
+        configured_root = _BRIEF_OUTPUT_DIR
+    elif kind == "auto":
+        configured_root = os.path.join(
+            _DAILY_BRIEF_OUTPUT_ROOT, datetime.now().strftime("%Y%m%d")
+        )
+    else:
+        raise ValueError("unsupported output kind")
+    return os.path.realpath(os.path.abspath(configured_root))
+
+
+def _open_brief_download(root: str, name: str):
+    """Open one regular DOCX beneath root and pin the validated file descriptor."""
+    if (
+        not name
+        or name != name.strip()
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+        or "\x00" in name
+        or not name.lower().endswith(".docx")
+        or name != _safe_filename(name, max_len=255)
+    ):
+        raise ValueError("invalid document name")
+    if not os.path.isdir(root):
+        raise FileNotFoundError(name)
+
+    candidate = os.path.join(root, name)
+    try:
+        resolved = os.path.realpath(candidate)
+        if os.path.commonpath((root, resolved)) != root:
+            raise FileNotFoundError(name)
+        before = os.stat(candidate, follow_symlinks=False)
+    except (OSError, ValueError):
+        raise FileNotFoundError(name) from None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise FileNotFoundError(name)
+
+    flags = os.O_RDONLY
+    for optional_flag in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"):
+        flags |= int(getattr(os, optional_flag, 0))
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError:
+        raise FileNotFoundError(name) from None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise FileNotFoundError(name)
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        return handle
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
 @app.route("/api/brief/download_file")
 @require_auth
 def api_brief_download_file():
-    """按 kind+文件名下载今日产出（白名单目录 + basename 化，杜绝路径穿越）。"""
+    """按 kind+文件名下载今日产出（固定根、拒绝链接、句柄固定）。"""
     kind = request.args.get("kind", "manual")
-    name = os.path.basename(request.args.get("f", ""))  # 剥掉任何路径成分
-    if not name.lower().endswith(".docx"):
-        return jsonify({"error": "仅支持 .docx"}), 400
-    base = (_BRIEF_OUTPUT_DIR if kind == "manual"
-            else os.path.join(_DAILY_BRIEF_OUTPUT_ROOT, datetime.now().strftime("%Y%m%d")))
-    fpath = os.path.join(base, name)
-    if not os.path.isfile(fpath):
+    name = request.args.get("f", "")
+    try:
+        root = _brief_download_root(kind)
+        handle = _open_brief_download(root, name)
+    except ValueError:
+        return jsonify({"error": "下载参数无效"}), 400
+    except FileNotFoundError:
         return jsonify({"error": "文件不存在"}), 404
-    return send_file(fpath, as_attachment=True, download_name=name)
+    try:
+        response = send_file(
+            handle,
+            as_attachment=True,
+            download_name=name,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            max_age=0,
+        )
+    except Exception:
+        handle.close()
+        raise
+    response.call_on_close(handle.close)
+    return response
 
 @app.route("/api/translate", methods=["POST"])
 @require_auth
@@ -4400,7 +4671,7 @@ def api_translate():
     except AIBudgetExceeded as e:
         return jsonify({"error": str(e), "code": "budget"}), 429
     except Exception as e:
-        logger.warning("AI 翻译失败: %s", e)
+        logger.warning("AI 翻译失败 error_type=%s", type(e).__name__)
         return jsonify({"error": "翻译失败", "code": "ai_error"}), 502
 
 
@@ -4409,8 +4680,8 @@ def _consult_error_response(e: Exception):
         return jsonify({"error": str(e).strip("'")}), 404
     if isinstance(e, ValueError):
         return jsonify({"error": str(e)}), 400
-    logger.error("Consulting agent error: %s", e)
-    return jsonify({"error": f"防务咨询Agent处理失败: {str(e)[:200]}"}), 500
+    logger.error("Consulting agent error_type=%s", type(e).__name__)
+    return jsonify({"error": "防务咨询Agent处理失败"}), 500
 
 
 def _consult_model_info() -> dict:
@@ -4436,15 +4707,23 @@ def api_search_status():
 @require_auth
 def api_search_config():
     data = request.get_json() or {}
-    for field in SEARCH_CONFIG_SECRET_FIELDS:
-        if field in data:
-            SEARCH_CONFIG[field] = (data.get(field) or "").strip()
-    if isinstance(data.get("default_providers"), list):
-        SEARCH_CONFIG["default_providers"] = [
-            p for p in data["default_providers"]
-            if p in ("tavily", "brave", "serpapi")
-        ] or ["tavily", "brave", "serpapi"]
-    _save_search_config()
+    with _SEARCH_CONFIG_LOCK:
+        candidate = dict(SEARCH_CONFIG)
+        for field in SEARCH_CONFIG_SECRET_FIELDS:
+            if field in data:
+                candidate[field] = (data.get(field) or "").strip()
+        if isinstance(data.get("default_providers"), list):
+            candidate["default_providers"] = [
+                p for p in data["default_providers"]
+                if p in ("tavily", "brave", "serpapi")
+            ] or ["tavily", "brave", "serpapi"]
+        if not _save_search_config(candidate):
+            return jsonify({
+                "error": "联网搜索配置安全保存失败",
+                "code": "SEARCH_CONFIG_PERSISTENCE_FAILED",
+            }), 503
+        SEARCH_CONFIG.clear()
+        SEARCH_CONFIG.update(candidate)
     return jsonify({"ok": True, "status": _masked_search_config_status()})
 
 
@@ -5070,13 +5349,57 @@ def _consult_get_session_asset(session_id: str, asset_id: str) -> tuple[dict, di
     return session, asset
 
 
-def _consult_safe_asset_path(session_id: str, path: str) -> str:
+def _open_consult_asset(session_id: str, path: str):
+    """Open one archived regular file and pin the validated descriptor."""
+
     if not path:
         raise FileNotFoundError("资料文件不存在")
-    root = os.path.abspath(consulting_agent.source_archive_root(session_id))
-    resolved = os.path.abspath(path)
-    if os.path.commonpath([root, resolved]) != root or not os.path.exists(resolved):
-        raise FileNotFoundError("资料文件不存在或路径非法")
+    root = os.path.realpath(
+        os.path.abspath(consulting_agent.source_archive_root(session_id))
+    )
+    candidate = os.path.abspath(path)
+    descriptor = -1
+    try:
+        resolved = os.path.realpath(candidate)
+        if (
+            os.path.commonpath([root, resolved]) != root
+            or os.path.normcase(candidate) != os.path.normcase(resolved)
+        ):
+            raise FileNotFoundError("资料文件不存在或路径非法")
+        before = os.stat(candidate, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or bool(
+                getattr(before, "st_file_attributes", 0)
+                & 0x0400
+            )
+        ):
+            raise FileNotFoundError("资料文件不存在或路径非法")
+        flags = os.O_RDONLY
+        for optional_flag in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"):
+            flags |= int(getattr(os, optional_flag, 0))
+        descriptor = os.open(candidate, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (before.st_dev, before.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise FileNotFoundError("资料文件不存在或路径非法")
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        return handle, resolved
+    except (OSError, ValueError):
+        raise FileNotFoundError("资料文件不存在或路径非法") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _consult_safe_asset_path(session_id: str, path: str) -> str:
+    handle, resolved = _open_consult_asset(session_id, path)
+    handle.close()
     return resolved
 
 
@@ -5085,9 +5408,11 @@ def _consult_asset_is_real_pdf(session_id: str, asset: dict) -> bool:
     if document_type != "pdf" or not asset.get("local_path"):
         return False
     try:
-        path = _consult_safe_asset_path(session_id, asset.get("local_path") or "")
-        with open(path, "rb") as f:
-            return f.read(5) == b"%PDF-"
+        handle, _resolved = _open_consult_asset(
+            session_id, asset.get("local_path") or ""
+        )
+        with handle:
+            return handle.read(5) == b"%PDF-"
     except Exception:
         return False
 
@@ -5100,9 +5425,13 @@ def api_consult_asset_preview(session_id, asset_id):
         payload = asset.get("payload") or {}
         text = ""
         try:
-            text_path = _consult_safe_asset_path(session_id, asset.get("text_path") or "")
-            with open(text_path, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read(180000)
+            handle, _text_path = _open_consult_asset(
+                session_id, asset.get("text_path") or ""
+            )
+            with handle:
+                text = handle.read(720001).decode(
+                    "utf-8", errors="replace"
+                )[:180000]
         except Exception:
             text = payload.get("text") or payload.get("snippet") or ""
         if not text and asset.get("failure_reason"):
@@ -5168,21 +5497,32 @@ def api_consult_asset_preview(session_id, asset_id):
 @app.route("/api/consult/sessions/<session_id>/assets/<asset_id>/file", methods=["GET"])
 @require_auth
 def api_consult_asset_file(session_id, asset_id):
+    handle = None
     try:
         _session, asset = _consult_get_session_asset(session_id, asset_id)
-        path = _consult_safe_asset_path(session_id, asset.get("local_path") or "")
+        handle, path = _open_consult_asset(
+            session_id, asset.get("local_path") or ""
+        )
         guessed_type = mimetypes.guess_type(path)[0]
-        if (asset.get("document_type") or "").lower() == "pdf" and not _consult_asset_is_real_pdf(session_id, asset):
-            guessed_type = "text/plain; charset=utf-8"
+        if (asset.get("document_type") or "").lower() == "pdf":
+            is_real_pdf = handle.read(5) == b"%PDF-"
+            handle.seek(0)
+            if not is_real_pdf:
+                guessed_type = "text/plain; charset=utf-8"
         mimetype = guessed_type or asset.get("content_type") or "application/octet-stream"
-        return send_file(
-            path,
+        response = send_file(
+            handle,
             mimetype=mimetype,
             as_attachment=request.args.get("download") == "1",
             download_name=os.path.basename(path),
             max_age=0,
         )
+        response.call_on_close(handle.close)
+        handle = None
+        return response
     except Exception as e:
+        if handle is not None:
+            handle.close()
         return _consult_error_response(e)
 
 
@@ -6072,8 +6412,8 @@ def _agent_error_response(e: Exception):
         return jsonify({"error": str(e).strip("'")}), 404
     if isinstance(e, ValueError):
         return jsonify({"error": str(e)}), 400
-    logger.error("Report agent error: %s", e)
-    return jsonify({"error": f"报告Agent处理失败: {str(e)[:200]}"}), 500
+    logger.error("Report agent error_type=%s", type(e).__name__)
+    return jsonify({"error": "报告Agent处理失败"}), 500
 
 def _agent_selected_evidence(project_id: str, data: dict, allow_empty: bool = False) -> list[dict]:
     if "evidence_ids" not in data:
@@ -6309,9 +6649,16 @@ def _run_agent_draft_job(project_id: str, job_id: str):
                 report_agent.update_draft_job(job_id, draft_id=draft["draft_id"])
         report_agent.update_draft_job(job_id, status="done")
     except Exception as exc:
-        logger.error("报告草稿任务 %s 失败: %s", job_id, exc)
+        error_type = type(exc).__name__
+        logger.error(
+            "报告草稿任务 %s 失败 error_type=%s", job_id, error_type
+        )
         try:
-            report_agent.update_draft_job(job_id, status="failed", error=str(exc)[:240])
+            report_agent.update_draft_job(
+                job_id,
+                status="failed",
+                error=f"DRAFT_FAILED:{error_type}",
+            )
         except Exception:
             pass
 
@@ -6532,13 +6879,13 @@ def api_brief_generate():
             },
             "model": _ai_model_id(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "saved_to": saved_path,
+            "saved_to": _public_brief_saved_name(saved_path),
         })
     except requests.exceptions.HTTPError as e:
         return jsonify({"error": f"AI请求失败: {e.response.status_code}"}), 502
     except Exception as e:
-        logger.error("Brief generate error: %s", e)
-        return jsonify({"error": f"生成失败: {str(e)[:200]}"}), 500
+        logger.error("Brief generate failed error_type=%s", _brief_error_type(e))
+        return jsonify({"error": "生成失败，请稍后重试"}), 500
 
 @app.route("/api/brief/batch", methods=["POST"])
 @require_auth
@@ -6585,7 +6932,15 @@ def api_brief_batch():
                 validation = _validate_brief_text(result, source_context=source_context)
                 public_validation = _public_brief_validation(validation)
                 if validation.get("valid") is not True:
-                    raise ValueError(_brief_validation_error_text(validation))
+                    err = {
+                        "type": "error",
+                        "index": idx,
+                        "total": total,
+                        "error": _brief_validation_error_text(validation),
+                        "title": art.get("title", ""),
+                    }
+                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                    continue
                 saved_path = _persist_brief_to_disk(result, source_context=source_context)
                 article_id = record_quality_generation(
                     art,
@@ -6600,7 +6955,7 @@ def api_brief_batch():
                     "validation": public_validation,
                     "source_evidence": _brief_seal_source_context(source_context),
                     "article_id": article_id,
-                    "saved_to": saved_path,
+                    "saved_to": _public_brief_saved_name(saved_path),
                     "article": {
                         "article_id": article_id,
                         "title": art.get("title"),
@@ -6617,7 +6972,8 @@ def api_brief_batch():
                 }
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             except Exception as e:
-                err = {"type": "error", "index": idx, "total": total, "error": str(e)[:150],
+                logger.error("Brief batch failed error_type=%s", _brief_error_type(e))
+                err = {"type": "error", "index": idx, "total": total, "error": "生成失败，请稍后重试",
                        "title": art.get("title", "")}
                 yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
         yield f"data: {json.dumps({'type': 'done', 'total': total}, ensure_ascii=False)}\n\n"
@@ -6826,13 +7182,14 @@ def api_brief_import_url():
             },
             "model": _ai_model_id(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "saved_to": saved_path,
+            "saved_to": _public_brief_saved_name(saved_path),
         })
     except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"URL抓取失败: {str(e)[:200]}"}), 400
+        logger.warning("Import URL fetch failed error_type=%s", _brief_error_type(e))
+        return jsonify({"error": "URL抓取失败，请检查地址或稍后重试"}), 400
     except Exception as e:
-        logger.error("Import URL brief error: %s", e)
-        return jsonify({"error": f"生成失败: {str(e)[:200]}"}), 500
+        logger.error("Import URL brief failed error_type=%s", _brief_error_type(e))
+        return jsonify({"error": "生成失败，请稍后重试"}), 500
 
 
 @app.route("/api/brief/import_file", methods=["POST"])
@@ -6897,13 +7254,14 @@ def api_brief_import_file():
             },
             "model": _ai_model_id(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "saved_to": saved_path,
+            "saved_to": _public_brief_saved_name(saved_path),
         })
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        logger.warning("Import file rejected error_type=%s", _brief_error_type(e))
+        return jsonify({"error": "文件处理失败，请检查文件格式和内容"}), 400
     except Exception as e:
-        logger.error("Import file brief error: %s", e)
-        return jsonify({"error": f"生成失败: {str(e)[:200]}"}), 500
+        logger.error("Import file brief failed error_type=%s", _brief_error_type(e))
+        return jsonify({"error": "生成失败，请稍后重试"}), 500
 
 
 @app.route("/api/brief/import_text", methods=["POST"])
@@ -6964,11 +7322,11 @@ def api_brief_import_text():
             },
             "model": _ai_model_id(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "saved_to": saved_path,
+            "saved_to": _public_brief_saved_name(saved_path),
         })
     except Exception as e:
-        logger.error("Import text brief error: %s", e)
-        return jsonify({"error": f"生成失败: {str(e)[:200]}"}), 500
+        logger.error("Import text brief failed error_type=%s", _brief_error_type(e))
+        return jsonify({"error": "生成失败，请稍后重试"}), 500
 
 
 # ══════════════════════════════════════════════════════════════

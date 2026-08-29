@@ -1,0 +1,74 @@
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CANDIDATE_WORKFLOW = ROOT / ".github" / "workflows" / "v9-signed-candidate.yml"
+STABLE_WORKFLOW = ROOT / ".github" / "workflows" / "v9-stable-release.yml"
+
+
+def _job_block(source: str, job: str, next_job: str | None = None) -> str:
+    start = source.index(f"  {job}:\n")
+    if next_job is None:
+        return source[start:]
+    end = source.index(f"  {next_job}:\n", start)
+    return source[start:end]
+
+
+def test_signing_isolation_gate_fails_before_any_credentialed_job():
+    workflow = CANDIDATE_WORKFLOW.read_text(encoding="utf-8")
+    gate = _job_block(workflow, "signing-isolation-gate", "verify-source")
+
+    assert workflow.index("permissions: {}") < workflow.index("jobs:")
+    assert "runs-on: ubuntu-24.04" in gate
+    assert "permissions: {}" in gate
+    assert '"schema":"defense-tracker/signing-isolation-blocker/v1"' in gate
+    assert '"status":"blocked"' in gate
+    assert '"code":"SIGNING_ISOLATION_NOT_PROVISIONED"' in gate
+    assert "exit 78" in gate
+    for forbidden in (
+        "environment:",
+        "self-hosted",
+        "secrets.",
+        "id-token: write",
+        "Azure/login@",
+        "actions/upload-artifact@",
+    ):
+        assert forbidden not in gate
+
+
+def test_all_signing_environments_and_logins_are_downstream_of_failed_gate():
+    workflow = CANDIDATE_WORKFLOW.read_text(encoding="utf-8")
+    verify = _job_block(workflow, "verify-source", "prepare-installer-review")
+    prepare = _job_block(
+        workflow, "prepare-installer-review", "finalize-signed-candidate"
+    )
+    finalize = _job_block(workflow, "finalize-signed-candidate")
+
+    assert "needs: signing-isolation-gate" in verify
+    assert "      - signing-isolation-gate" in prepare
+    assert "      - verify-source" in prepare
+    assert "needs: prepare-installer-review" in finalize
+    assert "environment: v9-trusted-signing" in prepare
+    assert "environment: v9-installer-signing-review" in finalize
+    assert "Azure/login@" in prepare
+    assert "Azure/login@" in finalize
+    assert workflow.index("exit 78") < workflow.index("environment: v9-trusted-signing")
+    assert workflow.index("exit 78") < workflow.index(
+        "environment: v9-installer-signing-review"
+    )
+    assert workflow.index("exit 78") < workflow.index("Azure/login@")
+    assert "if: ${{ always() }}" not in prepare
+    assert "if: ${{ always() }}" not in finalize
+
+
+def test_failed_candidate_run_cannot_satisfy_stable_release_provenance():
+    candidate = CANDIDATE_WORKFLOW.read_text(encoding="utf-8")
+    stable = STABLE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "actions/upload-artifact@" not in _job_block(
+        candidate, "signing-isolation-gate", "verify-source"
+    )
+    assert "$candidate.conclusion -ne 'success'" in stable
+    assert "$candidate.path -ne '.github/workflows/v9-signed-candidate.yml'" in stable
+    assert "run-id: ${{ inputs.candidate_run_id }}" in stable
+    assert "name: DefenseTracker-v9.0.0-${{ inputs.release_sha }}" in stable

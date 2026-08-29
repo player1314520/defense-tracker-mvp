@@ -314,7 +314,9 @@ seal、GitHub attestation 和正式 artifact 上传全部在后续 GitHub-hosted
 `scripts/collect_deployment_evidence.py` 只从真实 HTTPS/TLS 请求、内建文件系统测量、
 仓库内固定恢复脚本的退出结果和实际文件字节生成证据。它不接受“pass”、状态码、
 延迟、哈希、记录数或任意命令作为输入，也不会保存响应正文、请求正文、header 值、
-stdout/stderr 或凭据。敏感请求值与备份/身份文件只通过**环境变量名引用**。HTTP 响应、
+stdout/stderr 或凭据。敏感请求值与备份/身份文件只通过**环境变量名引用**。响应正文只在
+内存中按严格 JSON schema 校验后丢弃；公开证据仅保存响应 SHA-256、固定语义码和随机
+challenge 的 SHA-256。HTTP 响应、
 peer certificate、TLS 版本和 cipher 来自同一条直连 socket；所有 DNS 结果及最终 peer
 必须是公网地址，不读取 `HTTP_PROXY`/`HTTPS_PROXY`，3xx 不会自动跳转。
 
@@ -373,8 +375,24 @@ secret。例如一项为：
 完整 plan 必须含 verifier 规定的 staging 或 production 全部且仅有的检查名。每个名称的
 method/path 均固定为 `/api/v9/deployment-evidence/<exact-name>` 契约；交换两个 path、改成
 `/health` 或重复端点都会在联网前失败。该路由必须由受审计的真实 E2E harness 执行对应
-流程。collector 从 verifier 内置契约取得预期状态，并在承载响应的同一 TLS 连接上记录
-证书身份：
+流程。collector 为整次 probe 生成 256-bit 随机 challenge，并用保留 header
+`X-DefenseTracker-Evidence-Challenge` 发送；plan 不能覆盖该 header。每个响应必须精确回显
+challenge，并返回固定 `check`、`result=pass`、场景专用 `result_code`、
+environment、origin、`semantic_version=9.0.0`、release SHA、`mvp-wire-v1` 和 Portal image
+digest。负向检查必须
+使用稳定语义码，例如跨角色访问是 `CROSS_ROLE_ACCESS_DENIED`，不能用通用 403/409 矩阵
+替代。正式 E2E 前，collector 还会直接请求 `/health`、`/api/status`、
+`/portal/config.json`，严格校验 V9 元数据、Supabase 模式、公共 signup 关闭、100/1000
+配额和 challenge 回显；正文、publishable key 与 challenge 原值均不写证据。
+
+联网前，collector 通过 root-controlled Docker client 对固定运行容器
+`defense-tracker-mvp-portal-1` 执行只读 inspect，只提取镜像引用、revision、wire、running 和
+health。随后用容器实际 `.Image` config ID 再次 inspect 镜像，并要求其 RepoDigests 中存在
+精确的 `repository@sha256:<64-hex>` 引用；digest 与发布输入一致，revision 与 release SHA
+一致，容器必须 running/healthy。probe 的 `runtime_portal` 同时绑定 environment、origin、
+container name、image reference、actual image ID 和 wire。因此 evidence 中的 image digest
+由运行态独立信号核对，不是原样抄写命令行。collector 从 verifier 内置契约取得预期状态，并在承载
+响应的同一 TLS 连接上记录证书身份：
 
 ```sh
 python3 scripts/collect_deployment_evidence.py probe \
@@ -396,7 +414,9 @@ python3 scripts/collect_deployment_evidence.py probe \
 不可访问。数据路径必须真实位于 `/opt/defense-tracker/`，备份状态必须真实位于
 `/var/lib/defense-tracker-backup/`，且任何符号链接或越界路径均拒绝。磁盘指标来自该
 Postgres 数据设备；备份年龄和摘要来自 `backup.sh` 在远端哈希复核后写出的固定
-`last-success` receipt，不接受任意文件 mtime。staging 固定每小时采 1 次、26 个样本并
+`last-success` receipt，不接受任意文件 mtime。每个 `/health` 样本使用新的 256-bit
+challenge 并重新验证严格 JSON 语义；观测开始和发布 JSONL 前还会再次核对运行容器身份，
+期间切换镜像会整窗失败。staging 固定每小时采 1 次、26 个样本并
 覆盖 25 小时，production 固定每分钟采 1 次、100 个样本。
 全部成功后才一次性原子发布 JSONL；进程中断不会留下可续采或可补写的成功证据：
 
@@ -583,6 +603,14 @@ staging 中先签 EXE，使用 `/fd SHA256 /tr <URL> /td SHA256`，再由 Inno S
     证明已经取得 root、collector key、审计主机控制权，或同时控制 self-hosted runner 与
     collector 的攻击者诚实。schema 3 的外部 origin-isolation 仍依赖受保护 GitHub-hosted
     workflow；本地单元测试不能替代真实 25 小时观测、两用户流程、隔离恢复和外网探测。
-11. 当前仓库只定义 `/api/v9/deployment-evidence/<exact-name>` 的客户端契约，没有包含实际
+11. 当前仓库只定义 `/api/v9/deployment-evidence/<exact-name>` 的严格 challenge/JSON 客户端
+    契约，并在 Portal 三个公开元数据端点实现受限 64-hex challenge 回显；它没有包含实际
     执行全部跨角色、PKCE、配额和浏览器流程的生产 E2E harness。对应受审计路由未独立部署
-    前 probe 会得到 404/405 并 fail-closed；不能用普通 `/health`、手填 JSON 或静态响应替代。
+    前 probe 会得到 404/405 并 fail-closed。即使伪服务复制静态字段并动态回显 challenge，
+    collector key 与审计主机仍是信任边界；只有固定 Docker 运行态身份、真实流程语义码、
+    TLS/响应摘要和外部 seal 共同通过才可验收，不能用状态矩阵、手填 JSON 或静态响应替代。
+12. Compose 的实际项目名固定为 `defense-tracker-mvp`，所以两台隔离主机上的 Portal 容器名都
+    是 `defense-tracker-mvp-portal-1`。collector 会把传入的 environment/origin 写入并校验
+    `runtime_portal` 和每个 E2E 响应，但仅凭 Docker API 不能证明 staging 与 production 确实
+    位于两台独立主机。运营方必须在独立主机、独立 Docker daemon、独立 collector unit/key 和
+    独立受保护 runner label 上采集；该外部隔离未配置或无法审计时，stable Release 继续阻断。

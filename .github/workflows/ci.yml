@@ -192,6 +192,8 @@ jobs:
             --env-file deploy/mvp/production.env.example \
             --file deploy/mvp/docker-compose.production.yml \
             config --quiet
+      - name: Build the hash-locked full-stack server image
+        run: docker build --file deploy/Dockerfile --tag defense-tracker-full-stack:ci .
       - name: Stop the local Supabase database
         if: always()
         run: supabase stop --no-backup

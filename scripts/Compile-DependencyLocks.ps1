@@ -68,6 +68,10 @@ try {
         "x86_64-pc-windows-msvc"
     Invoke-LockCompile "deploy/requirements.cloud.in" "deploy/requirements.cloud.txt" `
         "x86_64-manylinux_2_36"
+    Invoke-LockCompile "deploy/requirements.server-build.in" "deploy/requirements.server-build.txt" `
+        "x86_64-manylinux_2_36"
+    Invoke-LockCompile "deploy/requirements.server.in" "deploy/requirements.server.txt" `
+        "x86_64-manylinux_2_36"
 } finally {
     Pop-Location
 }

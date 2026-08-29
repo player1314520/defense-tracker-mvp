@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,88 @@ def test_run_daily_brief_job_saves_to_desktop_folder_without_email_by_default(mo
     assert len(list(daily_dir.glob("candidate-*.docx"))) == 5
     assert result["email"] == {"sent": False, "reason": "email_disabled"}
     assert sent == []
+
+
+def test_brief_file_logs_hide_absolute_paths(monkeypatch, tmp_path, caplog):
+    output_dir = tmp_path / "private-user" / "briefs"
+    parsed = {"title": "测试要讯"}
+    monkeypatch.setattr(tracker, "DOCX_AVAILABLE", True)
+    monkeypatch.setattr(
+        tracker,
+        "_validate_brief_text",
+        lambda *args, **kwargs: {"valid": True, "errors": [], "parsed": parsed},
+    )
+    monkeypatch.setattr(tracker, "_parse_brief_text", lambda *_args: parsed)
+    monkeypatch.setattr(tracker, "_build_brief_docx", lambda *_args: BytesIO(b"docx"))
+    monkeypatch.setattr(
+        tracker, "_build_brief_docx_compiled", lambda *_args: BytesIO(b"compiled")
+    )
+
+    with caplog.at_level("INFO", logger=tracker.logger.name):
+        saved_path = tracker._persist_brief_to_disk(
+            "valid brief", output_dir=str(output_dir)
+        )
+        compiled_path = tracker._write_daily_compiled_docx(
+            [{"brief": "valid brief", "source_article": {}}],
+            str(output_dir),
+            now=datetime(2026, 8, 14, 22, 0, 0),
+        )
+
+    assert Path(saved_path).is_file()
+    assert Path(compiled_path).is_file()
+    assert str(output_dir) not in caplog.text
+    assert "[brief auto-save] saved" in caplog.text
+    assert "[daily brief compiled] saved" in caplog.text
+
+
+def test_daily_brief_email_log_hides_recipients_but_uses_real_attachment_path(
+    monkeypatch, tmp_path, caplog
+):
+    attachment = tmp_path / "private-user" / "brief.docx"
+    attachment.parent.mkdir()
+    attachment.write_bytes(b"docx")
+    sent_messages = []
+
+    class FakeSMTP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def login(self, user, password):
+            pass
+
+        def send_message(self, message):
+            sent_messages.append(message)
+
+    monkeypatch.setattr(tracker.smtplib, "SMTP_SSL", FakeSMTP)
+    config = {
+        "enabled": True,
+        "smtp_host": "smtp.example.test",
+        "smtp_port": 465,
+        "smtp_user": "sender@example.test",
+        "smtp_password": "test-password",
+        "from_addr": "sender@example.test",
+        "to_addrs": ["recipient@example.test"],
+        "use_ssl": True,
+        "starttls": False,
+    }
+
+    with caplog.at_level("INFO", logger=tracker.logger.name):
+        result = tracker._send_daily_brief_email(
+            [], [str(attachment)], email_config=config
+        )
+
+    assert result["sent"] is True
+    assert result["attachments"] == [str(attachment)]
+    assert sent_messages
+    assert "recipient@example.test" not in caplog.text
+    assert str(attachment) not in caplog.text
+    assert "recipient_count=1" in caplog.text
 
 
 def test_generate_brief_validation_failure_does_not_persist(monkeypatch, tmp_path):

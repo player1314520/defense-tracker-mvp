@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import ast
 import base64
 import hashlib
 import json
@@ -427,6 +428,8 @@ def test_feishu_accepts_only_task_metadata_commands_and_never_echoes_text(tmp_pa
     assert "报告正文".encode() not in raw
     assert b"sensitive-chat-id" not in raw
     assert b"evt-accept" not in raw
+    assert hashlib.sha256(b"sensitive-chat-id").hexdigest().encode() not in raw
+    assert hashlib.sha256(b"evt-accept").hexdigest().encode() not in raw
 
 
 def test_feishu_webhook_rejects_token_only_stale_and_cross_tenant_events(tmp_path):
@@ -530,9 +533,10 @@ def test_cloud_deployment_allowlist_excludes_full_text_runtime():
 
     assert {"cryptography", "flask", "gunicorn"}.issubset(requirements)
     assert re.search(r"(?m)^cryptography==50\.0\.1 \\$", requirements_text)
-    assert "cryptography>=50.0.1" in (
-        root / "deploy/requirements.server.txt"
-    ).read_text(encoding="utf-8")
+    server_requirements = (root / "deploy/requirements.server.txt").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(r"(?m)^cryptography==50\.0\.1 \\$", server_requirements)
     assert requirements_text.count("--hash=sha256:") >= len(requirements)
     assert "--require-hashes" in (root / "deploy/mvp/portal.Dockerfile").read_text(
         encoding="utf-8"
@@ -544,7 +548,12 @@ def test_cloud_deployment_allowlist_excludes_full_text_runtime():
         "COPY v9_cloud.py feishu_webhook_security.py product_version.py version.json ./"
         in dockerfile
     )
+    assert dockerfile.startswith(
+        "FROM python:3.11.14-slim-bookworm@sha256:"
+        "65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d"
+    )
     assert "--require-hashes" in dockerfile
+    assert "--only-binary=:all:" in dockerfile
     for forbidden in (
         "AI_API_KEY",
         "python-docx",
@@ -566,6 +575,153 @@ def test_cloud_deployment_allowlist_excludes_full_text_runtime():
         "FEISHU_DEDUPE_DB: /data/feishu-event-dedupe.sqlite3",
     ):
         assert required in staging
+
+
+def test_full_stack_server_uses_a_reproducible_hash_lock():
+    root = Path(__file__).resolve().parents[1]
+    input_text = (root / "deploy/requirements.server.in").read_text(
+        encoding="utf-8"
+    )
+    lock_text = (root / "deploy/requirements.server.txt").read_text(
+        encoding="utf-8"
+    )
+    build_input_text = (root / "deploy/requirements.server-build.in").read_text(
+        encoding="utf-8"
+    )
+    build_lock_text = (root / "deploy/requirements.server-build.txt").read_text(
+        encoding="utf-8"
+    )
+    dockerfile = (root / "deploy/Dockerfile").read_text(encoding="utf-8")
+    dockerignore = (root / "deploy/Dockerfile.dockerignore").read_text(
+        encoding="utf-8"
+    )
+    ci_workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    compiler = (root / "scripts/Compile-DependencyLocks.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for requirements_input, requirements_lock in (
+        (input_text, lock_text),
+        (build_input_text, build_lock_text),
+    ):
+        direct = [
+            line
+            for line in requirements_input.splitlines()
+            if line and not line.startswith("#")
+        ]
+        assert direct
+        assert all(
+            re.fullmatch(r"[A-Za-z0-9_.-]+==[A-Za-z0-9_.+-]+", line)
+            for line in direct
+        )
+        locked = re.findall(
+            r"(?m)^([A-Za-z0-9_.-]+)==[A-Za-z0-9_.+-]+(?:\s*\\)?$",
+            requirements_lock,
+        )
+        assert {line.split("==", 1)[0].lower() for line in direct}.issubset(
+            {name.lower() for name in locked}
+        )
+        assert requirements_lock.count("--hash=sha256:") >= len(locked)
+
+    assert "urllib3" in {
+        name.lower()
+        for name in re.findall(
+            r"(?m)^([A-Za-z0-9_.-]+)==[A-Za-z0-9_.+-]+(?:\s*\\)?$",
+            lock_text,
+        )
+    }
+    assert dockerfile.startswith(
+        "FROM python:3.11-slim@sha256:"
+        "1042b61448fef4ba92d16a8c7eb4996d027568ce64792a7877fd88511e0af7c6"
+    )
+    assert "apt-get" not in dockerfile
+    assert "requirements.server-build.txt" in dockerfile
+    assert "--only-binary=:all:" in dockerfile
+    assert "--no-binary=sgmllib3k" in dockerfile
+    assert "--require-hashes" in dockerfile
+    assert "--no-build-isolation" in dockerfile
+    assert dockerignore.splitlines()[1] == "**"
+    allowed_context_paths = {
+        line[1:]
+        for line in dockerignore.splitlines()
+        if line.startswith("!")
+    }
+    expected_context_paths = {
+        "deploy/",
+        "deploy/Dockerfile",
+        "deploy/requirements.server-build.txt",
+        "deploy/requirements.server.txt",
+        "app.py",
+        "state.py",
+        "quality.py",
+        "tracking.py",
+        "auth_devices.py",
+        "user_state.py",
+        "feishu_bot.py",
+        "feishu_common.py",
+        "consulting_agent.py",
+        "report_agent.py",
+        "search_adapters.py",
+        "pinned_http.py",
+        "protected_secrets.py",
+        "wechat_runtime.py",
+        "product_version.py",
+        "document_safety.py",
+        "feishu_webhook_security.py",
+        "version.json",
+        "v9/",
+        "templates/",
+        "static/",
+        "static/css/",
+        "static/img/",
+        "static/js/",
+        "static/js/vendor/",
+    }
+    expected_context_paths.update(
+        path.relative_to(root).as_posix()
+        for runtime_dir in (root / "v9", root / "templates", root / "static")
+        for path in runtime_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    )
+    assert allowed_context_paths == expected_context_paths
+    assert not any(path.endswith(("/**", "/*")) for path in allowed_context_paths)
+    for forbidden_runtime_material in (
+        "**/.access_token",
+        "**/.ai_config.json",
+        "**/.feishu_config.json",
+        "**/.env.*",
+        "**/*.key",
+        "**/*.p12",
+        "**/*二维码*",
+    ):
+        assert forbidden_runtime_material in dockerignore
+    assert "docker build --file deploy/Dockerfile --tag defense-tracker-full-stack:ci ." in ci_workflow
+    app_tree = ast.parse((root / "app.py").read_text(encoding="utf-8"))
+    root_modules = {path.stem for path in root.glob("*.py")}
+    imported_root_modules = {
+        alias.name.split(".", 1)[0]
+        for node in ast.walk(app_tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module.split(".", 1)[0]
+        for node in ast.walk(app_tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    app_copy = next(
+        line for line in dockerfile.splitlines() if line.startswith("COPY app.py ")
+    )
+    copied_root_modules = {
+        Path(token).stem
+        for token in app_copy.split()[1:-1]
+        if token.endswith(".py")
+    }
+    assert imported_root_modules & root_modules <= copied_root_modules
+    assert (
+        '"deploy/requirements.server-build.in" '
+        '"deploy/requirements.server-build.txt"'
+    ) in compiler
+    assert '"deploy/requirements.server.in" "deploy/requirements.server.txt"' in compiler
 
 
 def test_public_cloud_manifests_fail_closed_and_probe_readiness():
@@ -602,6 +758,7 @@ def test_public_cloud_manifests_fail_closed_and_probe_readiness():
     for required_module in (
         "deploy/requirements.server.txt",
         "auth_devices.py",
+        "pinned_http.py",
         "product_version.py",
         "version.json",
         "document_safety.py",

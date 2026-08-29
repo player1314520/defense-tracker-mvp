@@ -2,6 +2,7 @@
 import argparse
 import base64
 import hashlib
+import io
 import json
 import re
 import struct
@@ -28,16 +29,24 @@ from scripts.package_release_assets import package_assets
 from scripts.verify_deployment_evidence import (
     CORE_PAYLOAD_FILES,
     PAYLOAD_FILES,
+    PORTAL_CONTAINER_NAME,
+    PROBE_RESULT_CODES,
     PROBE_ROUTE_SPECS,
     PRODUCTION_CHECKS,
+    PUBLIC_METADATA_PATHS,
     STAGING_CHECKS,
     seal_origin_isolation as _seal_origin_isolation,
     verify as _verify_deployment_evidence,
 )
 from scripts.verify_release_assets import verify as verify_release_assets
 from scripts.verify_release_checks import (
+    EXPECTED_CODEQL_EVENT,
+    EXPECTED_CODEQL_WORKFLOW_PATH,
     GITHUB_ACTIONS_APP_ID,
     REQUIRED_CHECKS,
+    REQUIRED_CI_CHECKS,
+    REQUIRED_CODEQL_CHECKS,
+    load_check_runs,
     verify as verify_checks,
     verify_workflow_run,
 )
@@ -202,7 +211,7 @@ def _probe(
     certificate_sha256: str,
 ) -> dict[str, object]:
     return {
-        "schema": 2,
+        "schema": 3,
         "environment": environment,
         "release_commit": COMMIT,
         "candidate_run_id": 123,
@@ -218,6 +227,30 @@ def _probe(
             "not_before_utc": _utc(started - timedelta(days=1)),
             "not_after_utc": _utc(completed + timedelta(days=30)),
         },
+        "challenge_sha256": _digest(f"{environment}-probe-challenge"),
+        "runtime_portal": {
+            "environment": environment,
+            "origin": origin,
+            "container_name": PORTAL_CONTAINER_NAME,
+            "image_reference": f"ghcr.io/example/portal@{IMAGE_DIGEST}",
+            "image_digest": IMAGE_DIGEST,
+            "image_id": "sha256:" + _digest(f"{environment}-image-config"),
+            "release_commit": COMMIT,
+            "wire_compatibility": "mvp-wire-v1",
+            "state": "healthy",
+        },
+        "public_metadata": [
+            {
+                "name": name,
+                "method": "GET",
+                "url": f"{origin}{path}",
+                "status_code": 200,
+                "elapsed_ms": 50 + index,
+                "observed_at_utc": _utc(started + timedelta(seconds=index + 1)),
+                "response_sha256": _digest(f"{environment}-public-{name}"),
+            }
+            for index, (name, path) in enumerate(PUBLIC_METADATA_PATHS.items())
+        ],
         "checks": [
             {
                 "name": name,
@@ -227,6 +260,7 @@ def _probe(
                 "elapsed_ms": 100 + index,
                 "observed_at_utc": _utc(started + timedelta(seconds=index + 1)),
                 "response_sha256": _digest(f"{environment}-{name}"),
+                "result_code": PROBE_RESULT_CODES[name],
             }
             for index, (name, status) in enumerate(checks.items())
         ],
@@ -247,7 +281,7 @@ def _observations(
         records.append(
             json.dumps(
                 {
-                    "schema": 2,
+                    "schema": 3,
                     "environment": environment,
                     "release_commit": COMMIT,
                     "candidate_run_id": 123,
@@ -264,6 +298,10 @@ def _observations(
                         f"{environment}-backup-receipt-{index}"
                     ),
                     "response_sha256": _digest(f"{environment}-sample-{index}"),
+                    "challenge_sha256": _digest(
+                        f"{environment}-sample-challenge-{index}"
+                    ),
+                    "semantic_code": "PUBLIC_HEALTH_OK",
                 },
                 separators=(",", ":"),
             )
@@ -958,6 +996,8 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
     assert "origin_pattern='^https://" in deployment
     assert "runs-on: ubuntu-24.04" in deployment
     assert "if: github.ref == 'refs/heads/main'" in deployment
+    assert deployment.count("ref: ${{ github.sha }}") == 3
+    assert "ref: ${{ inputs.release_sha }}" not in deployment
     assert "git ls-remote --exit-code origin refs/heads/main" in deployment
     assert "probe-origin-isolation.py" in deployment
     assert "DEFENSE_TRACKER_STAGING_ORIGIN_TARGET: ${{ secrets." in deployment
@@ -968,6 +1008,7 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
         "  seal-live-evidence:", 1
     )[0]
     seal_job = deployment.split("  seal-live-evidence:", 1)[1]
+    assert "needs: verify-origin-isolation" in collect_job
     assert "runs-on: [self-hosted, Linux, X64, defense-deploy-auditor]" in collect_job
     assert "COLLECTOR_KEY_ID" not in collect_job
     assert "COLLECTOR_PUBLIC_KEY_SHA256" not in collect_job
@@ -1074,47 +1115,413 @@ def test_deployment_evidence_lock_uses_audited_cryptography_release():
     assert "python -m pip check" in workflow
 
 
-def test_required_check_gate_rejects_any_non_success():
-    successful = [
+def _required_check_suite(run_id, suite_id, names):
+    return [
         {
             "name": name,
             "status": "completed",
             "conclusion": "success",
             "app": {"id": GITHUB_ACTIONS_APP_ID, "slug": "github-actions"},
-            "details_url": "https://github.com/owner/repo/actions/runs/123/job/456",
-            "check_suite": {"id": 789},
+            "details_url": (
+                f"https://github.com/owner/repo/actions/runs/{run_id}/job/456"
+            ),
+            "check_suite": {"id": suite_id},
         }
-        for name in REQUIRED_CHECKS
+        for name in names
     ]
-    assert verify_checks(successful, repository="owner/repo") == 123
+
+
+def _required_ci_check_suite(run_id, suite_id):
+    return _required_check_suite(run_id, suite_id, REQUIRED_CI_CHECKS)
+
+
+def _required_codeql_check_suite(run_id, suite_id):
+    return _required_check_suite(run_id, suite_id, REQUIRED_CODEQL_CHECKS)
+
+
+def _required_ci_workflow_run(run_id, suite_id, **overrides):
+    workflow = {
+        "id": run_id,
+        "check_suite_id": suite_id,
+        "head_sha": COMMIT,
+        "head_branch": "main",
+        "path": ".github/workflows/ci.yml",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+        "repository": {"full_name": "owner/repo"},
+    }
+    workflow.update(overrides)
+    return workflow
+
+
+def _required_codeql_workflow_run(run_id, suite_id, **overrides):
+    workflow = _required_ci_workflow_run(
+        run_id,
+        suite_id,
+        path=EXPECTED_CODEQL_WORKFLOW_PATH,
+        event=EXPECTED_CODEQL_EVENT,
+    )
+    workflow.update(overrides)
+    return workflow
+
+
+def test_required_check_loader_fetches_every_reported_page(monkeypatch):
+    payloads = iter(
+        [
+            {
+                "total_count": 101,
+                "check_runs": [{"id": value} for value in range(1, 101)],
+            },
+            {"total_count": 101, "check_runs": [{"id": 101}]},
+        ]
+    )
+    requested_urls = []
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 30
+        requested_urls.append(request.full_url)
+        return io.BytesIO(json.dumps(next(payloads)).encode("utf-8"))
+
+    monkeypatch.setattr(
+        "scripts.verify_release_checks.urllib.request.urlopen", fake_urlopen
+    )
+
+    check_runs = load_check_runs("owner/repo", COMMIT, "token")
+
+    assert [run["id"] for run in check_runs] == list(range(1, 102))
+    assert requested_urls[0].endswith("filter=latest&page=1")
+    assert requested_urls[1].endswith("filter=latest&page=2")
+
+
+@pytest.mark.parametrize(
+    "second_page",
+    [
+        {"total_count": 102, "check_runs": [{"id": 101}]},
+        {"total_count": 101, "check_runs": []},
+    ],
+)
+def test_required_check_loader_rejects_changed_or_truncated_pagination(
+    monkeypatch, second_page
+):
+    payloads = iter(
+        [
+            {
+                "total_count": 101,
+                "check_runs": [{"id": value} for value in range(1, 101)],
+            },
+            second_page,
+        ]
+    )
+
+    def fake_urlopen(_request, timeout):
+        assert timeout == 30
+        return io.BytesIO(json.dumps(next(payloads)).encode("utf-8"))
+
+    monkeypatch.setattr(
+        "scripts.verify_release_checks.urllib.request.urlopen", fake_urlopen
+    )
+
+    with pytest.raises(ValueError, match="pagination"):
+        load_check_runs("owner/repo", COMMIT, "token")
+
+
+def test_required_check_gate_rejects_any_non_success():
+    successful = _required_ci_check_suite(123, 789) + _required_codeql_check_suite(
+        223, 889
+    )
+    workflow_runs = {
+        123: _required_ci_workflow_run(123, 789),
+        223: _required_codeql_workflow_run(223, 889),
+    }
+    assert (
+        verify_checks(
+            successful,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader=workflow_runs.__getitem__,
+        )
+        == 123
+    )
     successful[0]["conclusion"] = "failure"
     with pytest.raises(ValueError, match="not green"):
-        verify_checks(successful, repository="owner/repo")
+        verify_checks(
+            successful,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader=workflow_runs.__getitem__,
+        )
 
 
 def test_required_check_gate_rejects_spoofed_or_mixed_sources():
-    successful = [
-        {
-            "name": name,
-            "status": "completed",
-            "conclusion": "success",
-            "app": {"id": GITHUB_ACTIONS_APP_ID, "slug": "github-actions"},
-            "details_url": "https://github.com/owner/repo/actions/runs/123/job/456",
-            "check_suite": {"id": 789},
-        }
-        for name in REQUIRED_CHECKS
-    ]
+    successful = _required_ci_check_suite(123, 789) + _required_codeql_check_suite(
+        223, 889
+    )
     successful[0]["app"] = {"id": 999, "slug": "third-party-checks"}
     with pytest.raises(ValueError, match="untrusted publisher"):
-        verify_checks(successful, repository="owner/repo")
+        verify_checks(
+            successful,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: _required_ci_workflow_run(123, 789),
+                223: _required_codeql_workflow_run(223, 889),
+            }.__getitem__,
+        )
     successful[0]["app"] = {"id": GITHUB_ACTIONS_APP_ID, "slug": "github-actions"}
     successful[0]["details_url"] = "https://github.com/owner/repo/actions/runs/124/job/456"
-    with pytest.raises(ValueError, match="one workflow run"):
-        verify_checks(successful, repository="owner/repo")
+    with pytest.raises(ValueError, match="missing"):
+        verify_checks(
+            successful,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: _required_ci_workflow_run(123, 789),
+                124: _required_ci_workflow_run(124, 789, event="workflow_dispatch"),
+                223: _required_codeql_workflow_run(223, 889),
+            }.__getitem__,
+        )
     successful[0]["details_url"] = "https://github.com/owner/repo/actions/runs/123/job/456"
     successful.append(dict(successful[0]))
     with pytest.raises(ValueError, match="duplicates"):
-        verify_checks(successful, repository="owner/repo")
+        verify_checks(
+            successful,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: _required_ci_workflow_run(123, 789),
+                223: _required_codeql_workflow_run(223, 889),
+            }.__getitem__,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"repository": "owner/repo"},
+        {"repository": "owner/repo", "sha": COMMIT},
+    ],
+)
+def test_required_check_gate_rejects_missing_provenance_inputs(kwargs):
+    with pytest.raises(ValueError, match="required for provenance"):
+        verify_checks([], **kwargs)
+
+
+def test_required_check_gate_selects_exact_push_suite_among_duplicate_named_runs():
+    check_runs = (
+        _required_ci_check_suite(124, 790)
+        + _required_ci_check_suite(125, 791)
+        + _required_ci_check_suite(123, 789)
+        + _required_codeql_check_suite(223, 889)
+    )
+    workflow_runs = {
+        123: _required_ci_workflow_run(123, 789),
+        124: _required_ci_workflow_run(124, 790, event="workflow_dispatch"),
+        125: _required_ci_workflow_run(
+            125, 791, event="workflow_dispatch", conclusion="cancelled"
+        ),
+        223: _required_codeql_workflow_run(223, 889),
+    }
+
+    assert (
+        verify_checks(
+            check_runs,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader=workflow_runs.__getitem__,
+        )
+        == 123
+    )
+
+
+@pytest.mark.parametrize("invalid_shape", ["missing", "duplicate", "failure"])
+def test_required_check_gate_rejects_invalid_selected_push_suite(invalid_shape):
+    check_runs = _required_ci_check_suite(123, 789)
+    if invalid_shape == "missing":
+        check_runs.pop()
+        expected_error = "missing"
+    elif invalid_shape == "duplicate":
+        check_runs.append(dict(check_runs[0]))
+        expected_error = "duplicates"
+    else:
+        check_runs[0]["conclusion"] = "failure"
+        expected_error = "failed"
+    check_runs += _required_ci_check_suite(124, 790)
+    check_runs += _required_codeql_check_suite(223, 889)
+    workflow_runs = {
+        123: _required_ci_workflow_run(123, 789),
+        124: _required_ci_workflow_run(124, 790, event="workflow_dispatch"),
+        223: _required_codeql_workflow_run(223, 889),
+    }
+
+    with pytest.raises(ValueError, match=expected_error):
+        verify_checks(
+            check_runs,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader=workflow_runs.__getitem__,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("event", "workflow_dispatch"),
+        ("head_sha", "c" * 40),
+        ("path", ".github/workflows/spoof.yml"),
+        ("conclusion", "failure"),
+        ("check_suite_id", 999),
+    ],
+)
+def test_required_check_gate_rejects_wrong_workflow_provenance(field, value):
+    workflow = _required_ci_workflow_run(123, 789)
+    workflow[field] = value
+
+    with pytest.raises(ValueError, match="exactly one successful push CI suite"):
+        verify_checks(
+            _required_ci_check_suite(123, 789)
+            + _required_codeql_check_suite(223, 889),
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: workflow,
+                223: _required_codeql_workflow_run(223, 889),
+            }.__getitem__,
+        )
+
+
+def test_required_check_gate_rejects_multiple_exact_push_suites():
+    workflow_runs = {
+        123: _required_ci_workflow_run(123, 789),
+        124: _required_ci_workflow_run(124, 790),
+        223: _required_codeql_workflow_run(223, 889),
+    }
+
+    with pytest.raises(ValueError, match="exactly one successful push CI suite"):
+        verify_checks(
+            _required_ci_check_suite(123, 789)
+            + _required_ci_check_suite(124, 790)
+            + _required_codeql_check_suite(223, 889),
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader=workflow_runs.__getitem__,
+        )
+
+
+def test_required_check_gate_matches_all_nine_protected_branch_checks():
+    assert REQUIRED_CHECKS == {
+        "Public tree policy",
+        "JavaScript tests and reproducible bundles",
+        "Supabase Edge Functions",
+        "MVP deployment assets",
+        "Python 3.11 (ubuntu-latest)",
+        "Python 3.11 (windows-latest)",
+        "Analyze (actions)",
+        "Analyze (javascript-typescript)",
+        "Analyze (python)",
+    }
+    assert REQUIRED_CI_CHECKS.isdisjoint(REQUIRED_CODEQL_CHECKS)
+
+
+@pytest.mark.parametrize("invalid_shape", ["missing", "duplicate", "failure", "pending"])
+def test_required_check_gate_rejects_invalid_codeql_suite(invalid_shape):
+    codeql_runs = _required_codeql_check_suite(223, 889)
+    if invalid_shape == "missing":
+        codeql_runs.pop()
+        expected_error = "missing"
+    elif invalid_shape == "duplicate":
+        codeql_runs.append(dict(codeql_runs[0]))
+        expected_error = "duplicates"
+    elif invalid_shape == "failure":
+        codeql_runs[0]["conclusion"] = "failure"
+        expected_error = "failed"
+    else:
+        codeql_runs[0]["status"] = "in_progress"
+        codeql_runs[0]["conclusion"] = None
+        expected_error = "failed"
+
+    with pytest.raises(ValueError, match=expected_error):
+        verify_checks(
+            _required_ci_check_suite(123, 789) + codeql_runs,
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: _required_ci_workflow_run(123, 789),
+                223: _required_codeql_workflow_run(223, 889),
+            }.__getitem__,
+        )
+
+
+def test_required_check_gate_rejects_all_codeql_checks_missing():
+    with pytest.raises(ValueError, match="CodeQL.*found=0"):
+        verify_checks(
+            _required_ci_check_suite(123, 789),
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={123: _required_ci_workflow_run(123, 789)}.__getitem__,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("event", "push"),
+        ("head_sha", "c" * 40),
+        ("head_branch", "release"),
+        ("path", ".github/workflows/codeql.yml"),
+        ("status", "in_progress"),
+        ("conclusion", "failure"),
+        ("check_suite_id", 999),
+    ],
+)
+def test_required_check_gate_rejects_wrong_codeql_provenance(field, value):
+    codeql_workflow = _required_codeql_workflow_run(223, 889)
+    codeql_workflow[field] = value
+
+    with pytest.raises(ValueError, match="exactly one successful dynamic CodeQL suite"):
+        verify_checks(
+            _required_ci_check_suite(123, 789)
+            + _required_codeql_check_suite(223, 889),
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: _required_ci_workflow_run(123, 789),
+                223: codeql_workflow,
+            }.__getitem__,
+        )
+
+
+def test_required_check_gate_rejects_multiple_exact_codeql_suites():
+    with pytest.raises(ValueError, match="exactly one successful dynamic CodeQL suite"):
+        verify_checks(
+            _required_ci_check_suite(123, 789)
+            + _required_codeql_check_suite(223, 889)
+            + _required_codeql_check_suite(224, 890),
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: _required_ci_workflow_run(123, 789),
+                223: _required_codeql_workflow_run(223, 889),
+                224: _required_codeql_workflow_run(224, 890),
+            }.__getitem__,
+        )
+
+
+def test_required_check_gate_rejects_cross_workflow_check_mixing():
+    ci_runs = _required_ci_check_suite(123, 789)
+    ci_runs.append(_required_codeql_check_suite(123, 789)[0])
+
+    with pytest.raises(ValueError, match="another workflow"):
+        verify_checks(
+            ci_runs + _required_codeql_check_suite(223, 889),
+            repository="owner/repo",
+            sha=COMMIT,
+            workflow_run_loader={
+                123: _required_ci_workflow_run(123, 789),
+                223: _required_codeql_workflow_run(223, 889),
+            }.__getitem__,
+        )
 
 
 def test_required_ci_workflow_run_is_exact_main_push():
@@ -1152,6 +1559,101 @@ def test_deployment_evidence_schema_3_binds_raw_evidence_and_recomputes_threshol
         expected_image_digest=IMAGE_DIGEST,
         expected_candidate_run_id=123,
     )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda probe: probe["checks"][0].update(
+                {"result_code": "GENERIC_STATUS_OK"}
+            ),
+            "wrong semantic code",
+        ),
+        (
+            lambda probe: probe["runtime_portal"].update(
+                {"image_digest": "sha256:" + "0" * 64}
+            ),
+            "runtime Portal identity mismatch",
+        ),
+        (
+            lambda probe: probe.update(
+                {
+                    "schema": 2,
+                    "checks": [
+                        {
+                            key: value
+                            for key, value in check.items()
+                            if key != "result_code"
+                        }
+                        for check in probe["checks"]
+                    ],
+                }
+            ),
+            "schema or environment mismatch",
+        ),
+    ],
+)
+def test_signed_probe_still_rejects_generic_semantics_runtime_drift_or_legacy_schema(
+    tmp_path, mutation, error
+):
+    generated = _write_schema_3_evidence(tmp_path)
+    path = tmp_path / "staging-probe.json"
+    probe = json.loads(path.read_text(encoding="utf-8"))
+    mutation(probe)
+    path.write_text(json.dumps(probe, separators=(",", ":")), encoding="utf-8")
+    _refresh_evidence_manifest(tmp_path, generated)
+    with pytest.raises(ValueError, match=error):
+        verify_deployment_evidence(
+            tmp_path,
+            expected_commit=COMMIT,
+            expected_image_digest=IMAGE_DIGEST,
+            expected_candidate_run_id=123,
+        )
+
+
+def test_stable_verifier_rejects_old_probe_even_with_fresh_observations(tmp_path):
+    generated = _write_schema_3_evidence(tmp_path)
+    path = tmp_path / "staging-probe.json"
+    probe = json.loads(path.read_text(encoding="utf-8"))
+    started = generated - timedelta(hours=50)
+    completed = started + timedelta(minutes=20)
+    probe["started_at_utc"] = _utc(started)
+    probe["completed_at_utc"] = _utc(completed)
+    probe["tls"]["not_before_utc"] = _utc(started - timedelta(days=1))
+    probe["tls"]["not_after_utc"] = _utc(generated + timedelta(days=1))
+    for index, row in enumerate([*probe["public_metadata"], *probe["checks"]]):
+        row["observed_at_utc"] = _utc(started + timedelta(seconds=index + 1))
+    path.write_text(json.dumps(probe, separators=(",", ":")), encoding="utf-8")
+    _refresh_evidence_manifest(tmp_path, generated)
+    with pytest.raises(ValueError, match="Staging probe evidence is stale"):
+        verify_deployment_evidence(
+            tmp_path,
+            expected_commit=COMMIT,
+            expected_image_digest=IMAGE_DIGEST,
+            expected_candidate_run_id=123,
+        )
+
+
+def test_stable_verifier_rejects_old_observations_even_with_fresh_probe(tmp_path):
+    generated = _write_schema_3_evidence(tmp_path)
+    path = tmp_path / "production-observations.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    started = generated - timedelta(minutes=50)
+    for index, row in enumerate(rows):
+        row["observed_at_utc"] = _utc(started + timedelta(seconds=index * 10))
+    path.write_text(
+        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    _refresh_evidence_manifest(tmp_path, generated)
+    with pytest.raises(ValueError, match="Production observation evidence is stale"):
+        verify_deployment_evidence(
+            tmp_path,
+            expected_commit=COMMIT,
+            expected_image_digest=IMAGE_DIGEST,
+            expected_candidate_run_id=123,
+        )
 
 
 def test_deployment_evidence_seals_legacy_manifest_without_publishing_screenshots(tmp_path):

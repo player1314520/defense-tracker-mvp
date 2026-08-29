@@ -36,6 +36,8 @@ from v9.cloud import validate_ciphertext_event
 
 _TASK_ID = re.compile(r"^[A-Z][A-Z0-9_-]{5,63}$")
 _FULL_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+_EVIDENCE_CHALLENGE = re.compile(r"^[0-9a-f]{64}$")
+_EVIDENCE_CHALLENGE_HEADER = "X-DefenseTracker-Evidence-Challenge"
 _WIRE_COMPATIBILITY = "mvp-wire-v1"
 _TASK_ACTIONS = {"claim", "approve", "status"}
 _TASK_STATUSES = {
@@ -51,6 +53,16 @@ _TASK_STATUSES = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _opaque_audit_id(secret: str, domain: bytes, value: str) -> str:
+    """Create a deployment-scoped opaque identifier for audit correlation."""
+
+    return hmac.new(
+        secret.encode("utf-8"),
+        domain + b"\0" + value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _resolve_build_commit(explicit: str | None = None) -> str:
@@ -416,6 +428,17 @@ def create_app(
 
         return wrapped
 
+    def public_metadata_response(payload: dict[str, object]):
+        """Echo only a bounded random audit challenge; never reflect arbitrary text."""
+
+        challenge = request.headers.get(_EVIDENCE_CHALLENGE_HEADER)
+        if challenge is not None:
+            if _EVIDENCE_CHALLENGE.fullmatch(challenge) is None:
+                return jsonify({"error_code": "INVALID_EVIDENCE_CHALLENGE"}), 400
+            payload["evidence_challenge"] = challenge
+            payload["semantic_version"] = PRODUCT_VERSION.semantic_version
+        return jsonify(payload)
+
     @application.after_request
     def security_headers(response):
         origin = request.headers.get("Origin", "").rstrip("/")
@@ -454,7 +477,7 @@ def create_app(
 
     @application.get("/health")
     def health():
-        return jsonify({
+        return public_metadata_response({
             "status": "ok",
             "mode": "ciphertext-only",
             "sync_backend": (
@@ -481,7 +504,7 @@ def create_app(
 
     @application.get("/api/status")
     def api_status():
-        return jsonify({
+        return public_metadata_response({
             "status": "ok",
             "mode": "ciphertext-only",
             "sync_backend": (
@@ -501,7 +524,7 @@ def create_app(
     @application.get("/portal/config.json")
     def portal_config():
         configured = public_supabase_config is not None
-        return jsonify({
+        return public_metadata_response({
             "configured": configured,
             "url": supabase_url if configured else None,
             "publishable_key": (
@@ -669,8 +692,16 @@ def create_app(
             ):
                 return jsonify({"accepted": False})
             action, task_id = parts[0].lower(), parts[1]
-            actor_hash = hashlib.sha256(chat_id.encode()).hexdigest()
-            event_hash = hashlib.sha256(event_id.encode()).hexdigest()
+            actor_hash = _opaque_audit_id(
+                verify_token,
+                b"DefenseTracker Feishu actor audit id v1",
+                chat_id,
+            )
+            event_hash = _opaque_audit_id(
+                verify_token,
+                b"DefenseTracker Feishu event audit id v1",
+                event_id,
+            )
             store.record_command(event_hash, action, task_id, actor_hash)
             return jsonify(
                 {"accepted": True, "action": action, "task_id": task_id}

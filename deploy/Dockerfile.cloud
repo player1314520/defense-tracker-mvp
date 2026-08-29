@@ -1,16 +1,16 @@
-FROM python:3.11-slim
+FROM python:3.11.14-slim-bookworm@sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d
 
 WORKDIR /app
 
 COPY deploy/requirements.cloud.txt requirements.txt
-RUN pip install --no-cache-dir --require-hashes -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
 
 ARG DEFENSE_TRACKER_BUILD_COMMIT
 RUN printf '%s' "$DEFENSE_TRACKER_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 ENV DEFENSE_TRACKER_BUILD_COMMIT=${DEFENSE_TRACKER_BUILD_COMMIT}
 
 COPY v9_cloud.py feishu_webhook_security.py product_version.py version.json ./
-COPY v9/__init__.py v9/cloud.py ./v9/
+COPY v9/__init__.py v9/cloud.py v9/redaction.py ./v9/
 COPY web/v9-portal ./web/v9-portal
 
 RUN useradd -m -u 1000 appuser \

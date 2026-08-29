@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 import threading
 import time
@@ -228,17 +229,26 @@ class V9Service:
         temporary = path.with_name(
             f".{path.name}.{uuid.uuid4().hex}.tmp"
         )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = -1
         try:
-            with temporary.open("xb") as handle:
+            descriptor = os.open(temporary, flags, 0o600)
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+                raise OSError("unsafe local master key target")
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            try:
-                os.chmod(temporary, 0o600)
-            except OSError:
-                pass
             os.replace(temporary, path)
         finally:
+            if descriptor >= 0:
+                os.close(descriptor)
             temporary.unlink(missing_ok=True)
 
     def _harden_matching_legacy_master_keys(

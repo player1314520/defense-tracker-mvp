@@ -158,6 +158,8 @@ def _pyinstaller_args() -> list[str]:
         "report_agent",
         "consulting_agent",
         "search_adapters",
+        "protected_secrets",
+        "wechat_runtime",
         "product_version",
         "quality",
         "state",

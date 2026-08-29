@@ -594,44 +594,110 @@ document.querySelectorAll('.filter-btn').forEach(btn => {
 
 // 新闻源状态
 let feedHealthCache = null;
+
+const FEED_ERROR_LABELS = Object.freeze({
+  connection_error: '连接失败',
+  fetch_error: '抓取失败',
+  http_error: '上游 HTTP 错误',
+  processing_error: '内容处理失败',
+  timeout: '请求超时',
+  too_many_redirects: '重定向过多',
+  unsafe_url: '地址被安全策略拒绝',
+});
+
+function feedFailureText(health) {
+  const code = String(health?.last_error_code || '');
+  const label = Object.prototype.hasOwnProperty.call(FEED_ERROR_LABELS, code)
+    ? FEED_ERROR_LABELS[code]
+    : '';
+  const status = health?.last_http_status;
+  const http = Number.isInteger(status) && status >= 100 && status <= 599
+    ? `HTTP ${status}`
+    : '';
+  return [label, http].filter(Boolean).join(' · ');
+}
+
+function appendFeedText(parent, className, text, tagName = 'span') {
+  const node = document.createElement(tagName);
+  node.className = className;
+  node.textContent = String(text);
+  parent.append(node);
+  return node;
+}
+
+function renderFeedStatusView(el, entries, errors, healthPayload) {
+  const errorNames = new Set(Array.isArray(errors) ? errors : []);
+  const healthMap = Object.create(null);
+  for (const health of healthPayload?.feeds || []) {
+    if (health && typeof health.name === 'string') healthMap[health.name] = health;
+  }
+  const fallbackHealthy = entries.filter(([name]) => !errorNames.has(name)).length;
+  const fallbackUnhealthy = errorNames.size;
+  const safeCount = (value, fallback) => (
+    Number.isInteger(value) && value >= 0 ? value : fallback
+  );
+  const healthyN = safeCount(healthPayload?.healthy, fallbackHealthy);
+  const unhealthyN = safeCount(healthPayload?.unhealthy, fallbackUnhealthy);
+  const deadN = safeCount(healthPayload?.dead, 0);
+  const totalN = safeCount(healthPayload?.total, entries.length);
+
+  const summary = document.createElement('div');
+  summary.className = 'feed-summary';
+  appendFeedText(summary, 'feed-summary-total', `${totalN} 源`);
+  appendFeedText(summary, 'feed-summary-ok', `✓ ${healthyN}`);
+  if (unhealthyN) appendFeedText(summary, 'feed-summary-warn', `⚠ ${unhealthyN}`);
+  if (deadN) appendFeedText(summary, 'feed-summary-dead', `✕ ${deadN}`);
+  const toggle = appendFeedText(summary, 'feed-summary-toggle', '展开', 'button');
+  toggle.type = 'button';
+  toggle.id = 'feedDetailsToggle';
+  toggle.addEventListener('click', toggleFeedDetails);
+
+  const details = document.createElement('div');
+  details.className = 'feed-details';
+  details.id = 'feedDetails';
+  details.style.display = 'none';
+  for (const [name, rawCount] of entries) {
+    const health = healthMap[name] || {};
+    const failure = feedFailureText(health);
+    const streak = Number.isInteger(health.fail_streak) && health.fail_streak > 0
+      ? health.fail_streak
+      : 0;
+    const row = document.createElement('div');
+    row.className = 'feed-row';
+    appendFeedText(row, `feed-dot ${errorNames.has(name) ? 'err' : 'ok'}`, '');
+    const feedName = appendFeedText(row, 'feed-name', name);
+    feedName.title = failure ? `${name} · ${failure}` : String(name);
+    if (streak) {
+      const badge = appendFeedText(row, 'feed-streak', `✕${streak}`);
+      badge.title = failure
+        ? `连续失败${streak}次：${failure}`
+        : `连续失败${streak}次`;
+    }
+    const count = Number.isInteger(rawCount) && rawCount >= 0 ? rawCount : 0;
+    appendFeedText(row, 'feed-count', count);
+    details.append(row);
+  }
+  el.replaceChildren(summary, details);
+}
+
 async function renderFeedStatus(stats, errors) {
   const el = document.getElementById('feedStatus');
   if (!el) return;
   const entries = Object.entries(stats || {});
-  if (!entries.length) { el.innerHTML = '<div style="padding:12px;color:var(--text-3);font-size:12px">加载中…</div>'; return; }
+  if (!entries.length) {
+    const loading = appendFeedText(el, 'feed-loading', '加载中…', 'div');
+    loading.style.padding = '12px';
+    loading.style.color = 'var(--text-3)';
+    loading.style.fontSize = '12px';
+    el.replaceChildren(loading);
+    return;
+  }
   // 尝试拉取健康档案（带连续失败数）
   try {
     const r = await apiFetch('/api/feeds/health');
     feedHealthCache = await r.json();
   } catch(e) { feedHealthCache = null; }
-  const healthMap = {};
-  if (feedHealthCache && feedHealthCache.feeds) {
-    for (const f of feedHealthCache.feeds) healthMap[f.name] = f;
-  }
-  const healthyN = feedHealthCache?.healthy || entries.filter(([n])=>!errors.includes(n)).length;
-  const unhealthyN = feedHealthCache?.unhealthy || errors.length;
-  const deadN = feedHealthCache?.dead || 0;
-  const totalN = feedHealthCache?.total || entries.length;
-  const summary = `<div class="feed-summary">
-    <span class="feed-summary-total">${totalN} 源</span>
-    <span class="feed-summary-ok">✓ ${healthyN}</span>
-    ${unhealthyN?`<span class="feed-summary-warn">⚠ ${unhealthyN}</span>`:''}
-    ${deadN?`<span class="feed-summary-dead">✕ ${deadN}</span>`:''}
-    <button class="feed-summary-toggle" onclick="toggleFeedDetails()" id="feedDetailsToggle">展开</button>
-  </div>`;
-  const rows = entries.map(([name, count]) => {
-    const ok = !errors.includes(name);
-    const h = healthMap[name] || {};
-    const streak = h.fail_streak || 0;
-    const streakBadge = streak > 0 ? `<span class="feed-streak" title="连续失败${streak}次${h.last_err?'：'+h.last_err.slice(0,80):''}">✕${streak}</span>` : '';
-    return `<div class="feed-row">
-      <span class="feed-dot ${ok?'ok':'err'}"></span>
-      <span class="feed-name" title="${escHtml(name)}${h.last_err?' · '+escHtml(h.last_err.slice(0,100)):''}">${escHtml(name)}</span>
-      ${streakBadge}
-      <span class="feed-count">${count}</span>
-    </div>`;
-  }).join('');
-  el.innerHTML = summary + `<div class="feed-details" id="feedDetails" style="display:none">${rows}</div>`;
+  renderFeedStatusView(el, entries, errors, feedHealthCache);
 }
 function toggleFeedDetails() {
   const det = document.getElementById('feedDetails');
@@ -640,6 +706,47 @@ function toggleFeedDetails() {
   const show = det.style.display === 'none';
   det.style.display = show ? '' : 'none';
   btn.textContent = show ? '折叠' : '展开';
+}
+
+async function logoutWorkspace() {
+  globalThis.__WORKSPACE_LOGGING_OUT__ = true;
+  const csrf = getCookie('csrf_token');
+  const headers = new Headers();
+  if (csrf) headers.set('X-CSRF-Token', csrf);
+  let response;
+  try {
+    response = await apiFetch('/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers,
+    }, {toast: false});
+  } catch (error) {
+    globalThis.__WORKSPACE_LOGGING_OUT__ = false;
+    throw error;
+  }
+  const target = new URL(response.url || '/login', window.location.href);
+  const safeTarget = target.origin === window.location.origin
+    && (target.pathname === '/login' || target.pathname === '/')
+    ? target.href
+    : new URL('/login', window.location.origin).href;
+  window.location.assign(safeTarget);
+}
+
+function bindWorkspaceLogout(button) {
+  if (!button) return false;
+  button.addEventListener('click', async () => {
+    try {
+      await logoutWorkspace();
+    } catch (_error) {
+      if (typeof showToast === 'function') showToast('退出失败，请稍后重试');
+    }
+  });
+  return true;
+}
+
+if (typeof window !== 'undefined') {
+  window.logoutWorkspace = logoutWorkspace;
+  bindWorkspaceLogout(document.getElementById('workspaceLogout'));
 }
 
 // 价值标签统计
@@ -685,4 +792,13 @@ function renderPriorityStats() {
           <span class="pstats-cnt">${dist[s]}</span>
         </div>`).join('')}
     </div>`;
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    bindWorkspaceLogout,
+    feedFailureText,
+    renderFeedStatusView,
+    logoutWorkspace,
+  };
 }
