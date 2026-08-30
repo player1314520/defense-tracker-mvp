@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -118,6 +120,10 @@ print(json.dumps(statuses, sort_keys=True))
     }
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="pywebview is intentionally locked only in the Windows CI environment",
+)
 def test_desktop_renderer_callback_allows_only_edgechromium(tmp_path):
     env = os.environ.copy()
     env["DEFENSE_TRACKER_HOME"] = str(tmp_path / "runtime")
