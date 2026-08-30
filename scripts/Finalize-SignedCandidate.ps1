@@ -626,22 +626,59 @@ New-Item -ItemType Directory -Path $evidence,$work,$assets -Force | Out-Null
 $appPublisher = [string](Get-Content $appRequest -Raw | ConvertFrom-Json).release.publisher
 $installerPublisher = [string](Get-Content $installerRequest -Raw | ConvertFrom-Json).release.publisher
 
-& $python (Join-Path $project 'scripts\signing_exchange.py') verify-return `
-    --bundle-root $applicationBundle --request $appRequest --receipt $appReceipt `
-    --expected-request-sha256 $ApplicationSigningRequestSha256 --expected-subject-kind application `
-    --expected-release-commit $ExpectedReleaseSha --expected-publisher $appPublisher `
-    --expected-repository $Repository --expected-workflow-ref $applicationWorkflow `
-    --expected-run-id $ExpectedApplicationRunId --expected-run-attempt $ExpectedApplicationRunAttempt `
-    --expected-job sign-application --output (Join-Path $evidence 'application-return.json')
-if ($LASTEXITCODE -ne 0) { throw 'Application exchange verification failed.' }
-& $python (Join-Path $project 'scripts\signing_exchange.py') verify-return `
-    --bundle-root $installerBundle --request $installerRequest --receipt $installerReceipt `
-    --expected-request-sha256 $InstallerSigningRequestSha256 --expected-subject-kind installer `
-    --expected-release-commit $ExpectedReleaseSha --expected-publisher $installerPublisher `
-    --expected-repository $Repository --expected-workflow-ref $installerWorkflow `
-    --expected-run-id $InstallerRunId --expected-run-attempt $InstallerRunAttempt `
-    --expected-job sign-installer --output (Join-Path $evidence 'installer-return.json')
-if ($LASTEXITCODE -ne 0) { throw 'Installer exchange verification failed.' }
+$applicationReturn = Join-Path $evidence 'application-return.json'
+$applicationPathRoot = Split-Path $applicationBundle -Parent
+$boundedApplicationReturn = Join-Path $applicationPathRoot (
+    'application-return-' + [guid]::NewGuid().ToString('N') + '.json'
+)
+try {
+    Push-Location -LiteralPath $applicationPathRoot
+    try {
+        & $python (Join-Path $project 'scripts\signing_exchange.py') verify-return `
+            --bundle-root ([IO.Path]::GetRelativePath($applicationPathRoot, $applicationBundle).Replace('\','/')) `
+            --request ([IO.Path]::GetRelativePath($applicationPathRoot, $appRequest).Replace('\','/')) `
+            --receipt ([IO.Path]::GetRelativePath($applicationPathRoot, $appReceipt).Replace('\','/')) `
+            --expected-request-sha256 $ApplicationSigningRequestSha256 --expected-subject-kind application `
+            --expected-release-commit $ExpectedReleaseSha --expected-publisher $appPublisher `
+            --expected-repository $Repository --expected-workflow-ref $applicationWorkflow `
+            --expected-run-id $ExpectedApplicationRunId --expected-run-attempt $ExpectedApplicationRunAttempt `
+            --expected-job sign-application `
+            --output ([IO.Path]::GetRelativePath($applicationPathRoot, $boundedApplicationReturn).Replace('\','/'))
+        if ($LASTEXITCODE -ne 0) { throw 'Application exchange verification failed.' }
+    } finally {
+        Pop-Location
+    }
+    Copy-Item -LiteralPath $boundedApplicationReturn -Destination $applicationReturn -Force
+} finally {
+    Remove-Item -LiteralPath $boundedApplicationReturn -Force -ErrorAction SilentlyContinue
+}
+
+$installerReturn = Join-Path $evidence 'installer-return.json'
+$installerPathRoot = Split-Path $installerBundle -Parent
+$boundedInstallerReturn = Join-Path $installerPathRoot (
+    'installer-return-' + [guid]::NewGuid().ToString('N') + '.json'
+)
+try {
+    Push-Location -LiteralPath $installerPathRoot
+    try {
+        & $python (Join-Path $project 'scripts\signing_exchange.py') verify-return `
+            --bundle-root ([IO.Path]::GetRelativePath($installerPathRoot, $installerBundle).Replace('\','/')) `
+            --request ([IO.Path]::GetRelativePath($installerPathRoot, $installerRequest).Replace('\','/')) `
+            --receipt ([IO.Path]::GetRelativePath($installerPathRoot, $installerReceipt).Replace('\','/')) `
+            --expected-request-sha256 $InstallerSigningRequestSha256 --expected-subject-kind installer `
+            --expected-release-commit $ExpectedReleaseSha --expected-publisher $installerPublisher `
+            --expected-repository $Repository --expected-workflow-ref $installerWorkflow `
+            --expected-run-id $InstallerRunId --expected-run-attempt $InstallerRunAttempt `
+            --expected-job sign-installer `
+            --output ([IO.Path]::GetRelativePath($installerPathRoot, $boundedInstallerReturn).Replace('\','/'))
+        if ($LASTEXITCODE -ne 0) { throw 'Installer exchange verification failed.' }
+    } finally {
+        Pop-Location
+    }
+    Copy-Item -LiteralPath $boundedInstallerReturn -Destination $installerReturn -Force
+} finally {
+    Remove-Item -LiteralPath $boundedInstallerReturn -Force -ErrorAction SilentlyContinue
+}
 
 $appReceiptData = Get-Content -LiteralPath $appReceipt -Raw | ConvertFrom-Json
 $installerReceiptData = Get-Content -LiteralPath $installerReceipt -Raw | ConvertFrom-Json
@@ -717,25 +754,44 @@ $iss = Join-Path $project 'deploy\mvp\DefenseTracker.iss'
 $reviewData = Get-Content -LiteralPath $review -Raw | ConvertFrom-Json
 $now = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $pythonVersion = (& $python --version 2>&1 | Out-String).Trim()
-& $python (Join-Path $project 'scripts\package_release_assets.py') `
-    --application-root $applicationRoot --installer $signedInstaller --output-dir $assets `
-    --third-party-notices (Join-Path $project 'THIRD_PARTY_NOTICES.md') --packages-file $packages `
-    --commit $ExpectedReleaseSha --source-tree $tree --source-date-epoch $epoch `
-    --build-started-utc ([string]$build.build_started_at_utc) --build-finished-utc $now --verified-at-utc $now `
-    --publisher ([string]$policy.publisher) --signing-provider ([string]$policy.provider) `
-    --python-version $pythonVersion --runtime-lock-sha256 (Get-Sha256 (Join-Path $project 'requirements.runtime.lock')) `
-    --build-lock-sha256 (Get-Sha256 (Join-Path $project 'requirements.build.lock')) `
-    --toolchain-evidence $toolchainPath --publisher-policy $policyPath `
-    --application-signing-request $appRequest --application-signing-receipt $appReceipt `
-    --installer-signing-request $installerRequest --installer-signing-receipt $installerReceipt `
-    --compliance-evidence $compliance --compliance-evidence-sha256 (Get-Sha256 $compliance) `
-    --component-inventory $componentInventory --installer-review-request $review `
-    --installer-payload-root $extract --signed-application-inventory $signedInventory `
-    --iss $iss --iscc $iscc --iscc-version ([string]$toolchain.iscc.version) `
-    --seven-zip $sevenZip --seven-zip-version ([string]$toolchain.seven_zip.version) `
-    --bootstrap-license-declared LicenseRef-Inno-Setup --bootstrap-license-concluded LicenseRef-Inno-Setup `
-    --bootstrap-copyright-text ([string]$reviewData.bootstrap_license.copyright_text) --bootstrap-license-text $license
-if ($LASTEXITCODE -ne 0) { throw 'Release asset packaging failed.' }
+$packageInputRoot = Join-Path $work 'package-inputs'
+Reset-GeneratedDirectory $packageInputRoot
+$packageInputFiles = [ordered]@{
+    'application-signing-request.json' = $appRequest
+    'application-signing-receipt.json' = $appReceipt
+    'installer-signing-request.json' = $installerRequest
+    'installer-signing-receipt.json' = $installerReceipt
+    'publisher-policy.json' = $policyPath
+}
+foreach ($entry in $packageInputFiles.GetEnumerator()) {
+    Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $packageInputRoot $entry.Key)
+}
+Push-Location -LiteralPath $packageInputRoot
+try {
+    & $python (Join-Path $project 'scripts\package_release_assets.py') `
+        --application-root $applicationRoot --installer $signedInstaller --output-dir $assets `
+        --third-party-notices (Join-Path $project 'THIRD_PARTY_NOTICES.md') --packages-file $packages `
+        --commit $ExpectedReleaseSha --source-tree $tree --source-date-epoch $epoch `
+        --build-started-utc ([string]$build.build_started_at_utc) --build-finished-utc $now --verified-at-utc $now `
+        --publisher ([string]$policy.publisher) --signing-provider ([string]$policy.provider) `
+        --python-version $pythonVersion --runtime-lock-sha256 (Get-Sha256 (Join-Path $project 'requirements.runtime.lock')) `
+        --build-lock-sha256 (Get-Sha256 (Join-Path $project 'requirements.build.lock')) `
+        --toolchain-evidence $toolchainPath --publisher-policy 'publisher-policy.json' `
+        --application-signing-request 'application-signing-request.json' `
+        --application-signing-receipt 'application-signing-receipt.json' `
+        --installer-signing-request 'installer-signing-request.json' `
+        --installer-signing-receipt 'installer-signing-receipt.json' `
+        --compliance-evidence $compliance --compliance-evidence-sha256 (Get-Sha256 $compliance) `
+        --component-inventory $componentInventory --installer-review-request $review `
+        --installer-payload-root $extract --signed-application-inventory $signedInventory `
+        --iss $iss --iscc $iscc --iscc-version ([string]$toolchain.iscc.version) `
+        --seven-zip $sevenZip --seven-zip-version ([string]$toolchain.seven_zip.version) `
+        --bootstrap-license-declared LicenseRef-Inno-Setup --bootstrap-license-concluded LicenseRef-Inno-Setup `
+        --bootstrap-copyright-text ([string]$reviewData.bootstrap_license.copyright_text) --bootstrap-license-text $license
+    if ($LASTEXITCODE -ne 0) { throw 'Release asset packaging failed.' }
+} finally {
+    Pop-Location
+}
 
 $portableRoot = Join-Path $work 'portable'
 Reset-GeneratedDirectory $portableRoot

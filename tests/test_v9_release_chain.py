@@ -622,7 +622,7 @@ def test_windows_version_info_contains_required_release_fields():
         assert value in rendered
 
 
-def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
+def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path, monkeypatch):
     app = tmp_path / "app"
     app.mkdir()
     unsigned_executable = _minimal_unsigned_pe64()
@@ -926,6 +926,7 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
         ).hexdigest()},
     )
     approved_output = tmp_path / "approved-assets"
+    monkeypatch.chdir(tmp_path)
     approved_args = argparse.Namespace(
         **{
             **vars(args),
@@ -936,11 +937,19 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
                 compliance_evidence.read_bytes()
             ).hexdigest(),
             "component_inventory": component_inventory,
-            "publisher_policy": publisher_policy,
-            "application_signing_request": application_request_path,
-            "application_signing_receipt": application_receipt_path,
-            "installer_signing_request": installer_signing_request_path,
-            "installer_signing_receipt": installer_receipt_path,
+            "publisher_policy": publisher_policy.relative_to(tmp_path).as_posix(),
+            "application_signing_request": application_request_path.relative_to(
+                tmp_path
+            ).as_posix(),
+            "application_signing_receipt": application_receipt_path.relative_to(
+                tmp_path
+            ).as_posix(),
+            "installer_signing_request": installer_signing_request_path.relative_to(
+                tmp_path
+            ).as_posix(),
+            "installer_signing_receipt": installer_receipt_path.relative_to(
+                tmp_path
+            ).as_posix(),
             "installer_review_request": installer_request_path,
             "installer_payload_root": installer_payload,
             "signed_application_inventory": signed_application_inventory,

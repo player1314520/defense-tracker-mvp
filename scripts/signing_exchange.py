@@ -109,6 +109,15 @@ PUBLISHER_POLICY_KEYS = {
     "digicert_key_alias",
 }
 RESERVED_METADATA = {"signing-request.json", "signing-receipt.json"}
+WINDOWS_DEVICE_NAMES = {
+    "aux",
+    "clock$",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -265,35 +274,81 @@ def sha256_file(path: Path, *, label: str) -> tuple[int, str]:
 
 
 def _safe_relative_path(value: object, *, label: str) -> str:
-    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or "\x00" in value
+        or value in {".", ".."}
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+        or re.match(r"^[A-Za-z]:", value) is not None
+    ):
         raise ValueError(f"{label} is not a safe POSIX relative path")
     path = PurePosixPath(value)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError(f"{label} is not a safe POSIX relative path")
     if value != path.as_posix() or any(
-        re.search(r'[:*?"<>|]', part) is not None for part in path.parts
+        re.search(r'[:*?"<>|]', part) is not None
+        or part.endswith((" ", "."))
+        or part.split(".", 1)[0].casefold() in WINDOWS_DEVICE_NAMES
+        for part in path.parts
     ):
         raise ValueError(f"{label} is not a portable relative path")
     return value
 
 
-def _resolve_bundle_file(root: Path, relative: str, *, label: str) -> Path:
+def resolve_path_within(
+    root: Path,
+    relative: object,
+    *,
+    label: str,
+    kind: Literal["file", "directory", "output"] = "file",
+) -> Path:
+    """Resolve one strict POSIX relative path beneath an already chosen root.
+
+    The relative value is validated before it reaches any host path API.  Every
+    existing component is then checked again after resolution so a symlink or
+    Windows reparse point cannot redirect the operation outside ``root``.
+    """
+
     normalized = _safe_relative_path(relative, label=label)
     root_resolved = root.resolve(strict=True)
+    if _is_reparse(root_resolved) or root_resolved.is_symlink() or not root_resolved.is_dir():
+        raise ValueError(f"{label} root must be a regular non-reparse directory")
     candidate = root_resolved.joinpath(*PurePosixPath(normalized).parts)
     try:
-        candidate_resolved = candidate.resolve(strict=True)
-        candidate_resolved.relative_to(root_resolved)
+        if kind == "output":
+            parent = candidate.parent.resolve(strict=True)
+            parent.relative_to(root_resolved)
+            resolved = parent / candidate.name
+        else:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root_resolved)
     except (OSError, ValueError) as exc:
-        raise ValueError(f"{label} escapes or is absent from the bundle") from exc
+        raise ValueError(f"{label} escapes or is absent from its allowed root") from exc
     current = root_resolved
-    for part in PurePosixPath(normalized).parts:
+    parts = PurePosixPath(normalized).parts
+    checked_parts = parts[:-1] if kind == "output" else parts
+    for part in checked_parts:
         current = current / part
         if _is_reparse(current) or current.is_symlink():
             raise ValueError(f"{label} traverses a reparse point")
-    if candidate_resolved != candidate or not candidate.is_file():
-        raise ValueError(f"{label} is not a regular bundle file")
-    return candidate
+    if kind == "file" and (resolved != candidate or not candidate.is_file()):
+        raise ValueError(f"{label} is not a regular file")
+    if kind == "directory" and (resolved != candidate or not candidate.is_dir()):
+        raise ValueError(f"{label} is not a regular directory")
+    if kind == "output" and candidate.exists():
+        if _is_reparse(candidate) or candidate.is_symlink() or not candidate.is_file():
+            raise ValueError(f"{label} is not a regular output file")
+        if candidate.resolve(strict=True) != candidate:
+            raise ValueError(f"{label} does not resolve to its exact allowed path")
+    return resolved
+
+
+def _resolve_bundle_file(root: Path, relative: str, *, label: str) -> Path:
+    return resolve_path_within(root, relative, label=label, kind="file")
 
 
 def _snapshot_payload(root: Path) -> list[dict[str, object]]:
@@ -302,6 +357,7 @@ def _snapshot_payload(root: Path) -> list[dict[str, object]]:
         raise ValueError("Bundle root must be a regular non-reparse directory")
     entries: list[dict[str, object]] = []
     identities_before: dict[str, tuple[int, int, int, int]] = {}
+    casefold_paths: set[str] = set()
     for directory, directory_names, file_names in os.walk(root_resolved, followlinks=False):
         directory_path = Path(directory)
         if _is_reparse(directory_path) or directory_path.is_symlink():
@@ -314,6 +370,10 @@ def _snapshot_payload(root: Path) -> list[dict[str, object]]:
             path = directory_path / name
             relative = path.relative_to(root_resolved).as_posix()
             _safe_relative_path(relative, label="bundle file path")
+            folded = relative.casefold()
+            if folded in casefold_paths:
+                raise ValueError("Bundle contains case-insensitive duplicate paths")
+            casefold_paths.add(folded)
             if relative in RESERVED_METADATA:
                 continue
             before = path.lstat()
@@ -441,12 +501,15 @@ def _validate_request(value: object) -> dict[str, object]:
     if not isinstance(files, list) or not files or len(files) > MAX_FILES:
         raise ValueError("Signing request payload_files is empty or oversized")
     previous = ""
+    casefold_paths: set[str] = set()
     target_count = 0
     for index, entry_value in enumerate(files):
         entry = _require_exact_keys(entry_value, FILE_KEYS, label=f"payload_files[{index}]")
         path = _safe_relative_path(entry["path"], label=f"payload_files[{index}].path")
-        if path in RESERVED_METADATA or path <= previous:
+        folded = path.casefold()
+        if path in RESERVED_METADATA or path <= previous or folded in casefold_paths:
             raise ValueError("Signing request payload file paths must be unique and sorted")
+        casefold_paths.add(folded)
         previous = path
         size = _positive_integer(entry["bytes"], label=f"payload_files[{index}].bytes")
         digest = entry["sha256"]
@@ -876,9 +939,13 @@ def _add_provenance_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _parse_materials(
-    values: list[str], digest_values: list[str] | None = None
+    values: list[str],
+    digest_values: list[str] | None = None,
+    *,
+    path_root: Path,
 ) -> dict[str, Path | str]:
     materials: dict[str, Path | str] = {}
+    material_paths: set[str] = set()
     for value in values:
         name, separator, raw_path = value.partition("=")
         if (
@@ -888,9 +955,17 @@ def _parse_materials(
             or not raw_path
         ):
             raise ValueError("Each --material must be a unique safe name=path pair")
-        path = Path(raw_path).resolve(strict=True)
-        if _is_reparse(path) or path.is_symlink() or not path.is_file():
-            raise ValueError(f"Release material {name} is not a regular file")
+        normalized = _safe_relative_path(raw_path, label=f"Release material {name}")
+        folded = normalized.casefold()
+        if folded in material_paths:
+            raise ValueError("Release material paths must be case-insensitively unique")
+        material_paths.add(folded)
+        path = resolve_path_within(
+            path_root,
+            normalized,
+            label=f"Release material {name}",
+            kind="file",
+        )
         materials[name] = path
     for value in digest_values or []:
         name, separator, digest = value.partition("=")
@@ -915,7 +990,7 @@ def main() -> int:
 
     create = subparsers.add_parser("create-request")
     create.add_argument("--subject-kind", choices=sorted(SUBJECT_KINDS), required=True)
-    create.add_argument("--bundle-root", type=Path, required=True)
+    create.add_argument("--bundle-root", required=True)
     create.add_argument("--target", required=True)
     create.add_argument("--release-commit", required=True)
     create.add_argument("--source-tree", required=True)
@@ -925,12 +1000,12 @@ def main() -> int:
     create.add_argument("--material", action="append", default=[])
     create.add_argument("--material-sha256", action="append", default=[])
     create.add_argument("--created-at-utc", default=None)
-    create.add_argument("--output", type=Path, required=True)
+    create.add_argument("--output", required=True)
 
     verify = subparsers.add_parser("verify-return")
-    verify.add_argument("--bundle-root", type=Path, required=True)
-    verify.add_argument("--request", type=Path, required=True)
-    verify.add_argument("--receipt", type=Path, required=True)
+    verify.add_argument("--bundle-root", required=True)
+    verify.add_argument("--request", required=True)
+    verify.add_argument("--receipt", required=True)
     verify.add_argument("--expected-request-sha256", required=True)
     verify.add_argument("--expected-subject-kind", choices=sorted(SUBJECT_KINDS), required=True)
     verify.add_argument("--expected-release-commit", required=True)
@@ -940,11 +1015,11 @@ def main() -> int:
     verify.add_argument("--expected-run-id", required=True, type=int)
     verify.add_argument("--expected-run-attempt", required=True, type=int)
     verify.add_argument("--expected-job", required=True)
-    verify.add_argument("--output", type=Path, required=True)
+    verify.add_argument("--output", required=True)
 
     verify_request = subparsers.add_parser("verify-request")
-    verify_request.add_argument("--bundle-root", type=Path, required=True)
-    verify_request.add_argument("--request", type=Path, required=True)
+    verify_request.add_argument("--bundle-root", required=True)
+    verify_request.add_argument("--request", required=True)
     verify_request.add_argument("--expected-request-sha256", required=True)
     verify_request.add_argument(
         "--expected-subject-kind", choices=sorted(SUBJECT_KINDS), required=True
@@ -958,12 +1033,24 @@ def main() -> int:
     verify_request.add_argument("--expected-job", required=True)
     verify_request.add_argument("--material", action="append", default=[])
     verify_request.add_argument("--material-sha256", action="append", default=[])
-    verify_request.add_argument("--output", type=Path, required=True)
+    verify_request.add_argument("--output", required=True)
 
     args = parser.parse_args()
+    cli_root = Path.cwd().resolve(strict=True)
+    bundle_root = resolve_path_within(
+        cli_root,
+        args.bundle_root,
+        label="--bundle-root",
+        kind="directory",
+    )
+    output = resolve_path_within(
+        cli_root,
+        args.output,
+        label="--output",
+        kind="output",
+    )
     if args.command == "create-request":
-        output = args.output.resolve(strict=False)
-        root = args.bundle_root.resolve(strict=True)
+        root = bundle_root
         expected_output = root / "signing-request.json"
         if output != expected_output:
             raise ValueError("Signing request must use the fixed bundle filename")
@@ -982,15 +1069,23 @@ def main() -> int:
             run_id=args.run_id,
             run_attempt=args.run_attempt,
             job=args.job,
-            materials=_parse_materials(args.material, args.material_sha256),
+            materials=_parse_materials(
+                args.material,
+                args.material_sha256,
+                path_root=cli_root,
+            ),
             created_at_utc=args.created_at_utc or utc_now_text(),
         )
         write_canonical_json(output, request)
         print(f"signing-request-sha256={sha256_bytes(canonical_json_bytes(request))}")
         return 0
 
-    bundle_root = args.bundle_root.resolve(strict=True)
-    request_path = args.request.resolve(strict=True)
+    request_path = resolve_path_within(
+        cli_root,
+        args.request,
+        label="--request",
+        kind="file",
+    )
     if request_path != bundle_root / "signing-request.json":
         raise ValueError("Signing request path must use the fixed bundle filename")
     if args.command == "verify-request":
@@ -1006,12 +1101,21 @@ def main() -> int:
             expected_run_id=args.expected_run_id,
             expected_run_attempt=args.expected_run_attempt,
             expected_job=args.expected_job,
-            materials=_parse_materials(args.material, args.material_sha256),
+            materials=_parse_materials(
+                args.material,
+                args.material_sha256,
+                path_root=cli_root,
+            ),
         )
-        write_canonical_json(args.output, result)
+        write_canonical_json(output, result)
         print("unsigned-request-verification: PASS")
         return 0
-    receipt_path = args.receipt.resolve(strict=True)
+    receipt_path = resolve_path_within(
+        cli_root,
+        args.receipt,
+        label="--receipt",
+        kind="file",
+    )
     if receipt_path != bundle_root / "signing-receipt.json":
         raise ValueError("Signing receipt path must use the fixed bundle filename")
     result = verify_signed_return(
@@ -1028,7 +1132,7 @@ def main() -> int:
         expected_run_attempt=args.expected_run_attempt,
         expected_job=args.expected_job,
     )
-    write_canonical_json(args.output, result)
+    write_canonical_json(output, result)
     print("signed-return-verification: PASS")
     return 0
 

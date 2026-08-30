@@ -1,16 +1,31 @@
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / "release" / "publisher-policy.json"
 
 
+def _powershell() -> str:
+    candidates = (
+        ("powershell", "pwsh") if os.name == "nt" else ("pwsh", "powershell")
+    )
+    for candidate in candidates:
+        executable = shutil.which(candidate)
+        if executable is not None:
+            return executable
+    pytest.skip("PowerShell is unavailable")
+
+
 def _run_powershell(source: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
-            "powershell",
+            _powershell(),
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",

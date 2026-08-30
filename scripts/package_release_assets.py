@@ -32,9 +32,11 @@ from scripts.installer_review import (  # noqa: E402
     canonical_json_bytes as installer_review_canonical_bytes,
 )
 from scripts.signing_exchange import (  # noqa: E402
+    _safe_relative_path as safe_relative_path,
     _validate_receipt as validate_signing_receipt,
     _validate_request as validate_signing_request,
     load_canonical_json as load_signing_exchange_json,
+    resolve_path_within,
 )
 
 
@@ -66,6 +68,36 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def resolve_signing_exchange_paths(
+    raw_paths: dict[str, object],
+    *,
+    cli_root: Path,
+) -> dict[str, Path]:
+    """Resolve CLI exchange members only after strict relative-path validation."""
+
+    resolved: dict[str, Path] = {}
+    casefold_paths: set[str] = set()
+    for name, value in raw_paths.items():
+        normalized = safe_relative_path(
+            value,
+            label=f"--{name.replace('_', '-')}",
+        )
+        folded = normalized.casefold()
+        if folded in casefold_paths:
+            raise ValueError(
+                "Signing exchange CLI paths must be case-insensitively unique"
+            )
+        casefold_paths.add(folded)
+        exchange_path = resolve_path_within(
+            cli_root,
+            normalized,
+            label=f"--{name.replace('_', '-')}",
+            kind="file",
+        )
+        resolved[name] = exchange_path
+    return resolved
 
 
 def _positive_github_id(value: object, *, field: str) -> int:
@@ -429,6 +461,7 @@ def load_compliance_evidence(
     ):
         raise ValueError("Unsigned component inventory is malformed")
     inventory_by_path: dict[str, dict[str, object]] = {}
+    inventory_casefold_paths: set[str] = set()
     for item in inventory["files"]:
         relative = item.get("path") if isinstance(item, dict) else None
         expected_keys = {"path", "bytes", "sha256"}
@@ -451,6 +484,11 @@ def load_compliance_evidence(
             or relative in inventory_by_path
         ):
             raise ValueError("Unsigned component inventory entry is malformed")
+        relative = safe_relative_path(relative, label="component inventory path")
+        folded_relative = relative.casefold()
+        if folded_relative in inventory_casefold_paths:
+            raise ValueError("Unsigned component inventory contains case-insensitive duplicates")
+        inventory_casefold_paths.add(folded_relative)
         inventory_by_path[relative] = item
     component_rows = evidence.get("components")
     if not isinstance(component_rows, list):
@@ -461,21 +499,18 @@ def load_compliance_evidence(
         "copyright_text",
     }
     reviewed_components: dict[str, dict[str, object]] = {}
+    reviewed_casefold_paths: set[str] = set()
     for row in component_rows:
         if not isinstance(row, dict):
             raise ValueError("Compliance component entry differs from the schema")
         relative_value = row.get("path")
         if not isinstance(relative_value, str):
             raise ValueError("Compliance component entry differs from the schema")
-        relative = relative_value
-        pure = PurePosixPath(relative)
-        if (
-            pure.is_absolute()
-            or ".." in pure.parts
-            or "\\" in relative
-            or relative in reviewed_components
-        ):
+        relative = safe_relative_path(relative_value, label="compliance component path")
+        folded_relative = relative.casefold()
+        if relative in reviewed_components or folded_relative in reviewed_casefold_paths:
             raise ValueError("Compliance component path is invalid")
+        reviewed_casefold_paths.add(folded_relative)
         expected_item = inventory_by_path.get(relative)
         if (
             expected_item is None
@@ -851,7 +886,12 @@ def write_spdx(
             "copyright_text": f"Copyright (c) 2026 {publisher}",
         }
     for relative, evidence in sorted(effective_component_licenses.items()):
-        source = application_root.joinpath(*PurePosixPath(relative).parts)
+        source = resolve_path_within(
+            application_root,
+            relative,
+            label="SBOM component path",
+            kind="file",
+        )
         file_id = "SPDXRef-File-" + hashlib.sha256(relative.encode()).hexdigest()[:24]
         files.append(
             {
@@ -938,9 +978,10 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
     installer_signature: dict[str, object] | None = None
     publisher_policy_sha256: str | None = None
     if supplied_exchange_count:
-        exchange_paths = {
-            name: Path(value).resolve() for name, value in raw_exchange_paths.items()
-        }
+        exchange_paths = resolve_signing_exchange_paths(
+            raw_exchange_paths,
+            cli_root=Path.cwd(),
+        )
         for exchange_path in exchange_paths.values():
             if not exchange_path.is_file():
                 raise FileNotFoundError(exchange_path)
@@ -1318,11 +1359,13 @@ def main() -> int:
     parser.add_argument("--runtime-lock-sha256", required=True)
     parser.add_argument("--build-lock-sha256", required=True)
     parser.add_argument("--toolchain-evidence", type=Path, required=True)
-    parser.add_argument("--publisher-policy", type=Path)
-    parser.add_argument("--application-signing-request", type=Path)
-    parser.add_argument("--application-signing-receipt", type=Path)
-    parser.add_argument("--installer-signing-request", type=Path)
-    parser.add_argument("--installer-signing-receipt", type=Path)
+    # Signing-exchange paths are portable paths relative to the invocation CWD.
+    # argparse must not turn untrusted text into a host path before validation.
+    parser.add_argument("--publisher-policy")
+    parser.add_argument("--application-signing-request")
+    parser.add_argument("--application-signing-receipt")
+    parser.add_argument("--installer-signing-request")
+    parser.add_argument("--installer-signing-receipt")
     parser.add_argument("--signer-subject")
     parser.add_argument("--timestamp-url")
     parser.add_argument("--timestamp-subject")

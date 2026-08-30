@@ -164,19 +164,29 @@ $python = Join-Path $projectRoot '.venv-build\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw 'Prepared credentialless Python environment is absent.'
 }
-$applicationVerification = Join-Path ([System.IO.Path]::GetTempPath()) (
+$applicationPathRoot = Split-Path $bundle -Parent
+$applicationVerification = Join-Path $applicationPathRoot (
     'defensetracker-app-return-' + [guid]::NewGuid().ToString('N') + '.json'
 )
 try {
-    & $python (Join-Path $projectRoot 'scripts\signing_exchange.py') verify-return `
-        --bundle-root $bundle --request $internalRequest --receipt $internalReceipt `
-        --expected-request-sha256 $ApplicationSigningRequestSha256 `
-        --expected-subject-kind application --expected-release-commit $ExpectedReleaseSha `
-        --expected-publisher $publisher --expected-repository $Repository `
-        --expected-workflow-ref $WorkflowRef --expected-run-id $RunId `
-        --expected-run-attempt $RunAttempt --expected-job sign-application `
-        --output $applicationVerification
-    if ($LASTEXITCODE -ne 0) { throw 'Signed application exchange verification failed.' }
+    $bundleRelative = [IO.Path]::GetRelativePath($applicationPathRoot, $bundle).Replace('\','/')
+    $requestRelative = [IO.Path]::GetRelativePath($applicationPathRoot, $internalRequest).Replace('\','/')
+    $receiptRelative = [IO.Path]::GetRelativePath($applicationPathRoot, $internalReceipt).Replace('\','/')
+    $verificationRelative = [IO.Path]::GetRelativePath($applicationPathRoot, $applicationVerification).Replace('\','/')
+    Push-Location -LiteralPath $applicationPathRoot
+    try {
+        & $python (Join-Path $projectRoot 'scripts\signing_exchange.py') verify-return `
+            --bundle-root $bundleRelative --request $requestRelative --receipt $receiptRelative `
+            --expected-request-sha256 $ApplicationSigningRequestSha256 `
+            --expected-subject-kind application --expected-release-commit $ExpectedReleaseSha `
+            --expected-publisher $publisher --expected-repository $Repository `
+            --expected-workflow-ref $WorkflowRef --expected-run-id $RunId `
+            --expected-run-attempt $RunAttempt --expected-job sign-application `
+            --output $verificationRelative
+        if ($LASTEXITCODE -ne 0) { throw 'Signed application exchange verification failed.' }
+    } finally {
+        Pop-Location
+    }
 } finally {
     if (Test-Path -LiteralPath $applicationVerification -PathType Leaf) {
         Remove-Item -LiteralPath $applicationVerification -Force
@@ -318,19 +328,29 @@ try {
         Join-Path $exchangeEvidence 'compliance-dispatch-verification.json'
     )
     $requestPath = Join-Path $exchangeRoot 'signing-request.json'
-    & $python (Join-Path $projectRoot 'scripts\signing_exchange.py') create-request `
-        --subject-kind installer --bundle-root $exchangeRoot `
-        --target "payload/$installerName" --release-commit $ExpectedReleaseSha `
-        --source-tree ([string]$request.release.source_tree) --version $version.semantic_version `
-        --publisher $publisher --repository $Repository --workflow-ref $WorkflowRef `
-        --run-id $RunId --run-attempt $RunAttempt --job prepare-unsigned-installer `
-        --material "iscc=$iscc" --material "seven-zip=$sevenZip" `
-        --material "inno-license=$licenseText" --material "installer-definition=$installerDefinition" `
-        --material "signed-application-inventory=$signedInventory" `
-        --material "application-signing-request=$internalRequest" `
-        --material "application-signing-receipt=$internalReceipt" `
-        --material "compliance-evidence=$complianceFull" --output $requestPath
-    if ($LASTEXITCODE -ne 0) { throw 'Installer signing request generation failed.' }
+    $exchangeRelative = [IO.Path]::GetRelativePath($outputFull, $exchangeRoot).Replace('\','/')
+    $requestRelative = [IO.Path]::GetRelativePath($outputFull, $requestPath).Replace('\','/')
+    Push-Location -LiteralPath $outputFull
+    try {
+        & $python (Join-Path $projectRoot 'scripts\signing_exchange.py') create-request `
+            --subject-kind installer --bundle-root $exchangeRelative `
+            --target "payload/$installerName" --release-commit $ExpectedReleaseSha `
+            --source-tree ([string]$request.release.source_tree) --version $version.semantic_version `
+            --publisher $publisher --repository $Repository --workflow-ref $WorkflowRef `
+            --run-id $RunId --run-attempt $RunAttempt --job prepare-unsigned-installer `
+            --material-sha256 "iscc=$(Get-Sha256 $iscc)" `
+            --material-sha256 "seven-zip=$(Get-Sha256 $sevenZip)" `
+            --material-sha256 "inno-license=$(Get-Sha256 $licenseText)" `
+            --material-sha256 "installer-definition=$(Get-Sha256 $installerDefinition)" `
+            --material-sha256 "signed-application-inventory=$(Get-Sha256 $signedInventory)" `
+            --material-sha256 "application-signing-request=$(Get-Sha256 $internalRequest)" `
+            --material-sha256 "application-signing-receipt=$(Get-Sha256 $internalReceipt)" `
+            --material-sha256 "compliance-evidence=$(Get-Sha256 $complianceFull)" `
+            --output $requestRelative
+        if ($LASTEXITCODE -ne 0) { throw 'Installer signing request generation failed.' }
+    } finally {
+        Pop-Location
+    }
     Copy-Item -LiteralPath $requestPath -Destination (Join-Path $outputFull 'installer-signing-request.json')
     Remove-Item -LiteralPath $installerWork -Recurse -Force
 } finally {

@@ -19,10 +19,14 @@ RECIPIENT = "age1g0mg6lvh0afw0placc32zcfau3ry28c0duk3vuc5uqugy7w869fsa0hs44"
 
 
 def _powershell() -> str:
-    executable = shutil.which("powershell") or shutil.which("pwsh")
-    if executable is None:
-        pytest.skip("PowerShell is unavailable")
-    return executable
+    candidates = (
+        ("powershell", "pwsh") if os.name == "nt" else ("pwsh", "powershell")
+    )
+    for candidate in candidates:
+        executable = shutil.which(candidate)
+        if executable is not None:
+            return executable
+    pytest.skip("PowerShell is unavailable")
 
 
 def _run(script: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -48,6 +52,54 @@ def _run(script: Path, *arguments: str, check: bool = True) -> subprocess.Comple
 
 
 def _fake_age(tmp_path: Path) -> tuple[Path, str]:
+    if os.name != "nt":
+        executable = tmp_path / "fake-age"
+        executable.write_text(
+            "#!/usr/bin/env sh\n"
+            "set -eu\n"
+            "if [ \"${1-}\" = \"--version\" ]; then\n"
+            "  printf '%s\\n' 'v1.3.2'\n"
+            "  exit 0\n"
+            "fi\n"
+            "mode=${1-}\n"
+            "if [ \"$mode\" != \"--encrypt\" ] && [ \"$mode\" != \"--decrypt\" ]; then\n"
+            "  exit 20\n"
+            "fi\n"
+            "shift\n"
+            "keyfile=\n"
+            "output=\n"
+            "input=\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  case \"$1\" in\n"
+            "    --recipients-file|--identity)\n"
+            "      [ \"$#\" -ge 2 ] || exit 20\n"
+            "      keyfile=$2\n"
+            "      shift 2\n"
+            "      ;;\n"
+            "    --output)\n"
+            "      [ \"$#\" -ge 2 ] || exit 20\n"
+            "      output=$2\n"
+            "      shift 2\n"
+            "      ;;\n"
+            "    --*) exit 20 ;;\n"
+            "    *)\n"
+            "      [ -z \"$input\" ] || exit 20\n"
+            "      input=$1\n"
+            "      shift\n"
+            "      ;;\n"
+            "  esac\n"
+            "done\n"
+            "[ -n \"$keyfile\" ] && [ -f \"$keyfile\" ] || exit 21\n"
+            "[ -n \"$input\" ] && [ -f \"$input\" ] || exit 22\n"
+            "[ -n \"$output\" ] || exit 23\n"
+            "cp -- \"$input\" \"$output\" || exit 23\n",
+            encoding="ascii",
+            newline="",
+        )
+        executable.chmod(0o700)
+        digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+        return executable, digest
+
     executable = tmp_path / "fake-age.cmd"
     executable.write_text(
         "@echo off\r\n"

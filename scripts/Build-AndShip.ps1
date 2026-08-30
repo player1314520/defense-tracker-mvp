@@ -1061,30 +1061,38 @@ if ($PrepareUnsignedApplicationBundle) {
         Set-Content -LiteralPath (Join-Path $bundleEvidence 'build-provenance.json') -Encoding UTF8
 
     $requestPath = Join-Path $bundleRoot 'signing-request.json'
-    & $venvPython (Join-Path $sourceRoot 'scripts\signing_exchange.py') create-request `
-        --subject-kind application `
-        --bundle-root $bundleRoot `
-        --target 'payload/DefenseTracker/DefenseTracker.exe' `
-        --release-commit $ExpectedReleaseSha `
-        --source-tree $gitFacts.tree `
-        --version $version.semantic_version `
-        --publisher $PublisherName `
-        --repository $PreparationRepository `
-        --workflow-ref $PreparationWorkflowRef `
-        --run-id $PreparationRunId `
-        --run-attempt $PreparationRunAttempt `
-        --job prepare-unsigned-application `
-        --material-sha256 "python-source=$([string]$buildEnvironmentMarker.python_source_sha256)" `
-        --material "build-environment=$markerPath" `
-        --material "installed-packages=$packagesFile" `
-        --material "bootstrap-lock=$bootstrapLock" `
-        --material "runtime-lock=$runtimeLock" `
-        --material "build-lock=$buildLock" `
-        --material "component-inventory=$componentInventoryPath" `
-        --material "publisher-policy=$policyFull" `
-        --material "version=$versionFile" `
-        --output $requestPath
-    if ($LASTEXITCODE -ne 0) { throw "Application signing request generation failed." }
+    $requestPathRoot = Split-Path $bundleRoot -Parent
+    $requestBundleRelative = [IO.Path]::GetRelativePath($requestPathRoot, $bundleRoot).Replace('\','/')
+    $requestOutputRelative = [IO.Path]::GetRelativePath($requestPathRoot, $requestPath).Replace('\','/')
+    Push-Location -LiteralPath $requestPathRoot
+    try {
+        & $venvPython (Join-Path $sourceRoot 'scripts\signing_exchange.py') create-request `
+            --subject-kind application `
+            --bundle-root $requestBundleRelative `
+            --target 'payload/DefenseTracker/DefenseTracker.exe' `
+            --release-commit $ExpectedReleaseSha `
+            --source-tree $gitFacts.tree `
+            --version $version.semantic_version `
+            --publisher $PublisherName `
+            --repository $PreparationRepository `
+            --workflow-ref $PreparationWorkflowRef `
+            --run-id $PreparationRunId `
+            --run-attempt $PreparationRunAttempt `
+            --job prepare-unsigned-application `
+            --material-sha256 "python-source=$([string]$buildEnvironmentMarker.python_source_sha256)" `
+            --material-sha256 "build-environment=$(Get-Sha256 $markerPath)" `
+            --material-sha256 "installed-packages=$(Get-Sha256 $packagesFile)" `
+            --material-sha256 "bootstrap-lock=$(Get-Sha256 $bootstrapLock)" `
+            --material-sha256 "runtime-lock=$(Get-Sha256 $runtimeLock)" `
+            --material-sha256 "build-lock=$(Get-Sha256 $buildLock)" `
+            --material-sha256 "component-inventory=$(Get-Sha256 $componentInventoryPath)" `
+            --material-sha256 "publisher-policy=$(Get-Sha256 $policyFull)" `
+            --material-sha256 "version=$(Get-Sha256 $versionFile)" `
+            --output $requestOutputRelative
+        if ($LASTEXITCODE -ne 0) { throw "Application signing request generation failed." }
+    } finally {
+        Pop-Location
+    }
     Copy-Item -LiteralPath $requestPath -Destination (
         Join-Path $outputFull 'application-signing-request.json'
     )
