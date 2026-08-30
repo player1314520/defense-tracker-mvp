@@ -191,10 +191,22 @@ function Get-ArtifactSafetyFindings {
     }
     $forbiddenNamePattern = '(?i)(?:^|[-_.])(qr(?:code)?|wechat|account|screenshot)(?:[-_.]|$)|二维码|账号|账户截图'
     $assetLibraryName = ([string][char]0x7D20) + ([string][char]0x6750) + ([string][char]0x5E93)
-    $secretRules = @(
+    $textSecretRules = @(
         [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
         [regex]::new(
-            '(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})',
+            '(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        ),
+        [regex]::new(
+            '(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{20,}(?![A-Za-z0-9])',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        ),
+        [regex]::new(
+            '(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}(?![A-Za-z0-9])',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        ),
+        [regex]::new(
+            '(?<![A-Za-z0-9])sb_secret_[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])',
             [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
         ),
         [regex]::new(
@@ -206,7 +218,19 @@ function Get-ArtifactSafetyFindings {
     $binarySecretRules = @(
         [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
         [regex]::new(
-            '(?:sk-(?:proj-)?[A-Za-z0-9_-]{24,}|ghp_[A-Za-z0-9]{32,}|AKIA[A-Z0-9]{16})',
+            '(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        ),
+        [regex]::new(
+            '(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{32,}(?![A-Za-z0-9])',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        ),
+        [regex]::new(
+            '(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}(?![A-Za-z0-9])',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        ),
+        [regex]::new(
+            '(?<![A-Za-z0-9])sb_secret_[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])',
             [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
         )
     )
@@ -258,7 +282,7 @@ function Get-ArtifactSafetyFindings {
             while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 $chunk = $tail + [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
                 $rules = if ($textExtensions -contains $lowerExtension) {
-                    $secretRules
+                    $textSecretRules
                 } else {
                     $binarySecretRules
                 }

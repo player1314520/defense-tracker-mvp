@@ -308,15 +308,35 @@ function Get-ArtifactSafetyFindings {
         '.supabase_v9_config.json','.v9_local_master.key','.search_config.json','.email_config.json'
     )
     $forbiddenExtensions = @('.key','.pfx','.p12','.kdbx','.sqlite','.sqlite3','.db')
+    $textExtensions = @(
+        '', '.txt', '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg',
+        '.conf', '.env', '.py', '.js', '.css', '.html', '.htm', '.md',
+        '.xml', '.csv', '.log', '.ps1', '.bat', '.cmd', '.pem'
+    )
     $rasterExtensions = @('.png','.jpg','.jpeg','.gif','.webp','.bmp','.ico')
     $allowedRasterHashes = @{
         '_internal\docx\templates\default-docx-template\docprops\thumbnail.jpeg' =
             '96367138dc44ce09bf2c8f0f8e49348a1478d2c5c0af69bbc2bbc38b63cdcead'
     }
     $forbiddenPattern = '(?i)(?:^|[-_.])(qr(?:code)?|wechat|account|screenshot)(?:[-_.]|$)|二维码|账号|账户截图'
-    $secretRules = @(
+    $textSecretRules = @(
         [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
-        [regex]::new('(?:sk-(?:proj-)?[A-Za-z0-9_-]{24,}|ghp_[A-Za-z0-9]{32,}|AKIA[A-Z0-9]{16})','IgnoreCase')
+        [regex]::new('(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])','IgnoreCase'),
+        [regex]::new('(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{20,}(?![A-Za-z0-9])','IgnoreCase'),
+        [regex]::new('(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}(?![A-Za-z0-9])','IgnoreCase'),
+        [regex]::new('(?<![A-Za-z0-9])sb_secret_[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])','IgnoreCase'),
+        [regex]::new(
+            '(?:api[_-]?key|app[_-]?secret|access[_-]?token|refresh[_-]?token|password|private[_-]?key)' +
+            '\s*[:=]\s*["''][^"'']{8,}["'']',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    )
+    $binarySecretRules = @(
+        [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+        [regex]::new('(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])','IgnoreCase'),
+        [regex]::new('(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{32,}(?![A-Za-z0-9])','IgnoreCase'),
+        [regex]::new('(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}(?![A-Za-z0-9])','IgnoreCase'),
+        [regex]::new('(?<![A-Za-z0-9])sb_secret_[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])','IgnoreCase')
     )
     foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
         $relative = $file.FullName.Substring($rootFull.Length)
@@ -343,7 +363,12 @@ function Get-ArtifactSafetyFindings {
             $tail = ''
             while (($read = $stream.Read($buffer,0,$buffer.Length)) -gt 0) {
                 $chunk = $tail + [System.Text.Encoding]::UTF8.GetString($buffer,0,$read)
-                if (@($secretRules | Where-Object { $_.IsMatch($chunk) }).Count -gt 0) {
+                $rules = if ($textExtensions -contains $extension) {
+                    $textSecretRules
+                } else {
+                    $binarySecretRules
+                }
+                if (@($rules | Where-Object { $_.IsMatch($chunk) }).Count -gt 0) {
                     $findings.Add("secret-content:$relative")
                     break
                 }

@@ -46,9 +46,29 @@ FORBIDDEN_PARTS = {
 FORBIDDEN_SUFFIXES = {".key", ".pem", ".pfx", ".p12", ".kdbx", ".sqlite", ".db"}
 SECRET_PATTERNS = (
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(rb"(?:sk-(?:proj-)?|ghp_)[A-Za-z0-9_-]{16,}", re.IGNORECASE),
-    re.compile(rb"sb_secret_[A-Za-z0-9_-]{16,}", re.IGNORECASE),
+    re.compile(
+        rb"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{16,}"
+        rb"(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rb"(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{20,}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rb"(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rb"(?<![A-Za-z0-9])sb_secret_[A-Za-z0-9_-]{16,}"
+        rb"(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    ),
 )
+
+
+def _contains_high_confidence_secret(payload: bytes) -> bool:
+    return any(pattern.search(payload) for pattern in SECRET_PATTERNS)
 
 
 def _git(*args: str, binary: bool = False) -> bytes | str:
@@ -156,7 +176,7 @@ def prepare(*, check_only: bool) -> dict[str, object]:
     file_entries: list[dict[str, object]] = []
     for relative in files:
         payload = bytes(_git("show", f"HEAD:{relative}", binary=True))
-        if any(pattern.search(payload) for pattern in SECRET_PATTERNS):
+        if _contains_high_confidence_secret(payload):
             raise SystemExit(f"high-confidence secret content in Portal input: {relative}")
         destination = CONTEXT_ROOT / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
