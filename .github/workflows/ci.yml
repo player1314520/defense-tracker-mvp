@@ -219,7 +219,7 @@ jobs:
           mkdir "$pg_build"
           cd "$pg_build"
           "$pg_src/configure" --without-readline --without-zlib
-          make -C src/test/isolation -j2 isolationtester
+          make -C src/test/isolation isolationtester
           isolationtester="$pg_build/src/test/isolation/isolationtester"
           export LD_LIBRARY_PATH="$pg_build/src/interfaces/libpq${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           test "$("$isolationtester" -V)" = \

@@ -178,7 +178,8 @@ def test_ci_executes_the_tracked_postgres_isolation_spec_with_pinned_source():
     )
     assert "ftp.postgresql.org/pub/source" in command
     assert "sha256sum --check --strict" in command
-    assert "make -C src/test/isolation -j2 isolationtester" in command
+    assert "make -C src/test/isolation isolationtester" in command
+    assert "make -C src/test/isolation -j" not in command
     assert ISOLATION_SPEC in command
     assert 'url.hostname == "127.0.0.1"' in command
     assert "expected exactly the two reviewed permutations" in command
