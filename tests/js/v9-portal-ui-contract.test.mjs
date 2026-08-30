@@ -67,6 +67,28 @@ test("Portal 会话不写持久存储且启动时清理旧版令牌", () => {
 });
 
 
+test("匿名初始化完成后不再停留在连接中状态", () => {
+  const initialize = source.slice(
+    source.indexOf("async function initialize()"),
+    source.indexOf('byId("login-form")'),
+  );
+  assert.match(initialize, /const \{ data, error \} = await state\.client\.auth\.getSession\(\)/);
+  assert.match(initialize, /if \(error\) throw error/);
+  assert.match(initialize, /if \(state\.session\)/);
+  assert.match(initialize, /else\s*{[\s\S]*setStatus\("登录入口已就绪，请使用获批邮箱登录"\)/);
+});
+
+
+test("已登录成员加载组织后收到明确的下一步提示", () => {
+  const loadOrganizations = source.slice(
+    source.indexOf("async function loadOrganizations()"),
+    source.indexOf("async function handleCallback()"),
+  );
+  assert.match(loadOrganizations, /账号已登录，但尚无获批组织；请等待人工审核/);
+  assert.match(loadOrganizations, /账号已登录，请选择组织并在本机解锁/);
+});
+
+
 test("PKCE 回调在兑换前清除地址栏 code，失败也不残留历史", () => {
   const callback = source.slice(
     source.indexOf("async function handleCallback()"),

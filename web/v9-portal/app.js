@@ -1587,6 +1587,8 @@ async function loadOrganizations() {
   render();
   if (!data?.length) {
     setStatus("账号已登录，但尚无获批组织；请等待人工审核");
+  } else {
+    setStatus("账号已登录，请选择组织并在本机解锁");
   }
 }
 
@@ -1643,11 +1645,14 @@ async function initialize() {
   byId("login-submit").disabled = false;
   byId("application-submit").disabled = !state.accessApplicationsEnabled;
   await handleCallback();
-  const { data } = await state.client.auth.getSession();
+  const { data, error } = await state.client.auth.getSession();
+  if (error) throw error;
   state.session = data.session;
   if (state.session) {
     await acceptPendingInvitations();
     await loadOrganizations();
+  } else {
+    setStatus("登录入口已就绪，请使用获批邮箱登录");
   }
 }
 
