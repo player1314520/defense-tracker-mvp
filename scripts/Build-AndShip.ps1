@@ -506,6 +506,29 @@ function Invoke-SignAndVerify {
     }
 }
 
+function Get-SmokeTransportStatus {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+    $responseValues = @(
+        $ErrorRecord.Exception.PSObject.Properties |
+            Where-Object { $_.Name -eq "Response" } |
+            ForEach-Object { $_.Value } |
+            Where-Object { $null -ne $_ }
+    )
+    $statusValues = @(
+        $responseValues |
+            ForEach-Object {
+                $_.PSObject.Properties |
+                    Where-Object { $_.Name -eq "StatusCode" } |
+                    ForEach-Object { $_.Value } |
+                    Where-Object { $null -ne $_ }
+            }
+    )
+    if ($statusValues.Count -eq 1) {
+        return "http-" + [int]$statusValues[0]
+    }
+    return "connection-error"
+}
+
 function Invoke-DesktopSmokeTest {
     param(
         [Parameter(Mandatory = $true)][string]$ExePath,
@@ -575,24 +598,7 @@ function Invoke-DesktopSmokeTest {
                             -Method Get -TimeoutSec 1 -ErrorAction Stop
                         $lastTransportStatus = "http-200"
                     } catch {
-                        $responseValues = @(
-                            $_.Exception.PSObject.Properties |
-                                Where-Object { $_.Name -eq "Response" } |
-                                ForEach-Object { $_.Value }
-                        )
-                        $statusValues = @(
-                            $responseValues |
-                                ForEach-Object {
-                                    $_.PSObject.Properties |
-                                        Where-Object { $_.Name -eq "StatusCode" } |
-                                        ForEach-Object { $_.Value }
-                                }
-                        )
-                        if ($statusValues.Count -eq 1) {
-                            $lastTransportStatus = "http-" + [int]$statusValues[0]
-                        } else {
-                            $lastTransportStatus = "connection-error"
-                        }
+                        $lastTransportStatus = Get-SmokeTransportStatus -ErrorRecord $_
                     }
                     if ($null -ne $response) {
                         $evidence = $response.evidence
