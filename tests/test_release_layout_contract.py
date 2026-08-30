@@ -63,11 +63,28 @@ def test_release_manifest_times_require_real_utc_ordering():
 
 def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     builder = (ROOT / "scripts" / "Build-AndShip.ps1").read_text(encoding="utf-8")
+    finalizer = (ROOT / "scripts" / "Finalize-SignedCandidate.ps1").read_text(
+        encoding="utf-8"
+    )
     launcher = (ROOT / "launcher.py").read_text(encoding="utf-8")
+    smoke_function = builder[
+        builder.index("function Invoke-DesktopSmokeTest") : builder.index(
+            "function Invoke-InstallerLifecycleSmokeTest"
+        )
+    ]
+    finalizer_smoke_function = finalizer[
+        finalizer.index("function Invoke-DesktopSmokeTest") : finalizer.index(
+            "function Invoke-InstallerLifecycleSmokeTest"
+        )
+    ]
     assert "DEFENSE_TRACKER_SMOKE_EVIDENCE" in builder
     assert "workspace_ready" in builder
     assert "build_commit -eq $ExpectedCommit" in builder
     assert "StatusCode -in @(200, 302)" not in builder
+    assert "Start-Process -FilePath $ExePath -PassThru" in smoke_function
+    assert "-WindowStyle Hidden" not in smoke_function
+    assert "Start-Process -FilePath $ExePath -PassThru" in finalizer_smoke_function
+    assert "-WindowStyle Hidden" not in finalizer_smoke_function
     assert "document.querySelector('main.v9-workspace')" in launcher
     assert "payload.build_commit" in launcher
     assert "Invoke-InstallerLifecycleSmokeTest" in builder

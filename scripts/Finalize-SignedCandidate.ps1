@@ -391,7 +391,9 @@ function Invoke-DesktopSmokeTest {
     [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_EVIDENCE',$smokeEvidence,'Process')
     $process = $null
     try {
-        $process = Start-Process -FilePath $ExePath -PassThru -WindowStyle Hidden
+        # The authenticated WebView probe starts from pywebview's shown callback.
+        # SW_HIDE suppresses that callback on hosted Windows runners.
+        $process = Start-Process -FilePath $ExePath -PassThru
         $deadline = [DateTime]::UtcNow.AddSeconds(60)
         $workspaceReady = $false
         $windowReady = $false
