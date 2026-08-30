@@ -46,6 +46,7 @@
 !v9/service.py
 !v9/situation.py
 !v9/supabase_client.py
+!v9/webview2_runtime.py
 !v9/workflow.py
 !templates/
 !templates/index.html
@@ -88,6 +89,7 @@
 !static/js/thinktanks.js
 !static/js/tracking.js
 !static/js/util.js
+!static/js/v9-desktop-release-smoke.js
 !static/js/vendor/
 !static/js/vendor/v9-supabase-auth.mjs
 

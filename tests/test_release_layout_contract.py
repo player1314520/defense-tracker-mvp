@@ -77,6 +77,10 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     )
     launcher = (ROOT / "launcher.py").read_text(encoding="utf-8")
     smoke_probe = (ROOT / "v9" / "desktop_smoke.py").read_text(encoding="utf-8")
+    smoke_beacon = (
+        ROOT / "static" / "js" / "v9-desktop-release-smoke.js"
+    ).read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
     transport_function = builder[
         builder.index("function Get-SmokeTransportStatus") : builder.index(
             "function Invoke-DesktopSmokeTest"
@@ -119,15 +123,41 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert finalizer_installer_smoke_function.count("-WindowStyle Hidden") == 2
     assert "/VERYSILENT" in installer_smoke_function
     assert "/VERYSILENT" in finalizer_installer_smoke_function
-    assert "document.querySelector('main.v9-workspace')" in smoke_probe
-    assert "payload.build_commit" in smoke_probe
-    assert "window.evaluate_js" not in launcher + smoke_probe
-    assert "window.run_js" in smoke_probe
-    assert "window.expose" not in smoke_probe
-    assert "window.pywebview" not in smoke_probe
-    assert "json.loads" in smoke_probe
+    assert "document.querySelector('main.v9-workspace')" in smoke_beacon
+    assert "payload.build_commit" in smoke_beacon
+    assert "window.evaluate_js" not in launcher + smoke_probe + smoke_beacon
+    assert "window.run_js" not in launcher + smoke_probe + smoke_beacon
+    assert "window.expose" not in launcher + smoke_probe + smoke_beacon
+    assert "window.pywebview" not in launcher + smoke_probe + smoke_beacon
+    assert "eval(" not in smoke_beacon
     assert "evidence_path" not in smoke_probe
-    assert "evidence_sink=_store_desktop_smoke_evidence" in launcher
+    assert "fetch('/api/status'" in smoke_beacon
+    assert "const endpoint = '/_internal/v9/desktop-release-smoke'" in smoke_beacon
+    assert "fetch(endpoint" in smoke_beacon
+    assert "credentials: 'same-origin'" in smoke_beacon
+    assert "'X-CSRF-Token': payload.csrf_token" in smoke_beacon
+    assert "X-Defense-Tracker-Smoke" not in smoke_beacon
+    assert "DEFENSE_TRACKER_SMOKE_TOKEN" not in smoke_beacon
+    assert "desktop_release_smoke_enabled" in template
+    assert "/static/js/v9-desktop-release-smoke.js" in template
+    assert "SUPABASE STAGING" not in template
+    assert "@require_auth" in launcher
+    assert "request.host" in launcher
+    assert "request.headers.get(\"Origin\")" in launcher
+    assert 'request.mimetype != "application/json"' in launcher
+    assert "request.content_length" in launcher
+    assert "DesktopSmokeEvidenceStore" in launcher
+    assert "normalize_desktop_smoke_renderer" in launcher
+    assert "detect_webview2_runtime" in launcher
+    assert launcher.index("    _require_compatible_webview2_before_startup()") < (
+        launcher.index("from state import")
+    )
+    assert launcher.index("from state import") < launcher.index("from app import")
+    assert "raise SystemExit(78)" in launcher
+    assert '_desktop_renderer != "edgechromium"' in launcher
+    assert "需要 Microsoft Edge WebView2 Runtime" in launcher
+    assert "window.events.initialized" in launcher
+    assert 'gui="edgechromium"' in launcher
     assert '"authenticated-loopback-v1"' in launcher
     assert '"X-Defense-Tracker-Smoke"' in launcher
     assert "hmac.compare_digest" in launcher
@@ -137,6 +167,8 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert "Invoke-RestMethod" in finalizer_smoke_function
     assert "$response.process_id -eq $process.Id" in smoke_function
     assert "$response.process_id -eq $process.Id" in finalizer_smoke_function
+    assert "$response.renderer -eq \"edgechromium\"" in smoke_function
+    assert "$response.renderer -eq 'edgechromium'" in finalizer_smoke_function
     assert "Get-NetTCPConnection -State Listen -OwningProcess $process.Id" in smoke_function
     assert "Get-NetTCPConnection -State Listen -OwningProcess $process.Id" in finalizer_smoke_function
     assert "foreach ($port in 49231..49235)" not in smoke_function

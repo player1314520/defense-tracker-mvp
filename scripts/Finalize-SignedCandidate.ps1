@@ -471,6 +471,7 @@ function Invoke-DesktopSmokeTest {
                     if ($null -ne $response) {
                         $evidence = $response.evidence
                         if ($response.process_id -eq $process.Id -and
+                            $response.renderer -eq 'edgechromium' -and
                             $evidence.schema -eq 1 -and $evidence.http_status -eq 200 -and
                             $evidence.pathname -eq '/' -and $evidence.workspace_ready -eq $true -and
                             $evidence.version -eq $Version.semantic_version -and

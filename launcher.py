@@ -32,10 +32,43 @@ else:
 os.chdir(BASE_DIR)
 
 from product_version import PRODUCT_VERSION, current_build_commit
+from v9.webview2_runtime import detect_webview2_runtime
+
+
+def _require_compatible_webview2_before_startup():
+    if os.name != "nt":
+        return
+    detection = detect_webview2_runtime()
+    if detection.compatible:
+        return
+    title = "DefenseTracker V9"
+    message = (
+        "需要 Microsoft Edge WebView2 Runtime (x64)。\n\n"
+        "DefenseTracker 已阻止旧版 MSHTML 回退。请从微软官方下载并安装 "
+        "WebView2 Runtime 后重新启动。"
+    )
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x10)
+    except (AttributeError, OSError):
+        print("[错误] 需要 Microsoft Edge WebView2 Runtime (x64)。")
+    raise SystemExit(78)
+
+
+if __name__ == "__main__":
+    # Fail before runtime directories, Flask, schedulers, or authentication
+    # state are initialized. A later renderer assertion independently catches
+    # broken registrations and pywebview fallbacks.
+    _require_compatible_webview2_before_startup()
 
 # ── 可写运行目录（程序目录始终只读）──────────────────────────
 from state import RUNTIME_LAYOUT, ensure_runtime_layout, migrate_legacy_runtime
-from v9.desktop_smoke import start_desktop_smoke_probe as run_desktop_smoke_probe
+from v9.desktop_smoke import (
+    DESKTOP_SMOKE_ENDPOINT,
+    DesktopSmokeEvidenceStore,
+    normalize_desktop_smoke_renderer,
+)
 
 ensure_runtime_layout(RUNTIME_LAYOUT)
 if getattr(sys, "frozen", False):
@@ -64,16 +97,14 @@ from app import (
     refresh_news,
     add_background_jobs,
     get_desktop_bootstrap_token,
+    require_auth,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import jsonify, request
 
 
 _DESKTOP_SMOKE_TRANSPORT = "authenticated-loopback-v1"
-_DESKTOP_SMOKE_ENDPOINT = "/_internal/v9/desktop-release-smoke"
 _DESKTOP_SMOKE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
-_desktop_smoke_lock = threading.Lock()
-_desktop_smoke_evidence = None
 
 
 def _desktop_smoke_transport_token():
@@ -89,31 +120,60 @@ def _desktop_smoke_transport_token():
 
 
 _desktop_smoke_token = _desktop_smoke_transport_token()
-
-
-def _store_desktop_smoke_evidence(evidence):
-    global _desktop_smoke_evidence
-    with _desktop_smoke_lock:
-        if _desktop_smoke_evidence is None:
-            _desktop_smoke_evidence = dict(evidence)
+_desktop_smoke_store = None
+_desktop_renderer = None
 
 
 if _desktop_smoke_token is not None:
-    @flask_app.get(_DESKTOP_SMOKE_ENDPOINT)
+    _desktop_smoke_store = DesktopSmokeEvidenceStore(
+        PRODUCT_VERSION.semantic_version,
+        PRODUCT_VERSION.display_version,
+        PRODUCT_VERSION.release_tag,
+        current_build_commit(),
+    )
+
+    @flask_app.context_processor
+    def _desktop_smoke_template_context():
+        return {"desktop_release_smoke_enabled": True}
+
+    @flask_app.get(DESKTOP_SMOKE_ENDPOINT)
     def _get_desktop_smoke_evidence():
         supplied = request.headers.get("X-Defense-Tracker-Smoke", "")
-        if not hmac.compare_digest(supplied, _desktop_smoke_token):
+        if (
+            _DESKTOP_SMOKE_TOKEN_RE.fullmatch(supplied) is None
+            or not hmac.compare_digest(supplied, _desktop_smoke_token)
+        ):
             return "", 404
-        with _desktop_smoke_lock:
-            if _desktop_smoke_evidence is None:
-                return "", 425
-            payload = {
-                "process_id": os.getpid(),
-                "evidence": dict(_desktop_smoke_evidence),
-            }
+        evidence = _desktop_smoke_store.snapshot()
+        if evidence is None:
+            return "", 425
+        payload = {
+            "process_id": os.getpid(),
+            "renderer": _desktop_smoke_store.renderer,
+            "evidence": evidence,
+        }
         response = jsonify(payload)
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    @flask_app.post(DESKTOP_SMOKE_ENDPOINT)
+    @require_auth
+    def _submit_desktop_smoke_evidence():
+        expected_origin = f"http://127.0.0.1:{PORT}"
+        if (
+            request.host != f"127.0.0.1:{PORT}"
+            or request.headers.get("Origin") != expected_origin
+        ):
+            return "", 404
+        if request.mimetype != "application/json":
+            return "", 400
+        content_length = request.content_length
+        if content_length is None or not 0 < content_length <= 4096:
+            return "", 400
+        payload = request.get_json(silent=True)
+        if not _desktop_smoke_store.submit(payload):
+            return "", 400
+        return "", 204
 
 # ── 后台 Flask 线程 ──────────────────────────────────────────
 def _run_flask():
@@ -136,18 +196,6 @@ def _wait_for_flask(timeout=30):
             time.sleep(0.4)
     return False
 
-
-def _start_desktop_smoke_probe(window):
-    if _desktop_smoke_token is None:
-        return
-    run_desktop_smoke_probe(
-        window,
-        evidence_sink=_store_desktop_smoke_evidence,
-        expected_version=PRODUCT_VERSION.semantic_version,
-        expected_display_version=PRODUCT_VERSION.display_version,
-        expected_release_tag=PRODUCT_VERSION.release_tag,
-        expected_build_commit=current_build_commit(),
-    )
 
 # ── 加载页（Flask 就绪前显示）────────────────────────────────
 LOADING_HTML = """<!DOCTYPE html>
@@ -183,6 +231,19 @@ LOADING_HTML = """<!DOCTYPE html>
   <div class="status">正在初始化情报系统，请稍候…</div>
 </body>
 </html>""".replace("__DISPLAY_VERSION__", PRODUCT_VERSION.display_version)
+
+WEBVIEW2_REQUIRED_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><style>
+body { margin:0; background:#0d0c0a; color:#eee7d9; font-family:'Microsoft YaHei',sans-serif;
+display:flex; align-items:center; justify-content:center; height:100vh; }
+main { max-width:680px; padding:40px; border:1px solid #40372d; background:#15120f; }
+h1 { color:#ef6b50; font-size:24px; } p { line-height:1.8; color:#c7bba8; }
+code { color:#f3d18a; }
+</style></head><body><main>
+<h1>需要 Microsoft Edge WebView2 Runtime</h1>
+<p>DefenseTracker V9 已阻止旧版 MSHTML 回退。请安装微软官方的
+<code>Microsoft Edge WebView2 Runtime (x64)</code> 后重新启动软件。</p>
+</main></body></html>"""
 
 # ════════════════════════════════════════════════════════════
 # 主程序
@@ -222,6 +283,9 @@ if __name__ == '__main__':
 
     # 6. Flask 就绪后跳转到应用
     def _on_shown():
+        if _desktop_renderer != "edgechromium":
+            window.load_html(WEBVIEW2_REQUIRED_HTML)
+            return
         if _wait_for_flask():
             print(f"[启动] 服务就绪，加载应用…")
             bootstrap = get_desktop_bootstrap_token()
@@ -233,13 +297,32 @@ if __name__ == '__main__':
                 return
             # fragment 不会进入 HTTP 请求/访问日志；登录页立即清除并 POST 交换。
             window.load_url(f'http://127.0.0.1:{PORT}/login#desktop={bootstrap}')
-            _start_desktop_smoke_probe(window)
         else:
             window.load_html("""<body style="background:#060d1a;color:#ef4444;
                 font-family:sans-serif;display:flex;align-items:center;
                 justify-content:center;height:100vh;font-size:18px;">
                 ❌ 服务启动超时，请重试。</body>""")
 
+    def _on_renderer_initialized(renderer):
+        global _desktop_renderer
+        normalized = normalize_desktop_smoke_renderer(renderer)
+        _desktop_renderer = normalized
+        if _desktop_smoke_store is None or normalized is None:
+            return
+        try:
+            _desktop_smoke_store.set_renderer(normalized)
+        except ValueError:
+            # The signed release gate accepts only an explicitly recognized
+            # renderer; unsupported fallbacks leave the evidence unavailable.
+            return
+
+    window.events.initialized += _on_renderer_initialized
+
     # Explicit ephemeral WebView profile: auth/CSRF cookies and PKCE state do
     # not survive the desktop process or mix with another local browser app.
-    webview.start(_on_shown, debug=False, private_mode=True)
+    webview.start(
+        _on_shown,
+        gui="edgechromium",
+        debug=False,
+        private_mode=True,
+    )

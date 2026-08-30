@@ -55,6 +55,11 @@ jobs:
               throw "Hash-locked build input is invalid: $lock"
             }
           }
+      - name: Install hash-pinned Microsoft WebView2 Runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\scripts\Install-VerifiedWebView2Runtime.ps1
       - name: Prepare one-use hash-locked unsigned-development toolchain
         shell: pwsh
         run: |
