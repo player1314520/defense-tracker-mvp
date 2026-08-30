@@ -124,8 +124,8 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert "window.evaluate_js" not in launcher + smoke_probe
     assert "window.run_js" in smoke_probe
     assert "window.expose" not in smoke_probe
-    assert "window.state += receive_desktop_smoke_state" in smoke_probe
-    assert "window.pywebview.state.desktopSmokeEvidence" in smoke_probe
+    assert "window.pywebview" not in smoke_probe
+    assert "json.loads" in smoke_probe
     assert "evidence_path" not in smoke_probe
     assert "evidence_sink=_store_desktop_smoke_evidence" in launcher
     assert '"authenticated-loopback-v1"' in launcher
