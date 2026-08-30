@@ -740,15 +740,63 @@ def test_public_probe_reads_release_values_from_version_json(tmp_path):
     with pytest.raises(module.ProbeFailure):
         module.verify_release_metadata(payload | {"version": "9.0.0"}, "a" * 40, version)
 
-    custom_env = tmp_path / "staging.env"
-    parsed_path, parsed_sha = module.parse_cli_args(
-        ["probe-public.py", str(custom_env), "b" * 40]
+    parsed_environment, parsed_sha = module.parse_cli_args(
+        ["probe-public.py", "/etc/defense-tracker/staging.env", "b" * 40]
     )
-    assert parsed_path == custom_env
+    assert parsed_environment == "staging"
     assert parsed_sha == "b" * 40
-    default_path, default_sha = module.parse_cli_args(["probe-public.py"])
-    assert default_path == Path("/etc/defense-tracker/production.env")
+    default_environment, default_sha = module.parse_cli_args(["probe-public.py"])
+    assert default_environment == "production"
     assert default_sha is None
+    with pytest.raises(SystemExit, match="deployment env must be"):
+        module.parse_cli_args(["probe-public.py", str(tmp_path / "production.env")])
+
+
+def test_public_probe_only_reads_fixed_deployment_paths(monkeypatch):
+    script = MVP / "bin" / "probe-public.py"
+    source = script.read_text(encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("defense_probe_fixed_paths", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    observed: list[Path] = []
+
+    def fake_read_text(path, *, encoding):
+        observed.append(path)
+        return "SUPABASE_STACK_DIR=/opt/defense-tracker/supabase/docker\n"
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    module.load_deployment_env("production")
+    module.load_deployment_env("staging")
+    module.load_supabase_env()
+    module.load_portal_publishable_key()
+
+    assert observed == [
+        Path("/etc/defense-tracker/production.env"),
+        Path("/etc/defense-tracker/staging.env"),
+        Path("/opt/defense-tracker/supabase/docker/.env"),
+        Path("/etc/defense-tracker/secrets/supabase_publishable_key"),
+    ]
+    with pytest.raises(module.ProbeFailure, match="deployment environment is invalid"):
+        module.load_deployment_env("attacker-controlled")
+
+    fixed_settings = {
+        "SUPABASE_STACK_DIR": "/opt/defense-tracker/supabase/docker",
+        "MVP_SECRETS_DIR": "/etc/defense-tracker/secrets",
+    }
+    module.verify_fixed_deployment_paths(fixed_settings)
+    with pytest.raises(module.ProbeFailure, match="Supabase stack path"):
+        module.verify_fixed_deployment_paths(
+            fixed_settings | {"SUPABASE_STACK_DIR": "/tmp/attacker-stack"}
+        )
+    with pytest.raises(module.ProbeFailure, match="Portal secrets path"):
+        module.verify_fixed_deployment_paths(
+            fixed_settings | {"MVP_SECRETS_DIR": "/tmp/attacker-secrets"}
+        )
+
+    assert "DEFENSE_TRACKER_VERSION_FILE" not in source
+    assert "def load_env(path" not in source
 
 
 def test_first_owner_bootstrap_is_out_of_band_empty_database_and_idempotent():

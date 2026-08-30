@@ -113,6 +113,15 @@ def test_trusted_proxy_walk_stops_at_rightmost_untrusted_hop(monkeypatch):
     )
 
 
+def test_trusted_proxy_allowlist_accepts_mixed_linear_delimiters(monkeypatch):
+    monkeypatch.setenv(
+        "DEFENSE_TRACKER_TRUSTED_PROXIES",
+        "10.0.0.0/8  192.0.2.0/24,\t2001:db8:ffff::/48",
+    )
+
+    assert _request_ip("10.1.2.3", "203.0.113.7") == "203.0.113.7"
+
+
 def test_trusted_ipv6_proxy_supplies_canonical_ipv6_identity(monkeypatch):
     monkeypatch.setenv(
         "DEFENSE_TRACKER_TRUSTED_PROXIES",
@@ -131,6 +140,8 @@ def test_trusted_ipv6_proxy_supplies_canonical_ipv6_identity(monkeypatch):
         "10.0.0.1/8",
         "10.0.0.0/8,not-a-network",
         "2001:db8::1/32",
+        "10.0.0.0/8,,192.0.2.0/24",
+        "10.0.0.0/8,  ,192.0.2.0/24",
     ),
 )
 def test_invalid_trusted_proxy_config_fails_closed(monkeypatch, invalid_config):

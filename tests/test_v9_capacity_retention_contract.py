@@ -9,6 +9,12 @@ CAPACITY = (
     / "migrations"
     / "202608280027_v9_atomic_capacity_and_event_quota.sql"
 )
+CLOSURE = (
+    ROOT
+    / "supabase"
+    / "migrations"
+    / "202608300030_v9_sync_byte_session_quarantine.sql"
+)
 RETENTION = (
     ROOT
     / "supabase"
@@ -44,6 +50,32 @@ def test_active_and_reserved_seats_share_one_atomic_capacity_ledger():
     assert "'invitation:' || m.invitation_request_id::text" in sql
     assert "on conflict (organization_id,reservation_key) do nothing" in sql
     assert "revoke all on table private.organization_seat_usage" in sql
+
+
+def test_capacity_release_fails_closed_except_during_organization_cascade():
+    sql = compact(CLOSURE)
+    start = sql.index(
+        "create or replace function private.release_organization_seat"
+    )
+    end = sql.index(
+        "create or replace function private.enforce_sync_event_daily_quota",
+        start,
+    )
+    body = sql[start:end]
+
+    missing_state = body.index("if not found then")
+    cascade_check = body.index(
+        "if not exists ( select 1 from public.organizations o "
+        "where o.id = p_organization_id ) then",
+        missing_state,
+    )
+    safe_return = body.index("return;", cascade_check)
+    corruption_error = body.index(
+        "raise exception 'organization capacity state is unavailable'",
+        safe_return,
+    )
+
+    assert missing_state < cascade_check < safe_return < corruption_error
 
 
 def test_event_quota_is_atomic_per_user_and_utc_day():

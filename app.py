@@ -259,14 +259,15 @@ def _trusted_proxy_networks(value: str | None = None) -> tuple:
     raw = raw.strip()
     if not raw:
         return ()
-    if (
-        len(raw) > MAX_TRUSTED_PROXY_CONFIG_LENGTH
-        or raw.startswith(",")
-        or raw.endswith(",")
-        or re.search(r",\s*,", raw)
-    ):
+    if len(raw) > MAX_TRUSTED_PROXY_CONFIG_LENGTH:
         return ()
-    entries = re.split(r"(?:\s*,\s*|\s+)", raw)
+
+    entries = []
+    for comma_group in raw.split(","):
+        group_entries = comma_group.split()
+        if not group_entries:
+            return ()
+        entries.extend(group_entries)
     if not entries or len(entries) > MAX_TRUSTED_PROXY_NETWORKS:
         return ()
 

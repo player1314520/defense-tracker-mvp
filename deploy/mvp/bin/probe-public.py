@@ -15,6 +15,16 @@ import urllib.error
 import urllib.request
 
 
+PRODUCTION_ENV_PATH = "/etc/defense-tracker/production.env"
+STAGING_ENV_PATH = "/etc/defense-tracker/staging.env"
+SUPABASE_STACK_DIR = "/opt/defense-tracker/supabase/docker"
+SUPABASE_ENV_PATH = Path("/opt/defense-tracker/supabase/docker/.env")
+MVP_SECRETS_DIR = "/etc/defense-tracker/secrets"
+PORTAL_PUBLISHABLE_KEY_PATH = Path(
+    "/etc/defense-tracker/secrets/supabase_publishable_key"
+)
+
+
 class ProbeFailure(RuntimeError):
     pass
 
@@ -26,12 +36,6 @@ def _tls_client_context() -> ssl.SSLContext:
 
 
 def _default_version_paths() -> tuple[Path, ...]:
-    configured = (os.environ.get("DEFENSE_TRACKER_VERSION_FILE") or "").strip()
-    if configured:
-        configured_path = Path(configured).expanduser()
-        if not configured_path.is_absolute():
-            raise ProbeFailure("configured version metadata path is not absolute")
-        return (configured_path,)
     # Source/deployment checkout: deploy/mvp/bin/probe-public.py -> repo root.
     # Portal container: product_version.py and version.json live under /app.
     source_root = Path(__file__).resolve().parents[3]
@@ -63,9 +67,9 @@ def load_product_version_metadata(path: Path | None = None) -> dict[str, object]
     return payload
 
 
-def load_env(path: Path) -> dict[str, str]:
+def _parse_env_text(content: str) -> dict[str, str]:
     values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -76,6 +80,33 @@ def load_env(path: Path) -> dict[str, str]:
             value = value[1:-1]
         values[key] = value
     return values
+
+
+def load_deployment_env(environment: str) -> dict[str, str]:
+    if environment == "production":
+        content = Path("/etc/defense-tracker/production.env").read_text(
+            encoding="utf-8"
+        )
+    elif environment == "staging":
+        content = Path("/etc/defense-tracker/staging.env").read_text(encoding="utf-8")
+    else:
+        raise ProbeFailure("deployment environment is invalid")
+    return _parse_env_text(content)
+
+
+def load_supabase_env() -> dict[str, str]:
+    return _parse_env_text(SUPABASE_ENV_PATH.read_text(encoding="utf-8"))
+
+
+def load_portal_publishable_key() -> str:
+    return PORTAL_PUBLISHABLE_KEY_PATH.read_text(encoding="ascii").strip()
+
+
+def verify_fixed_deployment_paths(settings: dict[str, str]) -> None:
+    if settings.get("SUPABASE_STACK_DIR") != SUPABASE_STACK_DIR:
+        raise ProbeFailure("Supabase stack path differs from the fixed deployment path")
+    if settings.get("MVP_SECRETS_DIR") != MVP_SECRETS_DIR:
+        raise ProbeFailure("Portal secrets path differs from the fixed deployment path")
 
 
 def request_bytes(
@@ -196,24 +227,30 @@ def probe_realtime_websocket(api_domain: str, key: str) -> None:
         raise ProbeFailure("Realtime WebSocket accept value is invalid")
 
 
-def parse_cli_args(argv: list[str]) -> tuple[Path, str | None]:
+def parse_cli_args(argv: list[str]) -> tuple[str, str | None]:
     if len(argv) > 3:
         raise SystemExit("usage: probe-public.py [PRODUCTION_ENV] [EXPECTED_RELEASE_SHA]")
-    production_path = Path(
-        argv[1] if len(argv) >= 2 else "/etc/defense-tracker/production.env"
-    )
+    requested_path = argv[1] if len(argv) >= 2 else PRODUCTION_ENV_PATH
+    if requested_path == PRODUCTION_ENV_PATH:
+        environment = "production"
+    elif requested_path == STAGING_ENV_PATH:
+        environment = "staging"
+    else:
+        raise SystemExit(
+            "deployment env must be /etc/defense-tracker/production.env "
+            "or /etc/defense-tracker/staging.env"
+        )
     expected_release_sha = argv[2] if len(argv) == 3 else None
-    return production_path, expected_release_sha
+    return environment, expected_release_sha
 
 
 def main() -> int:
-    production_path, expected_release_sha = parse_cli_args(sys.argv)
+    environment, expected_release_sha = parse_cli_args(sys.argv)
     product_version = load_product_version_metadata()
-    production = load_env(production_path)
-    stack_dir = Path(production["SUPABASE_STACK_DIR"])
-    upstream = load_env(stack_dir / ".env")
-    key_file = Path(production["MVP_SECRETS_DIR"]) / "supabase_publishable_key"
-    portal_key = key_file.read_text(encoding="ascii").strip()
+    production = load_deployment_env(environment)
+    verify_fixed_deployment_paths(production)
+    upstream = load_supabase_env()
+    portal_key = load_portal_publishable_key()
     official_key = upstream.get("SUPABASE_PUBLISHABLE_KEY", "")
     if not portal_key.startswith("sb_publishable_") or not hmac.compare_digest(portal_key, official_key):
         raise ProbeFailure("Portal and official Supabase publishable keys differ")

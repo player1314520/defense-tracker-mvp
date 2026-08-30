@@ -39,6 +39,7 @@ concurrency:
 jobs:
   publish-stable-release:
     name: Reverify, attest and publish immutable release
+    if: github.ref == 'refs/heads/main'
     environment: v9-production-release
     # Stable publication is isolated from the candidate builder and requires a
     # separately managed one-job runner registered with --ephemeral.
@@ -66,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.release_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
           clean: true

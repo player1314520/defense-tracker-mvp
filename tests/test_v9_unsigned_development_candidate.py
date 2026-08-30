@@ -219,6 +219,8 @@ def test_unsigned_development_workflow_is_ephemeral_read_only_and_main_bound():
     assert 'test "${GITHUB_SHA}" = "${RELEASE_SHA}"' in source
     assert 'test "${GITHUB_WORKFLOW_SHA}" = "${RELEASE_SHA}"' in source
     assert "persist-credentials: false" in source
+    assert "ref: ${{ github.sha }}" in source
+    assert "ref: ${{ inputs.release_sha }}" not in source
 
     assert (
         "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" in source

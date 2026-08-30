@@ -531,7 +531,7 @@ def test_deployment_lock_blocks_parallel_writer_and_allows_inherited_child(tmp_p
             "/bin/sh",
             "-c",
             '. "$1"; acquire_mvp_deployment_lock "$2"; '
-            'printf ready; sleep 10',
+            'printf ready; exec sleep 10',
             "lock-holder",
             str(helper),
             str(state_dir),
