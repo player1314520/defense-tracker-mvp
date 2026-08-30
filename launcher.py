@@ -317,11 +317,14 @@ if __name__ == '__main__':
             return
 
     window.events.initialized += _on_renderer_initialized
+    # pywebview starts the optional ``start(func=...)`` callback before the
+    # native window exists. Bind navigation to the real shown event so the
+    # first authenticated URL load cannot be silently dropped by WinForms.
+    window.events.shown += _on_shown
 
     # Explicit ephemeral WebView profile: auth/CSRF cookies and PKCE state do
     # not survive the desktop process or mix with another local browser app.
     webview.start(
-        _on_shown,
         gui="edgechromium",
         debug=False,
         private_mode=True,

@@ -157,6 +157,11 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert '_desktop_renderer != "edgechromium"' in launcher
     assert "需要 Microsoft Edge WebView2 Runtime" in launcher
     assert "window.events.initialized" in launcher
+    shown_subscription = "window.events.shown += _on_shown"
+    assert shown_subscription in launcher
+    assert launcher.index(shown_subscription) < launcher.index("    webview.start(")
+    start_call = launcher[launcher.index("    webview.start(") :]
+    assert "_on_shown," not in start_call.split(")", 1)[0]
     assert 'gui="edgechromium"' in launcher
     assert '"authenticated-loopback-v1"' in launcher
     assert '"X-Defense-Tracker-Smoke"' in launcher
