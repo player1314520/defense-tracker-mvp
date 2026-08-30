@@ -587,10 +587,15 @@ class SupabaseSessionManager:
         redirect_uri: str,
     ) -> dict[str, Any]:
         email = str(email or "").strip().lower()
-        if (
-            len(email) > 254
-            or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
-        ):
+        local, separator, domain = email.partition("@")
+        valid_email = bool(
+            separator
+            and local
+            and "@" not in domain
+            and not any(char.isspace() for char in email)
+            and "." in domain[1:-1]
+        )
+        if len(email) > 254 or not valid_email:
             raise ValueError("valid invited email is required")
         callback = self._validate_loopback_callback(redirect_uri)
         verifier = secrets.token_urlsafe(64)

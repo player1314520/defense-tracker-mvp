@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+import inspect
 import re
 
 import pytest
@@ -701,6 +702,89 @@ def test_extract_target_word_count_and_sanitize_forbidden_terms():
     assert "机密" not in cleaned
     assert "秘密" not in cleaned
     assert "报告" in cleaned
+
+
+def test_sanitize_report_text_preserves_cleanup_semantics_without_regex():
+    assert "re.sub" not in inspect.getsource(report_agent.sanitize_report_text)
+
+    cleaned = report_agent.sanitize_report_text(
+        " 绝密报告 \t，机密材料 （ 公开 ） 秘密来源。 "
+    )
+
+    assert cleaned == "报告，材料 （公开） 来源。"
+
+
+def test_atx_heading_parser_is_linear_and_obeys_markdown_boundaries():
+    assert "re.match" not in inspect.getsource(report_agent._markdown_headings)
+    content = (
+        "# 一级标题\n"
+        "   ### 三级标题 ###\n"
+        "## 标题内 # 保留\n"
+        "    ## 四空格不是标题\n"
+        "####### 七个井号不是标题\n"
+        "##缺少空格不是标题\n"
+    )
+
+    assert report_agent._markdown_headings(content) == [
+        (1, "一级标题", 0),
+        (3, "三级标题", 1),
+        (2, "标题内 # 保留", 2),
+    ]
+
+
+def test_newspaper_h2_extraction_is_linear_and_excludes_nested_headings():
+    assert "re.match" not in inspect.getsource(report_agent._newspaper_toc)
+    assert "re.match" not in inspect.getsource(report_agent._newspaper_section)
+    content = (
+        "## 执行摘要 ##\n摘要正文。\n"
+        "### 摘要子节\n子节正文。\n"
+        "   ## 核心判断\n判断正文。\n"
+        "### 判断细节\n细节正文。\n"
+        "## 来源附录\n来源正文。\n"
+    )
+
+    assert report_agent._newspaper_toc(content) == [
+        "执行摘要",
+        "核心判断",
+        "来源附录",
+    ]
+    assert report_agent._newspaper_section(content, "核心判断") == (
+        "判断正文。\n### 判断细节\n细节正文。"
+    )
+
+
+def test_inline_markdown_links_use_linear_balanced_parenthesis_parser():
+    assert "re.sub" not in inspect.getsource(report_agent._clean_inline_markdown)
+
+    cleaned = report_agent._clean_inline_markdown(
+        "参见 **[公开报告](https://example.test/a_(b))** 与 `公开摘要`。"
+    )
+
+    assert cleaned == (
+        "参见 公开报告（https://example.test/a_(b)） 与 公开摘要。"
+    )
+
+
+def test_markdown_block_parser_handles_pathological_heading_and_list_boundaries_without_regex(
+):
+    assert "re.match" not in inspect.getsource(report_agent._markdown_blocks)
+    pathological = "9" * (report_agent.MAX_REPORT_LINE_CHARS - 2) + ".x"
+    content = (
+        "###### 合法标题 ######\n"
+        "####### 七级标记是正文\n"
+        "- 列表一\n"
+        "2) 列表二\n"
+        f"{pathological}\n"
+    )
+
+    blocks = report_agent._markdown_blocks(content)
+
+    assert blocks[:3] == [
+        {"type": "heading", "level": 6, "text": "合法标题"},
+        {"type": "paragraph", "text": "####### 七级标记是正文"},
+        {"type": "list", "items": ["列表一", "列表二"]},
+    ]
+    assert blocks[3] == {"type": "paragraph", "text": pathological}
 
 
 def test_report_text_rejects_oversized_payload_and_line_before_regexes(monkeypatch):
