@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -22,29 +23,42 @@ _EVIDENCE_FIELDS = (
 )
 
 # pywebview.evaluate_js wraps source in eval, which the application's strict CSP
-# correctly blocks. run_js executes this source as-is and reports through
-# pywebview's CSP-compatible State bridge.
+# correctly blocks. run_js executes this source as-is. The async fetch stores an
+# allowlisted candidate in the page; a later poll returns its JSON string through
+# WebView2 ExecuteScriptAsync without relying on pywebview's postMessage bridge.
 DESKTOP_SMOKE_SCRIPT = r"""
 (function () {
+  var evidenceKey = '__defenseTrackerReleaseSmokeEvidenceV1';
+  var pendingKey = '__defenseTrackerReleaseSmokePendingV1';
+  if (window[evidenceKey]) {
+    return JSON.stringify(window[evidenceKey]);
+  }
+  if (window[pendingKey]) {
+    return '';
+  }
+  window[pendingKey] = true;
   fetch('/api/status', {
     credentials: 'same-origin', cache: 'no-store'
   }).then(function (response) {
     return response.json().catch(function () { return {}; }).then(function (payload) {
-      if (!window.pywebview || !window.pywebview.state) {
+      var workspaceReady = Boolean(document.querySelector('main.v9-workspace'));
+      if (!response.ok || !workspaceReady || window.location.pathname !== '/') {
+        window[pendingKey] = false;
         return;
       }
-      window.pywebview.state.desktopSmokeEvidence = {
+      window[evidenceKey] = {
         schema: 1,
         http_status: response.status,
         pathname: window.location.pathname,
-        workspace_ready: Boolean(document.querySelector('main.v9-workspace')),
+        workspace_ready: workspaceReady,
         version: payload.version || '',
         display_version: payload.display_version || '',
         release_tag: payload.release_tag || '',
         build_commit: payload.build_commit || ''
       };
     });
-  }).catch(function () {});
+  }).catch(function () { window[pendingKey] = false; });
+  return '';
 })();
 """
 
@@ -105,40 +119,37 @@ def start_desktop_smoke_probe(
     accepted = threading.Event()
     write_lock = threading.Lock()
 
-    def receive_desktop_smoke_state(event_type, key, result):
-        if event_type != "change" or key != "desktopSmokeEvidence":
-            return
-        if accepted.is_set():
-            return
-        normalized = validate_desktop_smoke_evidence(
-            result,
-            expected_version=expected_version,
-            expected_display_version=expected_display_version,
-            expected_release_tag=expected_release_tag,
-            expected_build_commit=expected_build_commit,
-        )
-        if normalized is None:
-            return
-        with write_lock:
-            if accepted.is_set():
-                return
-            # The desktop process never accepts or writes a caller-supplied path.
-            # The release harness retrieves this allowlisted payload over an
-            # authenticated loopback-only endpoint and owns evidence persistence.
-            evidence_sink(dict(normalized))
-            accepted.set()
-
-    window.state += receive_desktop_smoke_state
-
     def _probe() -> None:
         deadline = time.monotonic() + timeout_seconds
         while not accepted.is_set() and time.monotonic() < deadline:
             try:
-                window.run_js(DESKTOP_SMOKE_SCRIPT)
+                serialized = window.run_js(DESKTOP_SMOKE_SCRIPT)
             except Exception:
                 if accepted.wait(retry_seconds):
                     return
                 continue
+            if isinstance(serialized, str) and 0 < len(serialized) <= 4096:
+                try:
+                    result = json.loads(serialized)
+                except (TypeError, ValueError):
+                    result = None
+                normalized = validate_desktop_smoke_evidence(
+                    result,
+                    expected_version=expected_version,
+                    expected_display_version=expected_display_version,
+                    expected_release_tag=expected_release_tag,
+                    expected_build_commit=expected_build_commit,
+                )
+                if normalized is not None:
+                    with write_lock:
+                        if not accepted.is_set():
+                            # The desktop process never accepts or writes a
+                            # caller-supplied path. The release harness retrieves
+                            # this exact allowlist through its authenticated,
+                            # process-owned loopback endpoint.
+                            evidence_sink(dict(normalized))
+                            accepted.set()
+                    return
             accepted.wait(retry_seconds)
 
     thread = threading.Thread(target=_probe, daemon=True)

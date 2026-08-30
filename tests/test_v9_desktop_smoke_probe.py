@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import json
+
 import pytest
 
 from v9.desktop_smoke import (
@@ -61,30 +63,18 @@ def test_desktop_smoke_validation_rejects_wrong_or_malformed_fields(field, value
     assert _validate(payload) is None
 
 
-def test_desktop_smoke_probe_uses_csp_safe_bridge_and_emits_once():
+def test_desktop_smoke_probe_uses_csp_safe_return_value_and_emits_once():
     payload = _valid_evidence()
     accepted = []
 
     class FakeWindow:
         def __init__(self):
-            self.state = FakeState()
+            self.results = [None, "not-json", json.dumps(payload)]
             self.scripts = []
 
         def run_js(self, script):
             self.scripts.append(script)
-            assert self.state.handler is not None
-            if len(self.scripts) == 1:
-                self.state.handler("change", "unrelatedState", payload)
-                return
-            self.state.handler("change", "desktopSmokeEvidence", payload)
-
-    class FakeState:
-        def __init__(self):
-            self.handler = None
-
-        def __iadd__(self, handler):
-            self.handler = handler
-            return self
+            return self.results.pop(0)
 
     window = FakeWindow()
     thread = start_desktop_smoke_probe(
@@ -101,11 +91,41 @@ def test_desktop_smoke_probe_uses_csp_safe_bridge_and_emits_once():
 
     assert not thread.is_alive()
     assert accepted == [payload]
-    window.state.handler("change", "desktopSmokeEvidence", dict(payload, version="0.0.0"))
-    assert accepted == [payload]
-    assert window.scripts == [DESKTOP_SMOKE_SCRIPT, DESKTOP_SMOKE_SCRIPT]
-    assert "window.pywebview.state.desktopSmokeEvidence" in DESKTOP_SMOKE_SCRIPT
+    assert window.scripts == [
+        DESKTOP_SMOKE_SCRIPT,
+        DESKTOP_SMOKE_SCRIPT,
+        DESKTOP_SMOKE_SCRIPT,
+    ]
+    assert "fetch('/api/status'" in DESKTOP_SMOKE_SCRIPT
+    assert "document.querySelector('main.v9-workspace')" in DESKTOP_SMOKE_SCRIPT
+    assert "JSON.stringify" in DESKTOP_SMOKE_SCRIPT
+    assert "window.pywebview" not in DESKTOP_SMOKE_SCRIPT
     assert "eval(" not in DESKTOP_SMOKE_SCRIPT
+    assert "X-Defense-Tracker-Smoke" not in DESKTOP_SMOKE_SCRIPT
+
+
+def test_desktop_smoke_probe_never_emits_wrong_release_identity():
+    payload = dict(_valid_evidence(), build_commit="b" * 40)
+    accepted = []
+
+    class FakeWindow:
+        def run_js(self, _script):
+            return json.dumps(payload)
+
+    thread = start_desktop_smoke_probe(
+        FakeWindow(),
+        evidence_sink=accepted.append,
+        expected_version="9.0.0",
+        expected_display_version="V9",
+        expected_release_tag="v9.0.0",
+        expected_build_commit=COMMIT,
+        timeout_seconds=0.03,
+        retry_seconds=0.005,
+    )
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert accepted == []
 
 
 def test_desktop_smoke_probe_rejects_non_callable_evidence_sink():
