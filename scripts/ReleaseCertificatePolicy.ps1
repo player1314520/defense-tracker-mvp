@@ -170,6 +170,399 @@ function Get-CertificateSha256 {
     }
 }
 
+function Assert-ExactJsonProperties {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string[]]$Expected,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    if ($null -eq $Value -or $Value -isnot [psobject]) {
+        throw "$Description must be a JSON object."
+    }
+    $actual = @($Value.PSObject.Properties.Name | Sort-Object)
+    $wanted = @($Expected | Sort-Object)
+    if (($actual -join "`n") -cne ($wanted -join "`n")) {
+        throw "$Description has missing or unexpected fields."
+    }
+}
+
+function ConvertTo-ReleasePolicyText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [ValidateRange(1, 512)][int]$MaximumLength = 200
+    )
+
+    if ($Value -isnot [string]) { throw "$Description must be a string." }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text) -or $text.Length -gt $MaximumLength -or
+        $text.Contains("`r") -or $text.Contains("`n") -or $text.Contains([char]0)) {
+        throw "$Description is missing or malformed."
+    }
+    return $text
+}
+
+function ConvertTo-ReleasePolicyList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [ValidateRange(1, 4)][int]$MaximumCount = 4
+    )
+
+    if ($null -eq $Value -or $Value -is [string]) {
+        throw "$Description must be a JSON array."
+    }
+    $entries = @($Value)
+    if ($entries.Count -lt 1 -or $entries.Count -gt $MaximumCount) {
+        throw "$Description must contain between one and $MaximumCount entries."
+    }
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in $entries) {
+        $normalized = ConvertTo-ReleasePolicyText $entry $Description
+        if ($result.Contains($normalized)) { throw "$Description contains a duplicate entry." }
+        $result.Add($normalized)
+    }
+    return $result.ToArray()
+}
+
+function ConvertTo-ReleasePolicyNames {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [switch]$RequirePublisherRdns
+    )
+
+    $result = @(
+        ConvertTo-ReleasePolicyList $Value $Description |
+            ForEach-Object {
+                $name = ConvertTo-NormalizedX500Name $_
+                if ($RequirePublisherRdns -and
+                    ($name -cnotmatch '(?:^|,\s*)CN=' -or $name -cnotmatch '(?:^|,\s*)O=')) {
+                    throw "$Description must include both CN and organization RDNs."
+                }
+                $name
+            }
+    )
+    if (@($result | Sort-Object -Unique).Count -ne $result.Count) {
+        throw "$Description contains a duplicate normalized X.500 name."
+    }
+    return $result
+}
+
+function ConvertTo-ReleasePolicyHashes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    return @(
+        ConvertTo-ReleasePolicyList $Value $Description |
+            ForEach-Object {
+                $hash = $_.ToLowerInvariant()
+                if ($hash -cnotmatch '^[0-9a-f]{64}$') { throw "$Description contains a malformed SHA-256." }
+                $hash
+            }
+    )
+}
+
+function Assert-ReleasePolicyPinCardinality {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$SubjectCount,
+        [Parameter(Mandatory = $true)][int]$IssuerCount,
+        [Parameter(Mandatory = $true)][int]$RootCount
+    )
+
+    foreach ($count in @($IssuerCount, $RootCount)) {
+        if ($count -ne 1 -and $count -ne $SubjectCount) {
+            throw 'Issuer/root allowlists must contain one shared pin or one ordered pin per signer.'
+        }
+    }
+}
+
+function Get-ReleasePublisherPolicy {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('AzureArtifactSigning', 'DigiCertKeyLocker')]
+        [string]$SigningProvider,
+        [string]$AzureMetadataPath,
+        [string]$DigiCertSmHost,
+        [string]$DigiCertKeyAlias
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+        throw 'Committed Publisher policy is missing.'
+    }
+    $file = Get-Item -LiteralPath $fullPath
+    if ($file.Length -lt 2 -or $file.Length -gt 1048576) {
+        throw 'Committed Publisher policy size is invalid.'
+    }
+    $policyBytes = [System.IO.File]::ReadAllBytes($fullPath)
+    try {
+        $document = [System.Text.Encoding]::UTF8.GetString($policyBytes) |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw 'Committed Publisher policy is not valid UTF-8 JSON.'
+    }
+    Assert-ExactJsonProperties $document @(
+        '$schema','schema_version','status','publisher','active_provider','providers'
+    ) 'Publisher policy'
+    if ([string]$document.'$schema' -cne './publisher-policy.schema.json' -or
+        [int]$document.schema_version -ne 1) {
+        throw 'Publisher policy schema identity is unsupported.'
+    }
+    Assert-ExactJsonProperties $document.providers @(
+        'AzureArtifactSigning','DigiCertKeyLocker'
+    ) 'Publisher provider collection'
+    $azureDocument = $document.providers.AzureArtifactSigning
+    $digicertDocument = $document.providers.DigiCertKeyLocker
+    Assert-ExactJsonProperties $azureDocument @(
+        'status','endpoint','account_name','certificate_profile_name',
+        'expected_subjects','expected_issuers','expected_root_sha256',
+        'durable_identity_eku','public_trust_eku','code_signing_eku',
+        'forbidden_test_eku','leaf_spki_policy'
+    ) 'Azure Artifact Signing policy'
+    Assert-ExactJsonProperties $digicertDocument @(
+        'status','sm_host','key_alias','certificate_file_sha256',
+        'expected_subjects','expected_spki_sha256',
+        'expected_issuers','expected_root_sha256','code_signing_eku','leaf_spki_policy'
+    ) 'DigiCert KeyLocker policy'
+    if ([string]$azureDocument.public_trust_eku -cne '1.3.6.1.4.1.311.97.1.0' -or
+        [string]$azureDocument.code_signing_eku -cne '1.3.6.1.5.5.7.3.3' -or
+        [string]$azureDocument.forbidden_test_eku -cne '1.3.6.1.4.1.311.10.3.13' -or
+        [string]$azureDocument.leaf_spki_policy -cne 'record-only' -or
+        [string]$digicertDocument.code_signing_eku -cne '1.3.6.1.5.5.7.3.3' -or
+        [string]$digicertDocument.leaf_spki_policy -cne 'required-pin') {
+        throw 'Publisher policy changes a fixed provider trust rule.'
+    }
+
+    if ([string]$document.status -ceq 'pending') {
+        if ($null -ne $document.publisher -or $null -ne $document.active_provider -or
+            [string]$azureDocument.status -cne 'pending' -or
+            [string]$digicertDocument.status -cne 'pending' -or
+            $null -ne $azureDocument.endpoint -or $null -ne $azureDocument.account_name -or
+            $null -ne $azureDocument.certificate_profile_name -or
+            @($azureDocument.expected_subjects).Count -ne 0 -or
+            @($azureDocument.expected_issuers).Count -ne 0 -or
+            @($azureDocument.expected_root_sha256).Count -ne 0 -or
+            $null -ne $azureDocument.durable_identity_eku -or
+            $null -ne $digicertDocument.sm_host -or
+            $null -ne $digicertDocument.key_alias -or
+            $null -ne $digicertDocument.certificate_file_sha256 -or
+            @($digicertDocument.expected_subjects).Count -ne 0 -or
+            @($digicertDocument.expected_spki_sha256).Count -ne 0 -or
+            @($digicertDocument.expected_issuers).Count -ne 0 -or
+            @($digicertDocument.expected_root_sha256).Count -ne 0) {
+            throw 'Pending Publisher policy contains unapproved identity values.'
+        }
+        throw 'Publisher policy is pending verified legal and signing-provider identity.'
+    }
+    if ([string]$document.status -cne 'approved') {
+        throw 'Publisher policy status is unsupported.'
+    }
+    $publisher = ConvertTo-ReleasePolicyText $document.publisher 'Publisher legal name'
+    if ([string]$document.active_provider -cne $SigningProvider) {
+        throw 'Requested signing provider differs from the committed active provider.'
+    }
+    $providerDocument = $document.providers.$SigningProvider
+    if ([string]$providerDocument.status -cne 'approved') {
+        throw 'The committed active provider is not approved.'
+    }
+    $subjects = @(ConvertTo-ReleasePolicyNames $providerDocument.expected_subjects `
+        'Expected signer Subjects' -RequirePublisherRdns)
+    $issuers = @(ConvertTo-ReleasePolicyNames $providerDocument.expected_issuers `
+        'Expected signer Issuers')
+    $rootHashes = @(ConvertTo-ReleasePolicyHashes $providerDocument.expected_root_sha256 `
+        'Expected signer root SHA-256')
+    Assert-ReleasePolicyPinCardinality $subjects.Count $issuers.Count $rootHashes.Count
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $policySha256 = ([System.BitConverter]::ToString($sha256.ComputeHash($policyBytes))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+    $result = [ordered]@{
+        schema_version = 1
+        policy_path = $fullPath
+        policy_sha256 = $policySha256
+        provider = $SigningProvider
+        publisher = $publisher
+        subjects = $subjects
+        issuers = $issuers
+        root_sha256 = $rootHashes
+        required_eku_oids = @([string]$providerDocument.code_signing_eku)
+        forbidden_eku_oids = @()
+        leaf_spki_policy = [string]$providerDocument.leaf_spki_policy
+        spki_sha256 = @()
+    }
+
+    if ($SigningProvider -eq 'AzureArtifactSigning') {
+        $endpointText = ConvertTo-ReleasePolicyText $azureDocument.endpoint `
+            'Azure Artifact Signing endpoint' 512
+        try { $endpoint = [Uri]$endpointText } catch { throw 'Azure Artifact Signing endpoint is malformed.' }
+        if (-not $endpoint.IsAbsoluteUri -or $endpoint.Scheme -cne 'https' -or
+            -not [string]::IsNullOrEmpty($endpoint.UserInfo) -or
+            -not [string]::IsNullOrEmpty($endpoint.Query) -or
+            -not [string]::IsNullOrEmpty($endpoint.Fragment) -or
+            $endpoint.AbsoluteUri -cne $endpointText) {
+            throw 'Azure Artifact Signing endpoint must be a canonical credential-free HTTPS URI.'
+        }
+        $account = ConvertTo-ReleasePolicyText $azureDocument.account_name `
+            'Azure Artifact Signing account name'
+        $profile = ConvertTo-ReleasePolicyText $azureDocument.certificate_profile_name `
+            'Azure Artifact Signing certificate profile name'
+        foreach ($pair in @(@($account, 'account'), @($profile, 'certificate profile'))) {
+            if ([string]$pair[0] -cnotmatch '^[A-Za-z][A-Za-z0-9-]{2,99}$' -or
+                [string]$pair[0] -match '--' -or [string]$pair[0] -match '-$') {
+                throw "Azure Artifact Signing $($pair[1]) name is malformed."
+            }
+        }
+        $durableEku = ConvertTo-ReleasePolicyText $azureDocument.durable_identity_eku `
+            'Azure Artifact Signing durable identity EKU'
+        if ($durableEku -cnotmatch '^1\.3\.6\.1\.4\.1\.311\.97\.(?:[0-9]+\.)+[0-9]+$' -or
+            $durableEku -ceq '1.3.6.1.4.1.311.97.1.0' -or
+            $durableEku -match '^1\.3\.6\.1\.4\.1\.311\.97\.1\.(?:3|4)\.1(?:\.|$)') {
+            throw 'Azure Artifact Signing durable identity EKU is not a Public Trust subscriber identity.'
+        }
+        $result.required_eku_oids = @(
+            [string]$azureDocument.code_signing_eku,
+            [string]$azureDocument.public_trust_eku,
+            $durableEku
+        )
+        $result.forbidden_eku_oids = @([string]$azureDocument.forbidden_test_eku)
+        $result.azure = [ordered]@{
+            endpoint = $endpointText
+            account_name = $account
+            certificate_profile_name = $profile
+            durable_identity_eku = $durableEku
+            public_trust_eku = [string]$azureDocument.public_trust_eku
+            metadata_sha256 = $null
+        }
+        if (-not [string]::IsNullOrWhiteSpace($AzureMetadataPath)) {
+            $metadataFull = [System.IO.Path]::GetFullPath($AzureMetadataPath)
+            if (-not (Test-Path -LiteralPath $metadataFull -PathType Leaf) -or
+                (Get-Item -LiteralPath $metadataFull).Length -gt 65536) {
+                throw 'Azure Artifact Signing metadata file is missing or oversized.'
+            }
+            $metadataBytes = [System.IO.File]::ReadAllBytes($metadataFull)
+            try {
+                $metadata = [System.Text.Encoding]::UTF8.GetString($metadataBytes) |
+                    ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                throw 'Azure Artifact Signing metadata is not valid UTF-8 JSON.'
+            }
+            Assert-ExactJsonProperties $metadata @(
+                'Endpoint','CodeSigningAccountName','CertificateProfileName','CorrelationId'
+            ) 'Azure Artifact Signing metadata'
+            $correlation = ConvertTo-ReleasePolicyText $metadata.CorrelationId `
+                'Azure Artifact Signing CorrelationId' 512
+            if ([string]$metadata.Endpoint -cne $endpointText -or
+                [string]$metadata.CodeSigningAccountName -cne $account -or
+                [string]$metadata.CertificateProfileName -cne $profile) {
+                throw 'Azure Artifact Signing metadata differs from the committed account/profile/endpoint policy.'
+            }
+            $metadataHasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $metadataSha256 = ([System.BitConverter]::ToString(
+                    $metadataHasher.ComputeHash($metadataBytes)
+                )).Replace('-', '').ToLowerInvariant()
+            } finally {
+                $metadataHasher.Dispose()
+            }
+            $result.azure.metadata_sha256 = $metadataSha256
+            $result.azure.correlation_id = $correlation
+        }
+    } else {
+        $smHostText = ConvertTo-ReleasePolicyText $digicertDocument.sm_host `
+            'DigiCert Software Trust Manager host' 512
+        try { $smHost = [Uri]$smHostText } catch { throw 'DigiCert Software Trust Manager host is malformed.' }
+        if (-not $smHost.IsAbsoluteUri -or $smHost.Scheme -cne 'https' -or
+            -not [string]::IsNullOrEmpty($smHost.UserInfo) -or
+            -not [string]::IsNullOrEmpty($smHost.Query) -or
+            -not [string]::IsNullOrEmpty($smHost.Fragment) -or
+            $smHost.AbsoluteUri -cne $smHostText) {
+            throw 'DigiCert Software Trust Manager host must be a canonical credential-free HTTPS URI.'
+        }
+        $keyAlias = ConvertTo-ReleasePolicyText $digicertDocument.key_alias `
+            'DigiCert KeyLocker key alias'
+        if (-not [string]::IsNullOrWhiteSpace($DigiCertSmHost) -and
+            $DigiCertSmHost -cne $smHostText) {
+            throw 'DigiCert runtime SM host differs from the committed Publisher policy.'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DigiCertKeyAlias) -and
+            $DigiCertKeyAlias -cne $keyAlias) {
+            throw 'DigiCert runtime key alias differs from the committed Publisher policy.'
+        }
+        $spkiHashes = @(ConvertTo-ReleasePolicyHashes $digicertDocument.expected_spki_sha256 `
+            'Expected signer SPKI SHA-256')
+        if ($subjects.Count -ne $spkiHashes.Count) {
+            throw 'DigiCert signer Subject and SPKI allowlists must have the same ordered count.'
+        }
+        $certificateFileSha256 = ConvertTo-ReleasePolicyText `
+            $digicertDocument.certificate_file_sha256 'DigiCert certificate-file SHA-256'
+        if ($certificateFileSha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'DigiCert certificate-file SHA-256 is malformed.'
+        }
+        $result.spki_sha256 = $spkiHashes
+        $result.digicert = [ordered]@{
+            sm_host = $smHostText
+            key_alias = $keyAlias
+            certificate_file_sha256 = $certificateFileSha256
+        }
+    }
+    return $result
+}
+
+function Get-ReleasePublisherPolicyEvidence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Policy)
+
+    if ([string]$Policy.policy_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Policy.leaf_spki_policy -notin @('record-only','required-pin')) {
+        throw 'Loaded Publisher policy evidence is incomplete.'
+    }
+    if ([string]$Policy.provider -eq 'AzureArtifactSigning') {
+        if ([string]$Policy.azure.metadata_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Azure Publisher-policy evidence requires exact metadata provenance.'
+        }
+        return [ordered]@{
+            sha256 = [string]$Policy.policy_sha256
+            leaf_spki_policy = 'record-only'
+            durable_identity_eku = [string]$Policy.azure.durable_identity_eku
+            azure_endpoint = [string]$Policy.azure.endpoint
+            azure_account_name = [string]$Policy.azure.account_name
+            azure_certificate_profile_name = [string]$Policy.azure.certificate_profile_name
+            azure_metadata_sha256 = [string]$Policy.azure.metadata_sha256
+            digicert_sm_host = $null
+            digicert_key_alias = $null
+        }
+    }
+    if ([string]$Policy.provider -ne 'DigiCertKeyLocker') {
+        throw 'Loaded Publisher policy provider is unsupported.'
+    }
+    return [ordered]@{
+        sha256 = [string]$Policy.policy_sha256
+        leaf_spki_policy = 'required-pin'
+        durable_identity_eku = $null
+        azure_endpoint = $null
+        azure_account_name = $null
+        azure_certificate_profile_name = $null
+        azure_metadata_sha256 = $null
+        digicert_sm_host = [string]$Policy.digicert.sm_host
+        digicert_key_alias = [string]$Policy.digicert.key_alias
+    }
+}
+
 function Get-ReleaseCertificatePolicy {
     [CmdletBinding()]
     param(
@@ -218,11 +611,34 @@ function Get-ReleaseCertificatePolicy {
         }
     }
     return [ordered]@{
+        provider = 'DigiCertKeyLocker'
+        publisher = $null
+        leaf_spki_policy = 'required-pin'
+        required_eku_oids = @('1.3.6.1.5.5.7.3.3')
+        forbidden_eku_oids = @()
+        digicert = $null
         subjects = $subjects
         spki_sha256 = $spkiHashes
         issuers = $issuers
         root_sha256 = $rootHashes
     }
+}
+
+function Get-CertificateEnhancedKeyUsageOids {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($extension in $Certificate.Extensions) {
+        if ($extension -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]) {
+            foreach ($oid in $extension.EnhancedKeyUsages) {
+                if (-not $result.Contains([string]$oid.Value)) { $result.Add([string]$oid.Value) }
+            }
+        }
+    }
+    return $result.ToArray()
 }
 
 function Test-CodeSigningEku {
@@ -231,13 +647,10 @@ function Test-CodeSigningEku {
         [Parameter(Mandatory = $true)]
         [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
     )
-    foreach ($extension in $Certificate.Extensions) {
-        if ($extension -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
-            @($extension.EnhancedKeyUsages | Where-Object { $_.Value -ceq '1.3.6.1.5.5.7.3.3' }).Count -gt 0) {
-            return $true
-        }
-    }
-    return $false
+    return @(
+        Get-CertificateEnhancedKeyUsageOids $Certificate |
+            Where-Object { $_ -ceq '1.3.6.1.5.5.7.3.3' }
+    ).Count -gt 0
 }
 
 function Assert-TrustedCertificateChain {
@@ -281,19 +694,54 @@ function Assert-ReleaseSignerCertificatePolicy {
         [Parameter(Mandatory = $true)]$Policy
     )
 
+    if ([string]$Policy.provider -notin @('AzureArtifactSigning','DigiCertKeyLocker')) {
+        throw 'Signer certificate policy provider is unsupported.'
+    }
     $subject = ConvertTo-NormalizedX500Name $Certificate.SubjectName
+    if (-not [string]::IsNullOrWhiteSpace([string]$Policy.publisher)) {
+        $simpleName = $Certificate.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+            $false
+        )
+        if ($simpleName -cne [string]$Policy.publisher) {
+            throw 'Signer certificate simple Publisher differs from the committed legal Publisher.'
+        }
+    }
     $spkiSha256 = Get-CertificateSpkiSha256 $Certificate
     $matchingPolicy = @()
     for ($index = 0; $index -lt $Policy.subjects.Count; $index++) {
-        if ($subject -ceq [string]$Policy.subjects[$index] -and
+        $subjectMatches = $subject -ceq [string]$Policy.subjects[$index]
+        if ($Policy.provider -eq 'AzureArtifactSigning') {
+            # Artifact Signing rotates short-lived leaf certificates daily. The leaf SPKI is evidence only,
+            # never a durable Azure allow decision; the subscriber EKU and service provenance are pinned.
+            if ($subjectMatches) { $matchingPolicy += $index }
+        } elseif ($subjectMatches -and
             $spkiSha256 -ceq [string]$Policy.spki_sha256[$index]) {
             $matchingPolicy += $index
         }
     }
     if ($matchingPolicy.Count -ne 1) {
-        throw 'Signer certificate Subject/SPKI is outside the protected ordered allowlist.'
+        if ($Policy.provider -eq 'AzureArtifactSigning') {
+            throw 'Azure signer certificate Subject is outside the protected ordered allowlist.'
+        }
+        throw 'DigiCert signer certificate Subject/SPKI is outside the protected ordered allowlist.'
     }
     $policyIndex = [int]$matchingPolicy[0]
+    $ekuOids = @(Get-CertificateEnhancedKeyUsageOids $Certificate)
+    foreach ($requiredOid in @($Policy.required_eku_oids)) {
+        if (@($ekuOids | Where-Object { $_ -ceq [string]$requiredOid }).Count -ne 1) {
+            if ($Policy.provider -eq 'AzureArtifactSigning' -and
+                [string]$requiredOid -ceq [string]$Policy.azure.durable_identity_eku) {
+                throw 'Azure Artifact Signing durable identity EKU is missing.'
+            }
+            throw "Signer certificate lacks required EKU $requiredOid."
+        }
+    }
+    foreach ($forbiddenOid in @($Policy.forbidden_eku_oids)) {
+        if (@($ekuOids | Where-Object { $_ -ceq [string]$forbiddenOid }).Count -gt 0) {
+            throw "Signer certificate contains forbidden test EKU $forbiddenOid."
+        }
+    }
     $chainIdentity = Assert-TrustedCertificateChain $Certificate -RequireCodeSigningEku
     $issuerIndex = if ($Policy.issuers.Count -eq 1) { 0 } else { $policyIndex }
     $rootIndex = if ($Policy.root_sha256.Count -eq 1) { 0 } else { $policyIndex }
@@ -304,11 +752,16 @@ function Assert-ReleaseSignerCertificatePolicy {
         throw 'Signer root certificate differs from the protected root pin.'
     }
     return [ordered]@{
+        provider = [string]$Policy.provider
         policy_index = $policyIndex
         normalized_subject = $subject
         spki_sha256 = $spkiSha256
+        leaf_spki_policy = [string]$Policy.leaf_spki_policy
         issuer_subject = [string]$chainIdentity.issuer_subject
         root_sha256 = [string]$chainIdentity.root_sha256
+        durable_identity_eku = if ($Policy.provider -eq 'AzureArtifactSigning') {
+            [string]$Policy.azure.durable_identity_eku
+        } else { $null }
     }
 }
 
@@ -343,8 +796,15 @@ function Assert-DigiCertCertificateFilePolicy {
         [Parameter(Mandatory = $true)]$Policy
     )
 
+    if ([string]$Policy.provider -cne 'DigiCertKeyLocker') {
+        throw 'DigiCert certificate file cannot be checked against a non-DigiCert policy.'
+    }
     if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw 'Protected DigiCert certificate-file SHA-256 is missing or malformed.'
+    }
+    if ($null -ne $Policy.digicert -and
+        [string]$Policy.digicert.certificate_file_sha256 -cne $ExpectedSha256) {
+        throw 'DigiCert certificate-file SHA-256 differs from the committed Publisher policy.'
     }
     $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -cne $ExpectedSha256) {

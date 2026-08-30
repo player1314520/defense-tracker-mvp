@@ -41,11 +41,11 @@ def test_build_gate_requires_isolated_python_and_full_release_checks():
     assert "Invoke-InstallerLifecycleSmokeTest" in source
     assert "Invoke-LegacyMigrationSmokeTest" in source
     assert "DEFENSE_TRACKER_COMPLIANCE_EVIDENCE" in source
-    assert "DEFENSE_TRACKER_COMPLIANCE_SIGNATURE" in source
     assert "DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256" in source
-    assert source.index("verify_compliance_evidence.py") < source.index(
-        "Invoke-SignAndVerify $stagedExe"
-    )
+    assert "Legacy in-process signing is removed" in source
+    assert "Invoke-SignAndVerify" not in source
+    assert "PrepareUnsignedApplicationBundle" in source
+    assert "signing_exchange.py" in source
     assert "portable-authenticated-workspace" in (
         PROJECT_ROOT / "scripts" / "finalize_release_assets.py"
     ).read_text(encoding="utf-8")
@@ -64,79 +64,51 @@ def test_signed_candidate_is_two_stage_and_never_signs_installer_in_stage_a():
         PROJECT_ROOT / "scripts" / "Finalize-SignedCandidate.ps1"
     ).read_text(encoding="utf-8-sig")
 
-    assert "Single-stage signed release builds are disabled" in stage_a
-    candidate_start = stage_a.index("if ($CandidateOnly) {", stage_a.index("$stagedInstaller"))
-    candidate_end = stage_a.index("\n        return", candidate_start)
-    candidate_block = stage_a[candidate_start:candidate_end]
-    assert "authenticode_digest.py" in candidate_block
-    assert "--require-state unsigned" in candidate_block
-    assert "installer-review-request.json" in candidate_block
-    assert "generate_installer_review_request.py" in candidate_block
-    assert "candidate-preparations" in candidate_block
-    assert "Invoke-SignAndVerify $stagedInstaller" not in candidate_block
-    assert "package_release_assets.py" not in candidate_block
-    assert candidate_block.index("$resolvedSevenZip x") < candidate_block.index(
-        "generate_installer_review_request.py"
-    )
-
-    assert "Copy-Item -LiteralPath $unsignedInstaller -Destination $signedInstaller" in stage_b
-    assert "Invoke-SignAndVerify $signedInstaller" in stage_b
-    assert "Invoke-SignAndVerify $unsignedInstaller" not in stage_b
-    assert "Application and installer reviews must use distinct registered Ed25519 keys" in stage_b
-    pre_review = stage_b.index("installer_review.py') pre-sign")
-    sign_installer = stage_b.index("$installerSignature = Invoke-SignAndVerify")
-    post_review = stage_b.index("installer_review.py') post-sign")
+    assert "Legacy in-process signing is removed" in stage_a
+    assert "Invoke-SignAndVerify" not in stage_a + stage_b
+    assert "signing_exchange.py') verify-return" in stage_b
+    assert stage_b.count("--expected-job") == 2
+    assert "Get-ReleasePublisherPolicy" in stage_b
+    assert "Assert-ReleaseSignerCertificatePolicy" in stage_b
+    assert "Invoke-InstallerLifecycleSmokeTest" in stage_b
+    assert stage_b.index("--portable-inventory-only") < stage_b.index("Expand-Archive")
     package = stage_b.index("package_release_assets.py")
-    assert pre_review < sign_installer < post_review < package
-    assert stage_b.index("Assert-PreparationBundle") < pre_review
-    assert stage_b.index("--require-state signed", sign_installer) < post_review
-    assert stage_b.index("Invoke-InstallerLifecycleSmokeTest", post_review) < package
+    assert stage_b.index("verify-return") < package
     for binding in (
-        "--installer-review-evidence",
-        "--installer-review-signature",
-        "--installer-reviewer-registry",
-        "--unsigned-installer",
+        "--application-signing-request",
+        "--application-signing-receipt",
+        "--installer-signing-request",
+        "--installer-signing-receipt",
+        "--installer-review-request",
         "--installer-payload-root",
-        "--application-reviewer-key-id",
     ):
         assert binding in stage_b
+    assert "--compliance-approval-context" not in stage_b
 
 
 def test_candidate_workflow_separates_application_and_installer_trust_environments():
-    workflow = (
+    application = (
+        PROJECT_ROOT / ".github" / "workflows" / "v9-application-signing.yml"
+    ).read_text(encoding="utf-8")
+    installer = (
         PROJECT_ROOT / ".github" / "workflows" / "v9-signed-candidate.yml"
     ).read_text(encoding="utf-8")
 
-    assert "prepare-installer-review:" in workflow
-    assert "finalize-signed-candidate:" in workflow
-    assert (
-        "needs:\n"
-        "      - signing-isolation-gate\n"
-        "      - verify-release-request\n"
-        "      - prepare-installer-review"
-    ) in workflow
-    assert "environment: v9-trusted-signing" in workflow
-    assert "environment: v9-installer-signing-review" in workflow
-    assert "defense-v9-candidate-ephemeral" in workflow
-    assert "defense-v9-installer-ephemeral" in workflow
-    assert "actions/download-artifact@" in workflow
-    assert "gh attestation verify" in workflow
-    assert "DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE" in workflow
-    assert "DEFENSE_TRACKER_INSTALLER_REVIEW_SIGNATURE" in workflow
-    assert "DEFENSE_TRACKER_INSTALLER_REVIEW_EVIDENCE_SHA256" in workflow
-    assert "      DEFENSE_TRACKER_PREPARATION_ARTIFACT_NAME: ${{ env." not in workflow
-    workflow_lines = workflow.splitlines()
-    preparation_root = (
-        "PREPARATION_ROOT: ${{ runner.temp }}\\DefenseTracker-v9-preparation"
-    )
-    assert f"      {preparation_root}" not in workflow_lines
-    assert workflow_lines.count(f"          {preparation_root}") == 2
-    assert workflow.index("Attest candidate build provenance") < workflow.index(
-        "Retain candidate preparation bundle"
-    )
-    assert workflow.index("Verify preparation run and every attested file") < workflow.index(
-        "Finalize independently reviewed installer candidate"
-    )
+    assert "sign-application:" in application
+    assert "prepare-unsigned-installer:" in application
+    assert "name: v9-trusted-signing" in application
+    assert "name: v9-candidate-processing" in application
+    assert "sign-installer:" in installer
+    assert "finalize-signed-candidate:" in installer
+    assert "name: v9-installer-signing-review" in installer
+    assert "name: v9-candidate-processing" in installer
+    assert "RELEASE_ARTIFACT_AGE_IDENTITY" in application + installer
+    assert "application-signing-request.json" in application
+    assert "installer-signing-request.json" in application + installer
+    assert "actions/download-artifact@" in application + installer
+    assert "candidate-transport-request.json" in application + installer
+    assert "self-hosted" not in application + installer
+    assert "github_environment_approval.py create" not in application + installer
 
 
 def test_build_environment_preparation_is_explicit_and_separate():

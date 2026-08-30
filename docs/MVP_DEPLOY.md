@@ -561,15 +561,22 @@ Auth、REST、Realtime、Storage、Functions 等所有
 全站维护、当前数据冻结、备份哈希复核和明确恢复授权后，将同一已演练包恢复到
 全新的 Supabase 数据目录，再切换域名；禁止原地覆盖未知状态的数据目录。
 
-桌面正式发布仍从 `scripts/Build-AndShip.ps1` 进入，但必须增加
-`-RequireSignedInstaller`，并通过环境变量或参数提供预置的 `ISCC.exe`、
-`signtool.exe`、7-Zip、Defender 及其预期 SHA-256，并配置 Microsoft Artifact
-Signing（GitHub OIDC）或 DigiCert KeyLocker、HTTPS RFC 3161 时间戳 URL 与经法律
-确认的 Publisher。门禁不会安装工具、使用自签名证书或从仓库读取签名秘密。它在
-staging 中先签 EXE，使用 `/fd SHA256 /tr <URL> /td SHA256`，再由 Inno Setup
-生成安装包并签名；两者都必须通过 SignTool、`Get-AuthenticodeSignature`、签名链、
-代码签名 EKU、Publisher 和时间戳证书检查。资产归档到
-`dist/releases/v9.0.0/<完整Git SHA>/`；旧活动目录先枚举后移入 `dist/archive/`。
+Windows 正式候选采用四段隔离流程。`v9-release-preparation.yml` 无凭据构建、扫描并
+加密 unsigned application；`v9-application-signing.yml` 的 signer-only job 只签应用，
+随后由无签名凭据的 job 生成 unsigned installer；`v9-signed-candidate.yml` 的
+signer-only job 只签安装器，随后由无签名凭据的 job 完成烟测、SBOM 和固定六资产；
+`v9-stable-release.yml` 先只读验证并生成 promotion request，再由
+`v9-production-release` 中唯一具有 `contents:write` 的 job 发布。旧入口
+`Build-AndShip.ps1 -RequireSignedInstaller` 已永久 fail-closed，不能再用于正式签名。
+
+Python、Inno Setup、7-Zip、Defender 等构建或检查工具只出现在无签名凭据阶段。
+signer-only job 不 checkout、不安装 Python 依赖、不运行仓库脚本、不构建安装器、
+不执行候选程序；它只下载固定哈希的 `age`、SignTool 和所需签名客户端，核对先前
+生成的 request 与完整 payload 后签一个 PE。两类签名都使用
+`/fd SHA256 /tr <URL> /td SHA256`，并通过 SignTool、
+`Get-AuthenticodeSignature`、签名链、provider-specific EKU、Publisher 和时间戳
+证书检查。最终本地产物可归档到 `dist/releases/v9.0.0/<完整Git SHA>/`；旧活动目录
+先枚举后移入 `dist/archive/`。
 没有可信 manifest 的旧版必须显式提供经审计的归档 ID（本机既有旧版为
 `88d507f-20260725`），脚本不会猜测身份或删除旧文件。
 
@@ -582,7 +589,8 @@ staging 中先签 EXE，使用 `/fd SHA256 /tr <URL> /td SHA256`，再由 Inno S
 2. 单 VPS 仍是单点故障；异机加密备份能支持恢复，但不提供无中断高可用。
 3. 备份脚本能证明密文上传与隔离恢复，不会证明对象存储账号长期可用、保留策略
    正确或实际 RTO 达标；这些必须通过持续监控和定期演练证明。
-4. 代码签名门禁能验证已提供证书的签名和时间戳，不能购买证书、保护硬件私钥、
+4. 代码签名门禁能验证已提供证书的签名和可信时间戳，但不解析或保存 RFC 3161
+   token 的实际签发时刻，也不能购买证书、保护硬件私钥、
    建立发行主体信誉，也不会绕过 Windows SmartScreen。
 5. 自托管降低平台依赖但把补丁、监控、扩容、灾备责任转移给运营方；未完成这些
    门禁时，不得把 `INVITED_SIGNUP_ENABLED` 改为 `true`。
@@ -593,14 +601,16 @@ staging 中先签 EXE，使用 `/fd SHA256 /tr <URL> /td SHA256`，再由 Inno S
 7. Portal 与桌面 Python 安装已经使用传递依赖 hash lock，候选构建也绑定工具链哈希
    与 provenance；但最终 onedir、安装器、容器原生库的许可证归属仍未完成独立复核，
    当前生成的 SPDX 含 `NOASSERTION`。该状态必须阻断 stable Release，不能仅凭 lockfile
-   宣称 SBOM 或许可证闭环。签名工作流会在首次签名之前要求 Ed25519 审核者签名且
-   SHA-256 固定的 compliance evidence；审核者公钥必须先通过独立治理变更登记到源码
-   registry。证据绑定提交、source tree、Publisher、两个 lock、实际安装包清单、
+   宣称 SBOM 或许可证闭环。首次签名前必须核对独立公开 evidence commit、精确
+   compliance evidence SHA、先前无凭据阶段生成的 canonical signing request、artifact
+   digest、run ID/attempt，以及受保护 `main` 中 `release/publisher-policy.json` 的精确
+   SHA。证据绑定提交、source tree、Publisher、两个 lock、实际安装包清单、
    THIRD_PARTY_NOTICES，以及预签名 onedir 中每个 EXE/DLL/原生库/资源的路径、字节数、
    SHA-256、SPDX 许可证与版权文字。打包后 SBOM 再绑定最终签名安装器、portable ZIP
-   和 portable 内每个文件的最终哈希。当前 reviewer registry 明确为 inactive，因此
-   signed candidate 和 stable Release 都会在首次签名前 fail-closed；法律主体、审核者
-   公钥与完整组件复核完成后才能生成不含 `NOASSERTION` 的私有候选。
+   和 portable 内每个文件的最终哈希。当前 Publisher policy 明确为 `pending`，且尚无
+   经法律复核的完整 evidence，因此 signed candidate 和 stable Release 会在首次签名前
+   fail-closed。Environment 批准当前允许由同一维护者完成，属于可审计单维护者模式，
+   并非独立双人复核；批准只允许 job 启动，不能离线证明审批人逐字节检查了候选。
 8. Portal/backend 的字段已分别收敛到单一 generation 文档，并用带状态摘要的 durable
    marker 阻止保留的旧字段在 JSON 丢失后复活；marker 绑定不可变的第 1 代谱系锚点，
    后续 generation 只需一次原子文档替换。容器切换也使用预写意图日志。文件系统

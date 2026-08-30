@@ -101,16 +101,16 @@ Describe 'Build-And-Ship Stage A signing identity gate' {
         Mock Assert-TrustedCertificateChain { return $script:chainIdentity }
     }
 
-    It 'places full policy and DigiCert file validation before the first sign command' {
+    It 'removes the legacy in-process signing command before any build work' {
         $source = [System.IO.File]::ReadAllText($buildScriptPath)
-        $policy = $source.IndexOf('$certificatePolicy = Get-ReleaseCertificatePolicy')
-        $certificateFile = $source.IndexOf(
-            '$digicertCertificateIdentity = Assert-DigiCertCertificateFilePolicy'
-        )
-        $sign = $source.IndexOf('$signatureEvidence = Invoke-SignAndVerify $stagedExe')
-        if ($policy -lt 0 -or $certificateFile -lt 0 -or $sign -lt 0 -or
-            -not ($policy -lt $certificateFile -and $certificateFile -lt $sign)) {
-            throw 'Stage A certificate policy/file gates do not precede the first sign command.'
+        $legacyGate = $source.IndexOf('if ($RequireSignedInstaller -or $CandidateOnly)')
+        $legacyThrow = $source.IndexOf('Legacy in-process signing is removed.', $legacyGate)
+        $firstFunction = $source.IndexOf('function Get-Sha256')
+        if ($legacyGate -lt 0 -or $legacyThrow -lt 0 -or $firstFunction -lt 0 -or
+            -not ($legacyGate -lt $legacyThrow -and $legacyThrow -lt $firstFunction) -or
+            $source.Contains('function Invoke-SignAndVerify') -or
+            $source.Contains('Invoke-SignAndVerify $stagedExe')) {
+            throw 'Legacy in-process signing is still reachable.'
         }
     }
 

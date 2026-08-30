@@ -43,12 +43,11 @@ def test_signed_candidate_workflow_consumes_the_tagged_candidate_directory():
         encoding="utf-8"
     )
 
-    assert workflow.count("dist/candidates/v9.0.0/") == 2
-    assert '"dist\\candidates\\v9.0.0\\$env:RELEASE_SHA"' in workflow
-    assert "-CandidateOnly" in workflow
-    assert "dist/releases/9.0.0/" not in workflow
-    assert "dist/releases/v9.0.0/" not in workflow
-    assert '"dist\\releases\\9.0.0\\$env:RELEASE_SHA"' not in workflow
+    assert "dist/candidates/" not in workflow
+    assert "DefenseTracker-v9.0.0-candidate-" in workflow
+    assert "candidate-envelope\\*" in workflow
+    assert "Protect-ReleaseArtifact.ps1" in workflow
+    assert "path: ${{ env.OUTPUT_ROOT }}\\release-assets\\*" not in workflow
 
 
 def test_schema2_build_metadata_names_source_epoch_truthfully(tmp_path):

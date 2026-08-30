@@ -45,11 +45,11 @@
   - 主 V9 页面识别到 11 屏，1440×900 与 390×844 均无横向溢出；
   - 诊断 API 返回 HTTP 200、`application/zip`；
   - console 0 error、0 warning；V9 situation/rules/diagnostics 均 HTTP 200。
-- 截图：`docs/release-evidence/P7/main-1440.png`、
-  `docs/release-evidence/P7/main-390.png`。
+- 当时的桌面/移动截图属于历史私有验证证据，未纳入公开仓。
 - staged gitleaks：0。
-- 标准桌面发布门禁通过：共享 Python 指纹不变、staging 递归秘密扫描、
-  PE/时间戳、EXE 启动、HTTP/V9/窗口标题和原子提升全部成功。
+- 当时的旧版本地构建门禁通过：共享 Python 指纹不变、staging 递归秘密扫描、
+  PE 新鲜度/构建时间检查、EXE 启动、HTTP/V9/窗口标题和原子提升全部成功；
+  该“时间”检查不是 RFC 3161 Authenticode 时间戳。
 - 最终 EXE：12,352,258 字节；SHA-256
   `162EC648CF3DC2FDBD8F904EB6C9123D1396D9B3E52FE3E467A1D252C13F1A8B`。
 - 发布清单：2832 个文件；提交

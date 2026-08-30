@@ -57,42 +57,48 @@ Run these gates against the exact commit and tracked tree to be published:
 Passing CI alone authorizes neither remote deployment nor a live-readiness
 claim.
 
-A signed candidate requires two source-registered Ed25519 decisions. The first
-reviews the hash-pinned application components before the first release
-signature; the second, using a distinct public key, reviews the exact unsigned
-installer, its full extracted payload, build recipe, tools, and bootstrap
-license. Stage A may sign the application and retain the attested unsigned
-installer review bundle, but cannot sign the installer or create final assets.
-Stage B must consume that exact run-bound bundle, authenticate the independent
-approval, and prove the signed installer has the same Authenticode-neutral bytes
-and complete payload before packaging. The evidence binds the exact commit,
-source tree, Publisher, dependency locks, installed package inventory,
-third-party notices, and final shipped bytes. If any evidence, reviewer,
-component, payload entry, signature, or binding is absent or mismatched,
-candidate creation stops. The stable verifier independently requires the two
-reviews, a final-shipped-bytes SBOM without `NOASSERTION`, and complete deployment
-evidence; no manifest flag may be changed after packaging.
+The Windows chain is split across four manually dispatched workflows and fresh
+GitHub-hosted `windows-2022` machines:
 
-Signed-candidate dispatch is presently fail-closed before credentials. A
-tokenless GitHub-hosted job emits a structured isolation blocker and exits
-non-zero before any protected signing environment, OIDC login, secret, or
-self-hosted runner is eligible to start. Enabling the path requires three
-separate roles: credentialless build/scan approval, hash-verifying signing that
-never executes the candidate, and post-signature smoke testing in a
-credentialless or least-privileged restricted-egress single-use VM. The
-controller must record runner deregistration and VM destruction; absence of
-either receipt remains a release blocker.
+1. `v9-release-preparation.yml` has no signing or decryption identity. It builds
+   and scans the unsigned application, then emits a canonical public signing
+   request plus an `age`-encrypted application bundle.
+2. `v9-application-signing.yml` verifies the exact prior run, artifact digest,
+   request SHA, compliance evidence, and committed Publisher-policy SHA.
+   `v9-trusted-signing` admits a signer-only job that signs only the reviewed
+   application PE. A later credentialless job builds the unsigned installer and
+   emits its request and encrypted bundle.
+3. `v9-signed-candidate.yml` repeats the exact-byte checks.
+   `v9-installer-signing-review` admits a signer-only job that signs only the
+   reviewed installer PE. A credentialless finalizer then verifies both signing
+   receipts, payloads, smoke tests, malware checks, SBOM, and the fixed six
+   assets before encrypting the final candidate.
+4. `v9-stable-release.yml` performs read-only production verification and emits
+   a public promotion request. The separate `v9-production-release` job is the
+   only job with `contents:write`; it has no signing identity, re-decrypts the
+   exact candidate, matches every byte to the promotion request, then publishes.
 
-The signed-candidate workflow accepts no SHA input. A source-free preflight
-queries the fixed `player1314520/defense-tracker-mvp` GitHub API endpoint and
-proves that current protected `main` is the lowercase 40-hex workflow revision;
-downstream jobs use GitHub's immutable `github.sha` context directly and remain
-blocked unless that independent preflight succeeds. The source-ZIP CLI likewise
-accepts no output path: it writes only
+Environment approval allows a job to start; it does not prove that the reviewer
+inspected bytes created after approval. Each signing request therefore exists in
+a prior credentialless job/run and is bound by request SHA, artifact digest, run
+ID/attempt, exact protected-main commit, and an Environment URL visible before
+approval. A signing receipt binds the post-signature bytes and signer-policy
+evidence; it does not invent an approver identity. GitHub's Environment audit
+trail remains the online record. The current arrangement is honestly
+`single-maintainer-audited`, not independent two-person review.
+
+Signer-only jobs do not checkout source, install Python dependencies, run
+repository scripts, build installers, execute candidate programs, or run
+Defender. They download only hash-pinned `age`, SignTool, and the provider client
+needed for one signature. Python, Inno Setup, 7-Zip, Defender, and application
+tests remain in credentialless jobs. Azure uses GitHub OIDC; temporary DigiCert
+material is validated against the committed policy and removed unconditionally.
+
+Public Actions artifacts contain ciphertext and sanitized requests/receipts,
+not plaintext candidate binaries. The source-ZIP CLI likewise accepts no output
+path: it writes only
 `build/release-evidence/source-zips/DefenseTracker-source-<expected-sha>.zip`.
 Existing targets, links, reparse points, and non-directory parents fail closed.
-Tests may call the internal API with two distinct controlled new names to prove
-the archives hash identically.
 
 ## Stable `v9.x` rule
 
@@ -113,5 +119,14 @@ See [the release signing policy](RELEASE_SIGNING_POLICY.md).
   guarantee the absence of vulnerabilities or immediate SmartScreen
   reputation.
 - A dependency inventory is not a complete legal-compliance opinion.
+- Repository readers can download retained Actions artifacts. `age` protects
+  candidate plaintext, but artifact names, requests, receipts, hashes, and run
+  metadata remain visible.
+- Candidate confidentiality depends on the secrecy, rotation, and Environment
+  access controls of `RELEASE_ARTIFACT_AGE_IDENTITY`; compromise exposes retained
+  candidate ciphertext.
+- Environment approval proves that a job was allowed to start, not that the
+  approver inspected each byte. Offline requests and receipts do not identify
+  who clicked Approve.
 - Public-source metadata and summaries may still be wrong, incomplete, biased,
   or unsuitable for redistribution or operational use.

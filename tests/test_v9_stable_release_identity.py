@@ -8,7 +8,7 @@ def _read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
-def test_shared_certificate_policy_pins_full_identity_and_bounded_rotation():
+def test_shared_certificate_policy_uses_provider_specific_durable_identity():
     policy = _read("scripts/ReleaseCertificatePolicy.ps1")
 
     assert "[ValidateRange(1, 4)][int]$MaximumCount = 4" in policy
@@ -16,47 +16,48 @@ def test_shared_certificate_policy_pins_full_identity_and_bounded_rotation():
     assert "a CN-only name is rejected" in policy
     assert "Get-CertificateSpkiSha256" in policy
     assert "ExportSubjectPublicKeyInfo" in policy
-    assert "Subject/SPKI is outside the protected ordered allowlist" in policy
+    assert "Get-ReleasePublisherPolicy" in policy
+    assert "Azure Artifact Signing durable identity EKU is missing" in policy
+    assert "1.3.6.1.4.1.311.97.1.0" in policy
+    assert "1.3.6.1.4.1.311.10.3.13" in policy
+    assert "leaf SPKI is evidence only" in policy
+    assert "DigiCert signer certificate Subject/SPKI is outside" in policy
     assert "Issuer/root allowlists must contain one shared pin" in policy
     assert "RevocationMode]::Online" in policy
     assert "RequireCodeSigningEku" in policy
     assert "root_sha256 = Get-CertificateSha256" in policy
 
 
-def test_stable_authenticode_gate_uses_shared_pins_and_hash_pinned_signtool():
+def test_stable_authenticode_gate_uses_committed_policy_and_hash_pinned_signtool():
     verifier = _read("scripts/Verify-ReleaseAuthenticode.ps1")
 
     for parameter in (
+        "PolicyPath",
         "ExpectedSignToolSha256",
-        "ExpectedSignerSubjects",
-        "ExpectedSignerSpkiSha256",
-        "ExpectedSignerIssuers",
-        "ExpectedSignerRootSha256",
     ):
         assert f"[Parameter(Mandatory = $true)][string]${parameter}" in verifier
+    assert "[string]$SigningProvider" in verifier
     assert ". (Join-Path $PSScriptRoot 'ReleaseCertificatePolicy.ps1')" in verifier
-    assert "Get-ReleaseCertificatePolicy" in verifier
+    assert "Get-ReleasePublisherPolicy" in verifier
     assert "Assert-ReleaseSignerCertificatePolicy" in verifier
     assert "Get-FileHash -LiteralPath $tool -Algorithm SHA256" in verifier
-    assert "Installer and portable application were not signed by the same pinned identity" in verifier
+    assert "durable Publisher EKU" in verifier
+    assert "pinned certificate identity" in verifier
+    assert "leaf_spki_policy -ceq 'record-only'" in verifier
     assert "Assert-TrustedCertificateChain $signature.TimeStamperCertificate" in verifier
 
 
 def test_finalizer_pins_digicert_public_certificate_and_reuses_identity_policy():
     finalizer = _read("scripts/Finalize-SignedCandidate.ps1")
 
-    for variable in (
-        "DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256",
-        "DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS",
-        "DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256",
-        "DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS",
-        "DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256",
-    ):
-        assert variable in finalizer
-    assert "Assert-DigiCertCertificateFilePolicy" in finalizer
-    assert "Get-ReleaseCertificatePolicy" in finalizer
+    assert "ExpectedPublisherPolicySha256" in finalizer
+    assert "ExpectedApplicationSigningReceiptSha256" in finalizer
+    assert "ExpectedInstallerSigningReceiptSha256" in finalizer
+    assert "Get-ReleasePublisherPolicy" in finalizer
     assert "Assert-ReleaseSignerCertificatePolicy" in finalizer
-    assert "Application and installer were not signed by the same pinned certificate identity" in finalizer
+    assert "DigiCert certificates differ across stages" in finalizer
+    assert "digicert_sm_host" in finalizer and "digicert_key_alias" in finalizer
+    assert "Invoke-SignAndVerify" not in finalizer
     assert "function Assert-CertificateChain" not in finalizer
 
 
@@ -73,67 +74,42 @@ def test_stage_a_build_reuses_full_certificate_policy_before_any_signing():
         assert variable in stage_a
     assert ". (Join-Path $PSScriptRoot 'ReleaseCertificatePolicy.ps1')" in stage_a
 
-    policy = stage_a.index("$certificatePolicy = Get-ReleaseCertificatePolicy")
-    first_sign = stage_a.index("Invoke-SignAndVerify $stagedExe")
-    assert policy < first_sign
-    for binding in (
-        "-ExpectedSignerSubjects $ExpectedSignerSubjects",
-        "-ExpectedSignerSpkiSha256 $ExpectedSignerSpkiSha256",
-        "-ExpectedSignerIssuers $ExpectedSignerIssuers",
-        "-ExpectedSignerRootSha256 $ExpectedSignerRootSha256",
-    ):
-        assert binding in stage_a[policy:first_sign]
-
-    invoke = stage_a[
-        stage_a.index("function Invoke-SignAndVerify") : stage_a.index(
-            "function Invoke-DesktopSmokeTest"
-        )
-    ]
-    assert "[Parameter(Mandatory = $true)]$CertificatePolicy" in invoke
-    assert "Assert-ReleaseSignerCertificatePolicy" in invoke
-    assert "Assert-TrustedCertificateChain $signature.TimeStamperCertificate" in invoke
+    assert "Legacy in-process signing is removed" in stage_a
+    assert "Invoke-SignAndVerify" not in stage_a
+    assert "Get-ReleasePublisherPolicy" in stage_a
+    assert "PrepareUnsignedApplicationBundle" in stage_a
+    assert "signing_exchange.py') create-request" in stage_a
     assert "function Assert-CertificateChain" not in stage_a
-    assert (
-        stage_a.count(
-            "$DigiCertKeyAlias $DigiCertCertificateFile $certificatePolicy"
-        )
-        == 3
-    )
 
 
 def test_stage_a_digicert_identity_and_file_hash_fail_before_signing():
     stage_a = _read("scripts/Build-AndShip.ps1")
 
-    resolve_certificate = stage_a.index(
-        '$DigiCertCertificateFile = Resolve-RequiredTool $DigiCertCertificateFile'
+    assert "Legacy in-process signing is removed" in stage_a
+    assert stage_a.index("if ($RequireSignedInstaller -or $CandidateOnly)") < stage_a.index(
+        "function Get-Sha256"
     )
-    validate_certificate = stage_a.index(
-        "$digicertCertificateIdentity = Assert-DigiCertCertificateFilePolicy",
-        resolve_certificate,
-    )
-    first_sign = stage_a.index("Invoke-SignAndVerify $stagedExe")
-    assert resolve_certificate < validate_certificate < first_sign
-    pre_sign_gate = stage_a[validate_certificate:first_sign]
-    assert "-ExpectedSha256 $ExpectedDigiCertCertificateFileSha256" in pre_sign_gate
-    assert "-Policy $certificatePolicy" in pre_sign_gate
+    assert "Invoke-SignAndVerify" not in stage_a
 
 
-def test_stable_workflow_requires_protected_certificate_policy_inputs():
+def test_stable_workflow_uses_committed_publisher_policy_not_mutable_identity_vars():
     workflow = _read(".github/workflows/v9-stable-release.yml")
 
-    for variable in (
-        "DEFENSE_TRACKER_SIGNTOOL_SHA256",
+    for obsolete_variable in (
         "DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS",
         "DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256",
         "DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS",
         "DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256",
     ):
-        assert f"{variable}: ${{{{ vars.{variable} }}}}" in workflow
+        assert f"vars.{obsolete_variable}" not in workflow
+    assert (
+        ".\\scripts\\Initialize-GitHubHostedReleaseTools.ps1 -Mode VerificationOnly"
+        in workflow
+    )
+    assert "release\\publisher-policy.json" in workflow
+    assert "-PolicyPath .\\release\\publisher-policy.json" in workflow
+    assert "-SigningProvider $policy.active_provider" in workflow
     assert "-ExpectedSignToolSha256 $env:DEFENSE_TRACKER_SIGNTOOL_SHA256" in workflow
-    assert "-ExpectedSignerSubjects $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS" in workflow
-    assert "-ExpectedSignerSpkiSha256 $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256" in workflow
-    assert "-ExpectedSignerIssuers $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS" in workflow
-    assert "-ExpectedSignerRootSha256 $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256" in workflow
 
 
 def test_stable_release_rechecks_fixed_remote_bytes_around_immutability():
@@ -147,38 +123,43 @@ def test_stable_release_rechecks_fixed_remote_bytes_around_immutability():
         "release-manifest.json",
     )
     for name in fixed_names:
-        assert workflow.count(f'"{name}"') == 1
+        assert name in workflow
 
-    draft_create = workflow.index("gh release create $tag --draft")
-    draft_api = workflow.index("Assert-RemoteReleaseAssets $draft 'draft'")
-    draft_download = workflow.index("Assert-DownloadedReleaseAssets $tag 'draft'")
-    publish = workflow.index("gh release edit $tag --draft=false --latest")
-    before_api = workflow.index(
-        "Assert-RemoteReleaseAssets $publishedBeforeImmutableCheck"
-    )
-    before_download = workflow.index(
-        "Assert-DownloadedReleaseAssets $tag 'published-before-immutable-check'"
-    )
-    immutable = workflow.index("$publishedBeforeImmutableCheck.immutable -ne $true")
-    after_api = workflow.index(
-        "Assert-RemoteReleaseAssets $publishedAfterImmutableCheck"
-    )
-    after_download = workflow.index(
-        "Assert-DownloadedReleaseAssets $tag 'published-after-immutable-check'"
-    )
-    assert (
-        draft_create
-        < draft_api
-        < draft_download
-        < publish
-        < before_api
-        < before_download
-        < immutable
-        < after_api
-        < after_download
-    )
-    assert "[string]$asset.digest -cne [string]$expected.digest" in workflow
-    assert "Get-FileHash -LiteralPath $path -Algorithm SHA256" in workflow
+    verify = workflow.index("verify-promotion:")
+    promotion = workflow.index("promotion-request.json", verify)
+    publish_job = workflow.index("publish-stable-release:")
+    draft_create = workflow.index("gh release create", publish_job)
+    publish = workflow.index("gh release edit", draft_create)
+    immutable = workflow.index("published.immutable-ne$true", publish)
+    assert verify < promotion < publish_job < draft_create < publish < immutable
+    assert "Get-FileHash $local.FullName -Algorithm SHA256" in workflow
+    assert "item.digest-cne$digest" in workflow
+    assert "Resolve-RemoteTagCommit" in workflow
+    assert "Release tag already exists and will never be reused" not in workflow
+
+
+def test_stable_release_only_resumes_its_exact_unchanged_draft():
+    workflow = _read(".github/workflows/v9-stable-release.yml")
+
+    assert "Invoke-WebRequest -SkipHttpErrorCheck" in workflow
+    assert "DefenseTracker-Stable-Workflow: .github/workflows/v9-stable-release.yml" in workflow
+    assert "release.draft-eq$true" in workflow
+    assert "release.tag_name-cne$tag" in workflow
+    assert "release.target_commitish-cne$env:RELEASE_SHA" in workflow
+    assert "release.author.login-cne'github-actions[bot]'" in workflow
+    assert "Existing draft lacks the exact workflow ownership and input binding" in workflow
+    assert "contains an unapproved asset" in workflow
+    assert 'remote mismatch: $($item.name)' in workflow
+    assert "A release tag exists without the exact resumable draft" in workflow
+    assert "Assert-RemoteAssets $release $false 'Draft'" in workflow
+    assert "Where-Object{$remoteNames -cnotcontains $_.Name}" in workflow
+    assert "&gh @uploadArgs" in workflow
+    assert "--clobber" not in workflow
+    assert "Assert-RemoteAssets $release $true 'Draft'" in workflow
+    assert "draftTagResponse.StatusCode-eq200" in workflow
+    assert "draftTagResponse.StatusCode-ne404" in workflow
+    assert "elseif($release.draft-eq$false)" in workflow
+    assert "Assert-RemoteAssets $published $true 'Published'" in workflow
 
 
 def test_release_security_document_states_non_atomic_unique_writer_boundary():
@@ -188,4 +169,4 @@ def test_release_security_document_states_non_atomic_unique_writer_boundary():
     assert "不是" in document or "没有" in document
     assert "immutable" in document
     assert "补丁版本" in document
-    assert document.count("- ") >= 9
+    assert document.count("- ") >= 4

@@ -1,0 +1,811 @@
+name: V9 application signing
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact protected main commit
+        required: true
+        type: string
+      preparation_run_id:
+        description: Successful V9 release preparation run ID
+        required: true
+        type: string
+      preparation_run_attempt:
+        description: Exact preparation run attempt
+        required: true
+        type: string
+      preparation_envelope_artifact:
+        description: Exact encrypted preparation artifact name
+        required: true
+        type: string
+      preparation_envelope_digest:
+        description: Exact sha256 digest reported by upload-artifact
+        required: true
+        type: string
+      preparation_request_artifact:
+        description: Exact public application signing request artifact name
+        required: true
+        type: string
+      preparation_request_digest:
+        description: Exact sha256 digest reported by upload-artifact
+        required: true
+        type: string
+      application_signing_request_sha256:
+        description: Exact SHA-256 of application-signing-request.json
+        required: true
+        type: string
+      compliance_evidence_commit:
+        description: Exact commit containing reviewed compliance evidence
+        required: true
+        type: string
+      compliance_evidence_sha256:
+        description: Exact SHA-256 of reviewed compliance evidence
+        required: true
+        type: string
+permissions: {}
+
+concurrency:
+  group: v9-application-signing
+  cancel-in-progress: false
+
+env:
+  AGE_VERSION: "1.3.2"
+  AGE_ARCHIVE_SHA256: "f48d8f8f9ebe903ab5027ed067652f2cc1db94bc206976430133b905dcd8e8c7"
+  SDK_PACKAGE_VERSION: "10.0.26100.4188"
+  SDK_PACKAGE_SHA256: "180deb372659029864c10a0c04787833234d64aacd1d2c0661d2c00295d8e022"
+  AZURE_CLIENT_VERSION: "1.0.128"
+  AZURE_CLIENT_SHA256: "74bd7d27e6ce1051409c38d9b46bc8df0400ecd643d51ffbf2ac00869061e40b"
+
+jobs:
+  verify-preparation-and-compliance:
+    name: Verify exact preparation and reviewed compliance evidence
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: v9-candidate-processing
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ inputs.preparation_run_id }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      SOURCE_RUN_ID: ${{ inputs.preparation_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.preparation_run_attempt }}
+      SOURCE_ENVELOPE_NAME: ${{ inputs.preparation_envelope_artifact }}
+      SOURCE_ENVELOPE_DIGEST: ${{ inputs.preparation_envelope_digest }}
+      SOURCE_REQUEST_NAME: ${{ inputs.preparation_request_artifact }}
+      SOURCE_REQUEST_DIGEST: ${{ inputs.preparation_request_digest }}
+      REQUEST_SHA256: ${{ inputs.application_signing_request_sha256 }}
+      COMPLIANCE_COMMIT: ${{ inputs.compliance_evidence_commit }}
+      COMPLIANCE_SHA256: ${{ inputs.compliance_evidence_sha256 }}
+    steps:
+      - name: Verify source run and exact artifact digests without checkout
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($value in @($env:RELEASE_SHA, $env:COMPLIANCE_COMMIT)) {
+            if ($value -cnotmatch '^[0-9a-f]{40}$') { throw 'A commit input is malformed.' }
+          }
+          foreach ($value in @($env:REQUEST_SHA256, $env:COMPLIANCE_SHA256)) {
+            if ($value -cnotmatch '^[0-9a-f]{64}$') { throw 'A SHA-256 input is malformed.' }
+          }
+          foreach ($value in @($env:SOURCE_RUN_ID, $env:SOURCE_RUN_ATTEMPT)) {
+            if ($value -cnotmatch '^[1-9][0-9]{0,18}$') { throw 'A source run identity is malformed.' }
+          }
+          $run = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:SOURCE_RUN_ID" | ConvertFrom-Json
+          if ($run.conclusion -cne 'success' -or $run.head_sha -cne $env:RELEASE_SHA -or
+              $run.head_branch -cne 'main' -or
+              $run.path -cne '.github/workflows/v9-release-preparation.yml' -or
+              $run.event -cne 'workflow_dispatch' -or
+              [string]$run.run_attempt -cne $env:SOURCE_RUN_ATTEMPT) {
+            throw 'Preparation run provenance is not trusted.'
+          }
+          $artifacts = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:SOURCE_RUN_ID/artifacts?per_page=100" | ConvertFrom-Json
+          foreach ($expected in @(
+            @{ name = $env:SOURCE_ENVELOPE_NAME; digest = $env:SOURCE_ENVELOPE_DIGEST },
+            @{ name = $env:SOURCE_REQUEST_NAME; digest = $env:SOURCE_REQUEST_DIGEST }
+          )) {
+            $matches = @($artifacts.artifacts | Where-Object { $_.name -ceq $expected.name -and -not $_.expired })
+            if ($matches.Count -ne 1 -or [string]$matches[0].digest -cne $expected.digest) {
+              throw "Source artifact identity mismatch: $($expected.name)"
+            }
+          }
+          $main = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/heads/main" | ConvertFrom-Json
+          if ($main.object.sha -cne $env:RELEASE_SHA -or $env:GITHUB_SHA -cne $env:RELEASE_SHA) {
+            throw 'Release commit is no longer exact protected main.'
+          }
+      - name: Download encrypted preparation
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.preparation_envelope_artifact }}
+          path: ${{ runner.temp }}\source-envelope
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.preparation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download public application request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.preparation_request_artifact }}
+          path: ${{ runner.temp }}\public-request
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.preparation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Bootstrap pinned age without repository code
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'age-bootstrap'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $archive = Join-Path $root 'age.zip'
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://github.com/FiloSottile/age/releases/download/v$env:AGE_VERSION/age-v$env:AGE_VERSION-windows-amd64.zip" `
+            -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:AGE_ARCHIVE_SHA256) {
+            throw 'Pinned age archive digest mismatch.'
+          }
+          [IO.Compression.ZipFile]::ExtractToDirectory($archive, (Join-Path $root 'expanded'))
+          $age = @(Get-ChildItem (Join-Path $root 'expanded') -Filter age.exe -File -Recurse)
+          if ($age.Count -ne 1 -or (& $age[0].FullName --version) -cne "v$env:AGE_VERSION") {
+            throw 'Pinned age executable identity mismatch.'
+          }
+          "AGE_EXE=$($age[0].FullName)" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Decrypt exact preparation and remove the one-use identity
+        shell: pwsh
+        env:
+          CANDIDATE_AGE_IDENTITY: ${{ secrets.RELEASE_ARTIFACT_AGE_IDENTITY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $envelope = Join-Path $env:RUNNER_TEMP 'source-envelope'
+          $entries = @(Get-ChildItem -LiteralPath $envelope -Force)
+          $cipher = @($entries | Where-Object { -not $_.PSIsContainer -and $_.Name -like '*.age' })
+          if ($entries.Count -ne 3 -or $cipher.Count -ne 1 -or @($entries | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0) {
+            throw 'Encrypted preparation is not the strict three-file envelope.'
+          }
+          $request = Get-Content (Join-Path $envelope 'candidate-transport-request.json') -Raw | ConvertFrom-Json
+          $receipt = Get-Content (Join-Path $envelope 'candidate-transport-receipt.json') -Raw | ConvertFrom-Json
+          if ($request.repository -cne $env:GITHUB_REPOSITORY -or
+              $request.release_commit -cne $env:RELEASE_SHA -or
+              [string]$request.run_id -cne $env:SOURCE_RUN_ID -or
+              [string]$request.run_attempt -cne $env:SOURCE_RUN_ATTEMPT -or
+              $receipt.ciphertext_file -cne $cipher[0].Name -or
+              $receipt.ciphertext_sha256 -cne (Get-FileHash $cipher[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              [int64]$receipt.ciphertext_size -ne $cipher[0].Length) {
+            throw 'Encrypted preparation transport receipt mismatch.'
+          }
+          if ($env:CANDIDATE_AGE_IDENTITY -cnotmatch '^AGE-SECRET-KEY-1[0-9A-Z]{58}\r?\n?$') {
+            throw 'Candidate transport identity is malformed.'
+          }
+          $identity = Join-Path $env:RUNNER_TEMP ("candidate-age-" + [guid]::NewGuid().ToString('N') + '.txt')
+          $archive = Join-Path $env:RUNNER_TEMP 'source-bundle.zip'
+          try {
+            [IO.File]::WriteAllText($identity, $env:CANDIDATE_AGE_IDENTITY.TrimEnd("`r", "`n") + "`n", [Text.UTF8Encoding]::new($false))
+            & $env:AGE_EXE --decrypt --identity $identity --output $archive $cipher[0].FullName
+            if ($LASTEXITCODE -ne 0) { throw 'age decryption failed.' }
+          } finally {
+            if (Test-Path -LiteralPath $identity -PathType Leaf) { Remove-Item -LiteralPath $identity -Force }
+          }
+          if ($receipt.plaintext_archive_sha256 -cne (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -or
+              [int64]$receipt.plaintext_archive_size -ne (Get-Item $archive).Length) {
+            throw 'Decrypted preparation archive digest mismatch.'
+          }
+      - name: Safely expand preparation after identity removal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $env:RUNNER_TEMP 'source-bundle.zip'))
+          $output = Join-Path $env:RUNNER_TEMP 'unsigned-application'
+          New-Item -ItemType Directory -Path $output | Out-Null
+          $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          try {
+            foreach ($entry in @($archive.Entries | Sort-Object FullName)) {
+              $name = $entry.FullName
+              if ($name -cnotmatch '^payload/(?!.*(?:^|/)\.\.?/)[^\\:]+$' -or $name.EndsWith('/') -or -not $seen.Add($name)) {
+                throw 'Encrypted preparation ZIP contains an unsafe or duplicate entry.'
+              }
+              $relative = $name.Substring(8)
+              $destination = [IO.Path]::GetFullPath((Join-Path $output $relative))
+              if (-not $destination.StartsWith([IO.Path]::GetFullPath($output).TrimEnd('\') + '\')) { throw 'ZIP entry escapes output.' }
+              New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+              $input = $entry.Open(); $stream = [IO.File]::Create($destination)
+              try { $input.CopyTo($stream) } finally { $stream.Dispose(); $input.Dispose() }
+            }
+          } finally { $archive.Dispose() }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+      - name: Install hash-locked preparation verification dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements.bootstrap.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Hash-locked preparation dependencies failed to install.' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Preparation dependency consistency check failed.' }
+      - name: Fetch exact public compliance evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:RUNNER_TEMP 'compliance-evidence.json'
+          $url = "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:COMPLIANCE_COMMIT/release-evidence/v9.0.0/$env:RELEASE_SHA.json"
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $path
+          if ((Get-Item $path).Length -gt 16MB -or
+              (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:COMPLIANCE_SHA256) {
+            throw 'Reviewed compliance evidence identity mismatch.'
+          }
+          "COMPLIANCE_EVIDENCE_PATH=$path" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Verify unsigned bundle materials and compliance before signing approval
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $policySha = (Get-FileHash .\release\publisher-policy.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          .\scripts\Verify-ApplicationSigningPreparation.ps1 `
+            -ExpectedReleaseSha $env:RELEASE_SHA `
+            -BundleRoot (Join-Path $env:RUNNER_TEMP 'unsigned-application') `
+            -SigningRequest (Join-Path $env:RUNNER_TEMP 'public-request\application-signing-request.json') `
+            -ExpectedSigningRequestSha256 $env:REQUEST_SHA256 `
+            -ComplianceEvidence $env:COMPLIANCE_EVIDENCE_PATH `
+            -ExpectedComplianceEvidenceSha256 $env:COMPLIANCE_SHA256 `
+            -ExpectedPublisherPolicySha256 $policySha
+          if ($LASTEXITCODE -ne 0) { throw 'Pre-sign compliance verification failed.' }
+
+  sign-application:
+    name: Sign only the exact reviewed application target
+    needs: verify-preparation-and-compliance
+    environment:
+      name: v9-trusted-signing
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ inputs.preparation_run_id }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      signed_envelope_name: ${{ steps.identities.outputs.signed_envelope_name }}
+      signed_envelope_digest: ${{ steps.signed_envelope.outputs.artifact-digest }}
+      signing_receipt_name: ${{ steps.identities.outputs.signing_receipt_name }}
+      signing_receipt_digest: ${{ steps.signing_receipt.outputs.artifact-digest }}
+      signing_receipt_sha256: ${{ steps.seal.outputs.signing_receipt_sha256 }}
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      SOURCE_RUN_ID: ${{ inputs.preparation_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.preparation_run_attempt }}
+      REQUEST_SHA256: ${{ inputs.application_signing_request_sha256 }}
+      SIGNING_PROVIDER: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER }}
+      TIMESTAMP_URL: ${{ vars.DEFENSE_TRACKER_TIMESTAMP_URL }}
+      AZURE_ENDPOINT: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_ENDPOINT }}
+      AZURE_ACCOUNT_NAME: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_ACCOUNT_NAME }}
+      AZURE_PROFILE_NAME: ${{ vars.DEFENSE_TRACKER_AZURE_SIGNING_CERTIFICATE_PROFILE_NAME }}
+      DIGICERT_SM_HOST: ${{ vars.DIGICERT_SM_HOST }}
+      DIGICERT_KEY_ALIAS: ${{ vars.DEFENSE_TRACKER_DIGICERT_KEY_ALIAS }}
+    steps:
+      - name: Download exact encrypted application bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.preparation_envelope_artifact }}
+          path: ${{ runner.temp }}\source-envelope
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.preparation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download exact public application signing request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.preparation_request_artifact }}
+          path: ${{ runner.temp }}\public-request
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.preparation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Bootstrap only hash-pinned age, SignTool, and Azure DLib
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'signer-tools'; New-Item -ItemType Directory $root | Out-Null
+          function Expand-PinnedZip([string]$Uri,[string]$Sha,[string]$Name) {
+            $archive = Join-Path $root "$Name.zip"; $expanded = Join-Path $root $Name
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $archive
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Sha) { throw "$Name digest mismatch." }
+            New-Item -ItemType Directory $expanded | Out-Null
+            [IO.Compression.ZipFile]::ExtractToDirectory($archive, $expanded)
+            return $expanded
+          }
+          $ageRoot = Expand-PinnedZip `
+            "https://github.com/FiloSottile/age/releases/download/v$env:AGE_VERSION/age-v$env:AGE_VERSION-windows-amd64.zip" `
+            $env:AGE_ARCHIVE_SHA256 'age'
+          $age = @(Get-ChildItem $ageRoot -Filter age.exe -File -Recurse)
+          if ($age.Count -ne 1 -or (& $age[0].FullName --version) -cne "v$env:AGE_VERSION") { throw 'age identity mismatch.' }
+          $sdk = Expand-PinnedZip `
+            "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.buildtools/$env:SDK_PACKAGE_VERSION/microsoft.windows.sdk.buildtools.$env:SDK_PACKAGE_VERSION.nupkg" `
+            $env:SDK_PACKAGE_SHA256 'sdk'
+          $signTool = @(Get-ChildItem $sdk -Filter signtool.exe -File -Recurse | Where-Object FullName -Match '[\\/]x64[\\/]signtool\.exe$')
+          if ($signTool.Count -ne 1) { throw 'x64 SignTool was not resolved exactly once.' }
+          "AGE_EXE=$($age[0].FullName)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          "SIGNTOOL_EXE=$($signTool[0].FullName)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          if ($env:SIGNING_PROVIDER -ceq 'AzureArtifactSigning') {
+            $azure = Expand-PinnedZip `
+              "https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/$env:AZURE_CLIENT_VERSION/microsoft.artifactsigning.client.$env:AZURE_CLIENT_VERSION.nupkg" `
+              $env:AZURE_CLIENT_SHA256 'azure'
+            $dlib = Join-Path $azure 'bin\x64\Azure.CodeSigning.Dlib.dll'
+            if (-not (Test-Path $dlib -PathType Leaf)) { throw 'Azure signing DLib is absent.' }
+            $metadata = Join-Path $root 'azure-metadata.json'
+            [IO.File]::WriteAllText($metadata, (@{
+              Endpoint = $env:AZURE_ENDPOINT
+              CodeSigningAccountName = $env:AZURE_ACCOUNT_NAME
+              CertificateProfileName = $env:AZURE_PROFILE_NAME
+              CorrelationId = "$env:GITHUB_REPOSITORY/$env:GITHUB_RUN_ID/$env:GITHUB_RUN_ATTEMPT/$env:RELEASE_SHA/application"
+            } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+            "AZURE_DLIB=$dlib" | Add-Content $env:GITHUB_ENV -Encoding utf8
+            "AZURE_METADATA=$metadata" | Add-Content $env:GITHUB_ENV -Encoding utf8
+            "AZURE_METADATA_SHA256=$((Get-FileHash $metadata -Algorithm SHA256).Hash.ToLowerInvariant())" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          }
+      - name: Decrypt application bundle and remove one-use identity
+        shell: pwsh
+        env:
+          CANDIDATE_AGE_IDENTITY: ${{ secrets.RELEASE_ARTIFACT_AGE_IDENTITY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $envelope = Join-Path $env:RUNNER_TEMP 'source-envelope'
+          $cipher = @(Get-ChildItem $envelope -Filter *.age -File)
+          $receipt = Get-Content (Join-Path $envelope 'candidate-transport-receipt.json') -Raw | ConvertFrom-Json
+          if ($cipher.Count -ne 1 -or $receipt.ciphertext_sha256 -cne (Get-FileHash $cipher[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Ciphertext mismatch.' }
+          $identity = Join-Path $env:RUNNER_TEMP ("age-" + [guid]::NewGuid().ToString('N') + '.txt')
+          $archive = Join-Path $env:RUNNER_TEMP 'application.zip'
+          try {
+            [IO.File]::WriteAllText($identity, $env:CANDIDATE_AGE_IDENTITY.TrimEnd("`r", "`n") + "`n", [Text.UTF8Encoding]::new($false))
+            & $env:AGE_EXE --decrypt --identity $identity --output $archive $cipher[0].FullName
+            if ($LASTEXITCODE -ne 0) { throw 'age decryption failed.' }
+          } finally {
+            if (Test-Path $identity -PathType Leaf) { Remove-Item $identity -Force }
+          }
+          if ($receipt.plaintext_archive_sha256 -cne (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Plaintext archive mismatch.' }
+      - name: Expand and validate exact unsigned target without executing it
+        id: validate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'application-bundle'; New-Item -ItemType Directory $root | Out-Null
+          $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path $env:RUNNER_TEMP 'application.zip'))
+          try {
+            foreach ($entry in @($zip.Entries | Sort-Object FullName)) {
+              if ($entry.FullName -cnotmatch '^payload/[^\\:]+$' -or $entry.FullName.EndsWith('/')) { throw 'Unsafe ZIP entry.' }
+              $relative = $entry.FullName.Substring(8)
+              if ($relative -match '(^|/)\.\.?(/|$)') { throw 'Unsafe ZIP segment.' }
+              $path = [IO.Path]::GetFullPath((Join-Path $root $relative))
+              if (-not $path.StartsWith([IO.Path]::GetFullPath($root).TrimEnd('\') + '\')) { throw 'ZIP escape.' }
+              New-Item -ItemType Directory (Split-Path $path -Parent) -Force | Out-Null
+              $source = $entry.Open(); $target = [IO.File]::Create($path)
+              try { $source.CopyTo($target) } finally { $target.Dispose(); $source.Dispose() }
+            }
+          } finally { $zip.Dispose() }
+          $publicRequest = Join-Path $env:RUNNER_TEMP 'public-request\application-signing-request.json'
+          $internalRequest = Join-Path $root 'signing-request.json'
+          if ((Get-FileHash $publicRequest -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:REQUEST_SHA256 -or
+              -not [Linq.Enumerable]::SequenceEqual([byte[]][IO.File]::ReadAllBytes($publicRequest), [byte[]][IO.File]::ReadAllBytes($internalRequest))) {
+            throw 'Application signing request differs from the approved bytes.'
+          }
+          $request = Get-Content $internalRequest -Raw | ConvertFrom-Json
+          $expectedWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-release-preparation.yml@refs/heads/main"
+          if ($request.schema -ne 2 -or $request.kind -cne 'defense-tracker-authenticode-signing-request' -or
+              $request.subject_kind -cne 'application' -or $request.release.commit -cne $env:RELEASE_SHA -or
+              $request.provenance.repository -cne $env:GITHUB_REPOSITORY -or
+              $request.provenance.workflow_ref -cne $expectedWorkflow -or
+              $request.provenance.job -cne 'prepare-unsigned-application' -or
+              [string]$request.provenance.run_id -cne $env:SOURCE_RUN_ID -or
+              [string]$request.provenance.run_attempt -cne $env:SOURCE_RUN_ATTEMPT -or
+              $request.target.path -cne 'payload/DefenseTracker/DefenseTracker.exe' -or
+              $request.target.signature_state -cne 'unsigned') { throw 'Application request identity mismatch.' }
+          $targetPath = Join-Path $root ($request.target.path.Replace('/', '\'))
+          if ((Get-FileHash $targetPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $request.target.sha256 -or
+              (Get-Item $targetPath).Length -ne [int64]$request.target.bytes -or
+              (Get-AuthenticodeSignature $targetPath).Status -ne [Management.Automation.SignatureStatus]::NotSigned) {
+            throw 'Unsigned application target differs from its request.'
+          }
+          $actualInventory = @(Get-ChildItem $root -File -Recurse |
+            Where-Object { $_.Name -notin @('signing-request.json','signing-receipt.json') } |
+            ForEach-Object {
+              [ordered]@{
+                path=$_.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
+                bytes=[int64]$_.Length
+                sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              }
+            } | Sort-Object path)
+          if (($actualInventory | ConvertTo-Json -Depth 4 -Compress) -cne
+              (@($request.payload_files) | ConvertTo-Json -Depth 4 -Compress)) {
+            throw 'Application payload inventory differs from the exact request.'
+          }
+          $policyPath = Join-Path $env:RUNNER_TEMP 'publisher-policy.json'
+          Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:RELEASE_SHA/release/publisher-policy.json" -OutFile $policyPath
+          $policyMaterial = @($request.materials | Where-Object { $_.name -ceq 'publisher-policy' })
+          if ($policyMaterial.Count -ne 1 -or [string]$policyMaterial[0].sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Application request has no unique Publisher-policy material.' }
+          $expectedPolicySha = [string]$policyMaterial[0].sha256
+          if ((Get-FileHash $policyPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedPolicySha) { throw 'Publisher policy digest mismatch.' }
+          $policy = Get-Content $policyPath -Raw | ConvertFrom-Json
+          $providerPolicy = $policy.providers.$($env:SIGNING_PROVIDER)
+          if ($policy.status -cne 'approved' -or
+              $policy.active_provider -notin @('AzureArtifactSigning','DigiCertKeyLocker') -or
+              $policy.active_provider -cne $env:SIGNING_PROVIDER -or
+              [string]::IsNullOrWhiteSpace([string]$policy.publisher) -or
+              $policy.publisher -cne $request.release.publisher -or
+              $providerPolicy.status -cne 'approved' -or
+              @($providerPolicy.expected_subjects).Count -lt 1 -or
+              @($providerPolicy.expected_issuers).Count -lt 1 -or
+              @($providerPolicy.expected_root_sha256).Count -lt 1) {
+            throw 'Publisher policy is not approved and fully pinned for this signer.'
+          }
+          if ($request.release.version -cne '9.0.0' -or
+              [string]$request.release.source_tree -cnotmatch '^[0-9a-f]{40}$' -or
+              $policyMaterial[0].sha256 -cne $expectedPolicySha) {
+            throw 'Application request is not bound to the exact release and Publisher policy.'
+          }
+          if ($env:SIGNING_PROVIDER -ceq 'AzureArtifactSigning') {
+            if ($providerPolicy.endpoint -cne $env:AZURE_ENDPOINT -or
+                $providerPolicy.account_name -cne $env:AZURE_ACCOUNT_NAME -or
+                $providerPolicy.certificate_profile_name -cne $env:AZURE_PROFILE_NAME -or
+                $providerPolicy.public_trust_eku -cne '1.3.6.1.4.1.311.97.1.0' -or
+                $providerPolicy.code_signing_eku -cne '1.3.6.1.5.5.7.3.3' -or
+                $providerPolicy.forbidden_test_eku -cne '1.3.6.1.4.1.311.10.3.13' -or
+                $providerPolicy.leaf_spki_policy -cne 'record-only' -or
+                [string]$providerPolicy.durable_identity_eku -cnotmatch '^1\.3\.6\.1\.4\.1\.311\.97\.(?:[0-9]+\.)+[0-9]+$' -or
+                $providerPolicy.durable_identity_eku -ceq $providerPolicy.public_trust_eku -or
+                [string]$providerPolicy.durable_identity_eku -match '^1\.3\.6\.1\.4\.1\.311\.97\.1\.(?:3|4)\.1(?:\.|$)') {
+              throw 'Azure signer configuration or durable identity policy is invalid.'
+            }
+          } else {
+            if ($providerPolicy.sm_host -cne $env:DIGICERT_SM_HOST -or
+                $providerPolicy.key_alias -cne $env:DIGICERT_KEY_ALIAS -or
+                [string]$providerPolicy.certificate_file_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                $providerPolicy.code_signing_eku -cne '1.3.6.1.5.5.7.3.3' -or
+                $providerPolicy.leaf_spki_policy -cne 'required-pin' -or
+                @($providerPolicy.expected_spki_sha256).Count -ne @($providerPolicy.expected_subjects).Count) {
+              throw 'DigiCert host, key alias, certificate, or identity pins differ from committed policy.'
+            }
+            try { $smHost = [Uri][string]$providerPolicy.sm_host } catch { throw 'Committed DigiCert SM host is malformed.' }
+            if (-not $smHost.IsAbsoluteUri -or $smHost.Scheme -cne 'https' -or
+                -not [string]::IsNullOrEmpty($smHost.UserInfo) -or
+                -not [string]::IsNullOrEmpty($smHost.Query) -or
+                -not [string]::IsNullOrEmpty($smHost.Fragment) -or
+                $smHost.AbsoluteUri -cne [string]$providerPolicy.sm_host) {
+              throw 'Committed DigiCert SM host is not a canonical credential-free HTTPS URI.'
+            }
+            "SM_HOST=$($providerPolicy.sm_host)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+            "VALIDATED_DIGICERT_KEY_ALIAS=$($providerPolicy.key_alias)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+            "DIGICERT_CERTIFICATE_FILE_SHA256=$($providerPolicy.certificate_file_sha256)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          }
+          "PUBLISHER_POLICY_SHA256=$expectedPolicySha" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          "TARGET_PATH=$targetPath" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          "BUNDLE_ROOT=$root" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          "UNSIGNED_SHA256=$($request.target.sha256)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          "PUBLISHER=$($request.release.publisher)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+          "POLICY_PATH=$policyPath" | Add-Content $env:GITHUB_ENV -Encoding utf8
+      - name: Authenticate Azure immediately before application signing
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'AzureArtifactSigning' }}
+        uses: Azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign exact application with Azure SignTool
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'AzureArtifactSigning' }}
+        shell: pwsh
+        run: |
+          if ((Get-FileHash $env:TARGET_PATH -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:UNSIGNED_SHA256) { throw 'Target changed before signing.' }
+          & $env:SIGNTOOL_EXE sign /v /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 /dlib $env:AZURE_DLIB /dmdf $env:AZURE_METADATA $env:TARGET_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'Azure application signing failed.' }
+      - name: Materialize and validate exact DigiCert public certificate
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'DigiCertKeyLocker' }}
+        shell: pwsh
+        env:
+          SIGNING_CERTIFICATE_B64: ${{ secrets.DIGICERT_SIGNING_CERT_FILE_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'digicert-signing.cer'
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:SIGNING_CERTIFICATE_B64))
+          if ((Get-FileHash $certificatePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:DIGICERT_CERTIFICATE_FILE_SHA256) {
+            throw 'DigiCert public certificate differs from the committed certificate-file pin.'
+          }
+          $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new([IO.File]::ReadAllBytes($certificatePath))
+          $policy = Get-Content $env:POLICY_PATH -Raw | ConvertFrom-Json
+          $providerPolicy = $policy.providers.DigiCertKeyLocker
+          $subject = $certificate.SubjectName.Decode([Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::UseCommas).Trim()
+          $spki = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($certificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant()
+          if ($certificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne $policy.publisher -or
+              $subject -notin @($providerPolicy.expected_subjects) -or
+              $spki -notin @($providerPolicy.expected_spki_sha256)) {
+            throw 'DigiCert public certificate identity is outside committed policy.'
+          }
+      - name: Materialize DigiCert authentication immediately before signing
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'DigiCertKeyLocker' }}
+        shell: pwsh
+        env:
+          CLIENT_CERTIFICATE_B64: ${{ secrets.DIGICERT_SM_CLIENT_CERT_FILE_B64 }}
+        run: |
+          [IO.File]::WriteAllBytes((Join-Path $env:RUNNER_TEMP 'digicert-client.p12'), [Convert]::FromBase64String($env:CLIENT_CERTIFICATE_B64))
+      - name: Authenticate DigiCert immediately before application signing
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'DigiCertKeyLocker' }}
+        uses: digicert/code-signing-software-trust-action@fae23a455ba4bde62b64fd7cb2f81ade788f5a95 # v1.2.1
+        env:
+          SM_API_KEY: ${{ secrets.DIGICERT_SM_API_KEY }}
+          SM_CLIENT_CERT_FILE: ${{ runner.temp }}\digicert-client.p12
+          SM_CLIENT_CERT_PASSWORD: ${{ secrets.DIGICERT_SM_CLIENT_CERT_PASSWORD }}
+      - name: Sign exact application with DigiCert SignTool
+        if: ${{ vars.DEFENSE_TRACKER_SIGNING_PROVIDER == 'DigiCertKeyLocker' }}
+        shell: pwsh
+        run: |
+          if ((Get-FileHash $env:TARGET_PATH -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:UNSIGNED_SHA256) { throw 'Target changed before signing.' }
+          if ((Get-FileHash (Join-Path $env:RUNNER_TEMP 'digicert-signing.cer') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:DIGICERT_CERTIFICATE_FILE_SHA256) { throw 'DigiCert certificate changed before signing.' }
+          & $env:SIGNTOOL_EXE sign /v /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 /csp 'DigiCert Signing Manager KSP' /kc $env:VALIDATED_DIGICERT_KEY_ALIAS /f (Join-Path $env:RUNNER_TEMP 'digicert-signing.cer') $env:TARGET_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'DigiCert application signing failed.' }
+      - name: Remove signer authentication material
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          foreach ($name in @('digicert-client.p12', 'digicert-signing.cer')) {
+            $path = Join-Path $env:RUNNER_TEMP $name
+            if (Test-Path $path -PathType Leaf) { Remove-Item $path -Force }
+          }
+          if (Get-Command az -ErrorAction SilentlyContinue) { az logout 2>$null; az account clear 2>$null }
+      - name: Verify signature, emit canonical receipt, and re-encrypt
+        id: seal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:SIGNTOOL_EXE verify /pa /all /v /tw $env:TARGET_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'Signed application verification failed.' }
+          $sig = Get-AuthenticodeSignature $env:TARGET_PATH
+          if ($sig.Status -ne [Management.Automation.SignatureStatus]::Valid -or $null -eq $sig.TimeStamperCertificate) { throw 'Signature or trusted timestamp is invalid.' }
+          $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+          $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::Online
+          if (-not $chain.Build($sig.SignerCertificate)) { throw 'Signer chain validation failed.' }
+          $root = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
+          $subject = $sig.SignerCertificate.SubjectName.Decode([Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::UseCommas).Trim()
+          $issuer = $sig.SignerCertificate.IssuerName.Decode([Security.Cryptography.X509Certificates.X500DistinguishedNameFlags]::UseCommas).Trim()
+          $spki = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($sig.SignerCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant()
+          $rootSha = (Get-FileHash -InputStream ([IO.MemoryStream]::new($root.RawData)) -Algorithm SHA256).Hash.ToLowerInvariant()
+          $policy = Get-Content $env:POLICY_PATH -Raw | ConvertFrom-Json
+          $providerPolicy = $policy.providers.$($env:SIGNING_PROVIDER)
+          if ($sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -cne $policy.publisher -or
+              $subject -notin @($providerPolicy.expected_subjects) -or $issuer -notin @($providerPolicy.expected_issuers) -or $rootSha -notin @($providerPolicy.expected_root_sha256)) { throw 'Actual signer identity is outside committed policy.' }
+          if ($env:SIGNING_PROVIDER -ceq 'DigiCertKeyLocker' -and $spki -notin @($providerPolicy.expected_spki_sha256)) { throw 'DigiCert SPKI is outside committed policy.' }
+          $ekuExtension = @($sig.SignerCertificate.Extensions | Where-Object { $_.Oid.Value -ceq '2.5.29.37' })
+          if ($ekuExtension.Count -ne 1) { throw 'Signer certificate has no unique enhanced-key-usage extension.' }
+          $typedEku = [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($ekuExtension[0], $ekuExtension[0].Critical)
+          $ekuOids = @($typedEku.EnhancedKeyUsages | ForEach-Object { $_.Value })
+          if (@($ekuOids | Where-Object { $_ -ceq $providerPolicy.code_signing_eku }).Count -ne 1) { throw 'Signer certificate lacks the committed code-signing EKU.' }
+          if ($env:SIGNING_PROVIDER -ceq 'AzureArtifactSigning') {
+            foreach ($requiredOid in @($providerPolicy.public_trust_eku, $providerPolicy.durable_identity_eku)) {
+              if (@($ekuOids | Where-Object { $_ -ceq $requiredOid }).Count -ne 1) { throw "Azure signer certificate lacks required EKU $requiredOid." }
+            }
+            if (@($ekuOids | Where-Object { $_ -ceq $providerPolicy.forbidden_test_eku }).Count -ne 0) { throw 'Azure signer certificate contains the forbidden Public Trust test EKU.' }
+          }
+          $observed = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+          $publisherPolicy = if ($env:SIGNING_PROVIDER -ceq 'AzureArtifactSigning') {
+            [ordered]@{ azure_account_name=$providerPolicy.account_name; azure_certificate_profile_name=$providerPolicy.certificate_profile_name; azure_endpoint=$providerPolicy.endpoint; azure_metadata_sha256=$env:AZURE_METADATA_SHA256; digicert_key_alias=$null; digicert_sm_host=$null; durable_identity_eku=$providerPolicy.durable_identity_eku; leaf_spki_policy='record-only'; sha256=$env:PUBLISHER_POLICY_SHA256 }
+          } else {
+            [ordered]@{ azure_account_name=$null; azure_certificate_profile_name=$null; azure_endpoint=$null; azure_metadata_sha256=$null; digicert_key_alias=$providerPolicy.key_alias; digicert_sm_host=$providerPolicy.sm_host; durable_identity_eku=$null; leaf_spki_policy='required-pin'; sha256=$env:PUBLISHER_POLICY_SHA256 }
+          }
+          $requestPath = Join-Path $env:BUNDLE_ROOT 'signing-request.json'
+          $receiptPath = Join-Path $env:BUNDLE_ROOT 'signing-receipt.json'
+          $receipt = [ordered]@{
+            completed_at_utc=$observed; kind='defense-tracker-authenticode-signing-receipt'
+            provenance=[ordered]@{ job='sign-application'; repository=$env:GITHUB_REPOSITORY; run_attempt=[int64]$env:GITHUB_RUN_ATTEMPT; run_id=[int64]$env:GITHUB_RUN_ID; workflow_ref=$env:GITHUB_WORKFLOW_REF }
+            release_commit=$env:RELEASE_SHA; request_sha256=$env:REQUEST_SHA256; schema=2
+            signature=[ordered]@{ provider=$env:SIGNING_PROVIDER; publisher=$env:PUBLISHER; publisher_policy=$publisherPolicy; signer_issuer_subject=$issuer; signer_root_sha256=$rootSha; signer_spki_sha256=$spki; signer_subject=$subject; timestamp_certificate_subject=$sig.TimeStamperCertificate.Subject; timestamp_url=$env:TIMESTAMP_URL; timestamp_verified_at_utc=$observed }
+            signed_bytes=[int64](Get-Item $env:TARGET_PATH).Length; signed_sha256=(Get-FileHash $env:TARGET_PATH -Algorithm SHA256).Hash.ToLowerInvariant(); subject_kind='application'; target_path='payload/DefenseTracker/DefenseTracker.exe'; unsigned_sha256=$env:UNSIGNED_SHA256
+          }
+          [IO.File]::WriteAllText($receiptPath, ($receipt | ConvertTo-Json -Depth 8 -Compress) + "`n", [Text.UTF8Encoding]::new($false))
+          $public = Join-Path $env:RUNNER_TEMP 'application-receipt-public'; New-Item -ItemType Directory $public | Out-Null
+          Copy-Item $receiptPath (Join-Path $public 'application-signing-receipt.json')
+          $receiptSha = (Get-FileHash $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "signing_receipt_sha256=$receiptSha" | Add-Content $env:GITHUB_OUTPUT -Encoding utf8
+          $recipient = Join-Path $env:RUNNER_TEMP 'recipient.txt'
+          Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:RELEASE_SHA/release/candidate-transport-recipient.txt" -OutFile $recipient
+          $artifactName = "DefenseTracker-v9.0.0-application-signed-$env:RELEASE_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $zipPath = Join-Path $env:RUNNER_TEMP 'signed-application.zip'
+          $zip = [IO.Compression.ZipFile]::Open($zipPath, [IO.Compression.ZipArchiveMode]::Create)
+          try {
+            foreach ($file in @(Get-ChildItem $env:BUNDLE_ROOT -File -Recurse | Sort-Object FullName)) {
+              $relative = $file.FullName.Substring($env:BUNDLE_ROOT.Length).TrimStart('\').Replace('\','/')
+              $entry = $zip.CreateEntry("payload/$relative", [IO.Compression.CompressionLevel]::Optimal)
+              $entry.LastWriteTime = [DateTimeOffset]::new(1980,1,1,0,0,0,[TimeSpan]::Zero)
+              $input = $file.OpenRead(); $output = $entry.Open(); try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+            }
+          } finally { $zip.Dispose() }
+          $out = Join-Path $env:RUNNER_TEMP 'signed-application-envelope'; New-Item -ItemType Directory $out | Out-Null
+          $cipherName = "$artifactName.age"; $cipher = Join-Path $out $cipherName
+          & $env:AGE_EXE --encrypt --recipients-file $recipient --output $cipher $zipPath
+          if ($LASTEXITCODE -ne 0) { throw 'Signed application re-encryption failed.' }
+          $transportRequest = [ordered]@{ artifact_name=$artifactName; recipient_file_sha256=(Get-FileHash $recipient -Algorithm SHA256).Hash.ToLowerInvariant(); release_commit=$env:RELEASE_SHA; repository=$env:GITHUB_REPOSITORY; run_attempt=[string]$env:GITHUB_RUN_ATTEMPT; run_id=[string]$env:GITHUB_RUN_ID; schema='defense-tracker-candidate-transport-request-v1' }
+          $transportRequestPath = Join-Path $out 'candidate-transport-request.json'
+          [IO.File]::WriteAllText($transportRequestPath, ($transportRequest | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+          $transportReceipt = [ordered]@{ ciphertext_file=$cipherName; ciphertext_sha256=(Get-FileHash $cipher -Algorithm SHA256).Hash.ToLowerInvariant(); ciphertext_size=[string](Get-Item $cipher).Length; plaintext_archive_sha256=(Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant(); plaintext_archive_size=[string](Get-Item $zipPath).Length; request_file='candidate-transport-request.json'; request_sha256=(Get-FileHash $transportRequestPath -Algorithm SHA256).Hash.ToLowerInvariant(); schema='defense-tracker-candidate-transport-receipt-v1' }
+          [IO.File]::WriteAllText((Join-Path $out 'candidate-transport-receipt.json'), ($transportReceipt | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+      - name: Set public artifact identities
+        id: identities
+        shell: pwsh
+        run: |
+          "signed_envelope_name=DefenseTracker-v9.0.0-application-signed-$env:RELEASE_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" | Add-Content $env:GITHUB_OUTPUT -Encoding utf8
+          "signing_receipt_name=DefenseTracker-v9.0.0-application-signing-receipt-$env:RELEASE_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" | Add-Content $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Attest only ciphertext and public receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}\signed-application-envelope\*
+            ${{ runner.temp }}\application-receipt-public\application-signing-receipt.json
+      - name: Upload encrypted signed application
+        id: signed_envelope
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.identities.outputs.signed_envelope_name }}
+          path: ${{ runner.temp }}\signed-application-envelope\*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+          include-hidden-files: false
+      - name: Upload public application signing receipt
+        id: signing_receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.identities.outputs.signing_receipt_name }}
+          path: ${{ runner.temp }}\application-receipt-public\application-signing-receipt.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+          include-hidden-files: false
+
+  prepare-unsigned-installer:
+    name: Verify signed application and prepare encrypted installer request
+    needs: sign-application
+    environment:
+      name: v9-candidate-processing
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      SIGNED_APPLICATION_ARTIFACT: ${{ needs.sign-application.outputs.signed_envelope_name }}
+      APPLICATION_RECEIPT_ARTIFACT: ${{ needs.sign-application.outputs.signing_receipt_name }}
+      APPLICATION_RECEIPT_SHA256: ${{ needs.sign-application.outputs.signing_receipt_sha256 }}
+      REQUEST_SHA256: ${{ inputs.application_signing_request_sha256 }}
+      COMPLIANCE_COMMIT: ${{ inputs.compliance_evidence_commit }}
+      COMPLIANCE_SHA256: ${{ inputs.compliance_evidence_sha256 }}
+    steps:
+      - name: Set one-use installer preparation root
+        shell: pwsh
+        run: |
+          "OUTPUT_ROOT=${{ runner.temp }}\installer-preparation" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - name: Download encrypted signed application
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.sign-application.outputs.signed_envelope_name }}
+          path: ${{ runner.temp }}\signed-application-envelope
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Download public application receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.sign-application.outputs.signing_receipt_name }}
+          path: ${{ runner.temp }}\application-receipt
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Bootstrap pinned age without checkout
+        shell: pwsh
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'age'; New-Item -ItemType Directory $root | Out-Null
+          $zip=Join-Path $root 'age.zip'; Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/FiloSottile/age/releases/download/v$env:AGE_VERSION/age-v$env:AGE_VERSION-windows-amd64.zip" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -cne $env:AGE_ARCHIVE_SHA256) { throw 'age digest mismatch.' }
+          [IO.Compression.ZipFile]::ExtractToDirectory($zip,(Join-Path $root 'expanded'))
+          $age=@(Get-ChildItem (Join-Path $root 'expanded') -Filter age.exe -File -Recurse); if($age.Count -ne 1){throw 'age missing.'}
+          "AGE_EXE=$($age[0].FullName)" | Add-Content $env:GITHUB_ENV -Encoding utf8
+      - name: Decrypt signed application and remove one-use identity
+        shell: pwsh
+        env:
+          CANDIDATE_AGE_IDENTITY: ${{ secrets.RELEASE_ARTIFACT_AGE_IDENTITY }}
+        run: |
+          $envRoot=Join-Path $env:RUNNER_TEMP 'signed-application-envelope'; $cipher=@(Get-ChildItem $envRoot -Filter *.age -File); if($cipher.Count -ne 1){throw 'cipher mismatch.'}
+          $id=Join-Path $env:RUNNER_TEMP ("age-"+[guid]::NewGuid().ToString('N')+'.txt'); $zip=Join-Path $env:RUNNER_TEMP 'signed-application.zip'
+          try {[IO.File]::WriteAllText($id,$env:CANDIDATE_AGE_IDENTITY.Trim()+"`n",[Text.UTF8Encoding]::new($false)); & $env:AGE_EXE --decrypt --identity $id --output $zip $cipher[0].FullName; if($LASTEXITCODE -ne 0){throw 'decrypt failed.'}} finally {if(Test-Path $id){Remove-Item $id -Force}}
+      - name: Safely expand signed application after identity removal
+        shell: pwsh
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'signed-application'; New-Item -ItemType Directory $root | Out-Null
+          $zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $env:RUNNER_TEMP 'signed-application.zip')); try {foreach($entry in $zip.Entries){if($entry.FullName -cnotmatch '^payload/[^\\:]+$' -or $entry.FullName.EndsWith('/')){throw 'unsafe entry.'};$rel=$entry.FullName.Substring(8);if($rel -match '(^|/)\.\.?(/|$)'){throw 'unsafe segment.'};$path=[IO.Path]::GetFullPath((Join-Path $root $rel));New-Item -ItemType Directory (Split-Path $path -Parent) -Force|Out-Null;$a=$entry.Open();$b=[IO.File]::Create($path);try{$a.CopyTo($b)}finally{$b.Dispose();$a.Dispose()}}}finally{$zip.Dispose()}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11.9"
+          architecture: x64
+      - name: Bootstrap credentialless installer tools
+        shell: pwsh
+        run: |
+          .\scripts\Initialize-GitHubHostedReleaseTools.ps1 -Mode VerificationOnly
+          .\scripts\Initialize-ReleaseArtifactCrypto.ps1
+          .\scripts\Prepare-BuildEnv.ps1 -RequireExpectedPythonHash
+      - name: Refetch exact reviewed compliance evidence
+        shell: pwsh
+        run: |
+          $path=Join-Path $env:RUNNER_TEMP 'compliance-evidence.json'
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:COMPLIANCE_COMMIT/release-evidence/v9.0.0/$env:RELEASE_SHA.json" `
+            -OutFile $path
+          if((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()-cne$env:COMPLIANCE_SHA256){throw 'Compliance evidence digest mismatch.'}
+          "COMPLIANCE_EVIDENCE_PATH=$path"|Add-Content $env:GITHUB_ENV -Encoding utf8
+      - name: Prepare exact unsigned installer from signed application
+        shell: pwsh
+        run: |
+          .\scripts\Prepare-UnsignedInstaller.ps1 `
+            -ExpectedReleaseSha $env:RELEASE_SHA `
+            -SignedApplicationBundleRoot (Join-Path $env:RUNNER_TEMP 'signed-application') `
+            -ApplicationSigningReceipt (Join-Path $env:RUNNER_TEMP 'application-receipt\application-signing-receipt.json') `
+            -ApplicationSigningRequestSha256 $env:REQUEST_SHA256 `
+            -ExpectedApplicationSigningReceiptSha256 $env:APPLICATION_RECEIPT_SHA256 `
+            -ComplianceEvidence $env:COMPLIANCE_EVIDENCE_PATH `
+            -ExpectedComplianceEvidenceSha256 $env:COMPLIANCE_SHA256 `
+            -OutputRoot $env:OUTPUT_ROOT
+      - name: Encrypt installer request bundle
+        id: installer_request
+        shell: pwsh
+        run: |
+          $name="DefenseTracker-v9.0.0-installer-unsigned-$env:RELEASE_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          .\scripts\Protect-ReleaseArtifact.ps1 -AgeExecutable $env:DEFENSE_TRACKER_AGE -ExpectedAgeExecutableSha256 $env:DEFENSE_TRACKER_AGE_SHA256 -PlaintextRoot (Join-Path $env:OUTPUT_ROOT 'installer-unsigned-bundle') -RecipientFile .\release\candidate-transport-recipient.txt -OutputDirectory (Join-Path $env:OUTPUT_ROOT 'installer-envelope') -ArtifactName $name -Repository $env:GITHUB_REPOSITORY -ReleaseCommit $env:RELEASE_SHA -RunId $env:GITHUB_RUN_ID -RunAttempt $env:GITHUB_RUN_ATTEMPT
+          $public=Join-Path $env:OUTPUT_ROOT 'installer-request-public';New-Item -ItemType Directory $public|Out-Null;Copy-Item (Join-Path $env:OUTPUT_ROOT 'installer-signing-request.json') (Join-Path $public 'installer-signing-request.json')
+          "envelope_name=$name"|Add-Content $env:GITHUB_OUTPUT -Encoding utf8
+          "request_name=DefenseTracker-v9.0.0-installer-signing-request-$env:RELEASE_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"|Add-Content $env:GITHUB_OUTPUT -Encoding utf8
+          "request_sha256=$((Get-FileHash (Join-Path $public 'installer-signing-request.json') -Algorithm SHA256).Hash.ToLowerInvariant())"|Add-Content $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Upload encrypted unsigned installer
+        id: installer_envelope_upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.installer_request.outputs.envelope_name }}
+          path: ${{ env.OUTPUT_ROOT }}\installer-envelope\*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+          include-hidden-files: false
+      - name: Upload public installer signing request
+        id: installer_request_upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.installer_request.outputs.request_name }}
+          path: ${{ env.OUTPUT_ROOT }}\installer-request-public\installer-signing-request.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+          include-hidden-files: false
+      - name: Publish exact installer-signing handoff identifiers
+        shell: pwsh
+        env:
+          ENVELOPE_NAME: ${{ steps.installer_request.outputs.envelope_name }}
+          ENVELOPE_DIGEST: ${{ steps.installer_envelope_upload.outputs.artifact-digest }}
+          REQUEST_NAME: ${{ steps.installer_request.outputs.request_name }}
+          REQUEST_DIGEST: ${{ steps.installer_request_upload.outputs.artifact-digest }}
+          INSTALLER_REQUEST_SHA256: ${{ steps.installer_request.outputs.request_sha256 }}
+          APP_ENVELOPE_NAME: ${{ needs.sign-application.outputs.signed_envelope_name }}
+          APP_ENVELOPE_DIGEST: ${{ needs.sign-application.outputs.signed_envelope_digest }}
+          APP_RECEIPT_NAME: ${{ needs.sign-application.outputs.signing_receipt_name }}
+          APP_RECEIPT_DIGEST: ${{ needs.sign-application.outputs.signing_receipt_digest }}
+          APP_RECEIPT_SHA256: ${{ needs.sign-application.outputs.signing_receipt_sha256 }}
+          APP_REQUEST_SHA256: ${{ inputs.application_signing_request_sha256 }}
+        run: |
+          $applicationHandoff=[ordered]@{application_receipt_artifact=$env:APP_RECEIPT_NAME;application_receipt_digest=$env:APP_RECEIPT_DIGEST;application_signed_artifact=$env:APP_ENVELOPE_NAME;application_signed_digest=$env:APP_ENVELOPE_DIGEST;application_signing_receipt_sha256=$env:APP_RECEIPT_SHA256;application_signing_request_sha256=$env:APP_REQUEST_SHA256}|ConvertTo-Json -Compress
+          @('### V9 installer signing handoff','',"- source run: ``$env:GITHUB_RUN_ID`` attempt ``$env:GITHUB_RUN_ATTEMPT``","- encrypted installer artifact: ``$env:ENVELOPE_NAME``","- encrypted installer artifact digest: ``$env:ENVELOPE_DIGEST``","- installer request artifact: ``$env:REQUEST_NAME``","- installer request artifact digest: ``$env:REQUEST_DIGEST``","- installer signing request SHA-256: ``$env:INSTALLER_REQUEST_SHA256``",'',"- application handoff JSON: ``$applicationHandoff``") | Add-Content $env:GITHUB_STEP_SUMMARY -Encoding utf8

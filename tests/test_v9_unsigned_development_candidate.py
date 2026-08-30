@@ -98,9 +98,7 @@ def test_signed_entrypoint_fails_closed_without_a_verified_publisher():
     combined = result.stdout + result.stderr
 
     assert result.returncode != 0
-    assert (
-        "DEFENSE_TRACKER_PUBLISHER must be the verified legal Publisher" in combined
-    )
+    assert "Legacy in-process signing is removed" in combined
 
 
 def test_build_gate_separates_unsigned_company_label_from_signed_publisher():
@@ -108,9 +106,11 @@ def test_build_gate_separates_unsigned_company_label_from_signed_publisher():
 
     assert UNSIGNED_DEVELOPMENT_COMPANY_NAME in source
     assert (
-        "if ($RequireSignedInstaller -and "
+        "if (($RequireSignedInstaller -or $PrepareUnsignedApplicationBundle) -and\n"
+        "    "
         "[string]::IsNullOrWhiteSpace($PublisherName))" in source
     )
+    assert "Legacy in-process signing is removed" in source
     assert (
         'throw "DEFENSE_TRACKER_PUBLISHER must be the verified legal Publisher; '
         'it is never inferred."' in source

@@ -31,7 +31,7 @@ documents are never part of the public deployment contract.
 | Area | What the repository can demonstrate | What still requires live evidence |
 |---|---|---|
 | Source | Reviewable code, automated tests, privacy gates, and deployment contracts | Independent security assessment |
-| Windows | Isolated two-stage build, independent installer-review, and verification tooling | Active independent reviewer keys, trusted publisher identity, valid Authenticode signature, clean-machine installation and migration tests |
+| Windows | Credentialless preparation/finalization, isolated signer-only jobs, encrypted candidate transport, and exact request/receipt verification | Approved committed Publisher policy, provisioned trusted signing provider, configured Environment review, valid Authenticode signatures, and clean-machine installation and migration tests |
 | Portal | Local browser and API contract tests | Separate staging/production infrastructure, real SMTP, WAF, backup/restore, and multi-user acceptance |
 | Operations | Documented health, rollback, and recovery gates | Measured availability, latency, recovery point, and recovery time |
 
