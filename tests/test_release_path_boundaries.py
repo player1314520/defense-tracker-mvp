@@ -1,4 +1,5 @@
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -13,7 +14,9 @@ from scripts.signing_exchange import (
     _validate_request,
     create_request,
     resolve_path_within,
+    write_canonical_json,
 )
+import scripts.signing_exchange as signing_exchange_module
 
 COMMIT = "1" * 40
 TREE = "2" * 40
@@ -158,6 +161,66 @@ def test_signing_request_rejects_case_insensitive_payload_duplicates(tmp_path):
         _validate_request(duplicate)
 
 
+def test_linux_bundle_cannot_alias_reserved_windows_metadata_name(tmp_path):
+    bundle = tmp_path / "bundle"
+    target = bundle / "payload" / "DefenseTracker" / "DefenseTracker.exe"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(_unsigned_pe())
+    (bundle / "Signing-Request.json").write_text("attacker metadata\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="aliases reserved signing metadata"):
+        create_request(
+            subject_kind="application",
+            bundle_root=bundle,
+            target_path="payload/DefenseTracker/DefenseTracker.exe",
+            release_commit=COMMIT,
+            source_tree=TREE,
+            version="9.0.0",
+            publisher=PUBLISHER,
+            repository=REPOSITORY,
+            workflow_ref=WORKFLOW,
+            run_id=RUN_ID,
+            run_attempt=RUN_ATTEMPT,
+            job=JOB,
+            materials={"python-source": "a" * 64},
+            created_at_utc="2026-08-30T01:00:00Z",
+        )
+
+
+def test_request_inventory_rejects_case_alias_of_reserved_metadata(tmp_path):
+    bundle = tmp_path / "bundle"
+    target = bundle / "payload" / "DefenseTracker" / "DefenseTracker.exe"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(_unsigned_pe())
+    support = target.parent / "support.txt"
+    support.write_text("support", encoding="utf-8")
+    request = create_request(
+        subject_kind="application",
+        bundle_root=bundle,
+        target_path="payload/DefenseTracker/DefenseTracker.exe",
+        release_commit=COMMIT,
+        source_tree=TREE,
+        version="9.0.0",
+        publisher=PUBLISHER,
+        repository=REPOSITORY,
+        workflow_ref=WORKFLOW,
+        run_id=RUN_ID,
+        run_attempt=RUN_ATTEMPT,
+        job=JOB,
+        materials={"python-source": "a" * 64},
+        created_at_utc="2026-08-30T01:00:00Z",
+    )
+    poisoned = json.loads(json.dumps(request))
+    support_entry = next(
+        item for item in poisoned["payload_files"] if item["path"].endswith("support.txt")
+    )
+    support_entry["path"] = "SIGNING-RECEIPT.JSON"
+    poisoned["payload_files"].sort(key=lambda item: item["path"])
+
+    with pytest.raises(ValueError, match="unique and sorted"):
+        _validate_request(poisoned)
+
+
 def test_output_boundary_rejects_parent_traversal_before_write(tmp_path):
     with pytest.raises(ValueError, match="relative path"):
         resolve_path_within(
@@ -203,7 +266,7 @@ def test_signing_cli_accepts_bounded_relative_paths_and_rejects_escape(tmp_path)
         "--job",
         JOB,
         "--material-sha256",
-        f"runtime-lock={'a' * 64}",
+        f"python-source={'a' * 64}",
     ]
     accepted = subprocess.run(
         [*base, "--output", "bundle/signing-request.json"],
@@ -225,3 +288,27 @@ def test_signing_cli_accepts_bounded_relative_paths_and_rejects_escape(tmp_path)
     )
     assert rejected.returncode != 0
     assert not (tmp_path.parent / "outside.json").exists()
+
+
+def test_canonical_writer_detects_output_parent_swap_before_replace(
+    tmp_path, monkeypatch
+):
+    parent = tmp_path / "output"
+    moved = tmp_path / "moved-output"
+    parent.mkdir()
+    destination = parent / "receipt.json"
+    original_mkstemp = signing_exchange_module.tempfile.mkstemp
+
+    def swapped_mkstemp(*args, **kwargs):
+        descriptor, temporary_name = original_mkstemp(*args, **kwargs)
+        os.close(descriptor)
+        temporary_leaf = Path(temporary_name).name
+        parent.rename(moved)
+        parent.mkdir()
+        moved_descriptor = os.open(moved / temporary_leaf, os.O_WRONLY)
+        return moved_descriptor, temporary_name
+
+    monkeypatch.setattr(signing_exchange_module.tempfile, "mkstemp", swapped_mkstemp)
+    with pytest.raises(ValueError, match="output parent changed"):
+        write_canonical_json(destination, {"schema": 1})
+    assert not destination.exists()

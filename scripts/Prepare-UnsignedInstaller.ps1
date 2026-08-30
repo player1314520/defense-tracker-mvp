@@ -328,8 +328,35 @@ try {
         Join-Path $exchangeEvidence 'compliance-dispatch-verification.json'
     )
     $requestPath = Join-Path $exchangeRoot 'signing-request.json'
+    $materialInputs = Join-Path $outputFull 'material-inputs'
+    New-Item -ItemType Directory -Path $materialInputs -Force | Out-Null
+    $materialCopies = [ordered]@{
+        'iscc.exe' = $iscc
+        'seven-zip.exe' = $sevenZip
+        'inno-license.txt' = $licenseText
+        'DefenseTracker.iss' = $installerDefinition
+        'signed-application-inventory.json' = $signedInventory
+        'application-signing-request.json' = $internalRequest
+        'application-signing-receipt.json' = $internalReceipt
+        'compliance-evidence.json' = $complianceFull
+    }
+    foreach ($name in $materialCopies.Keys) {
+        $sourceMaterial = Get-Item -LiteralPath $materialCopies[$name] -Force
+        if ($sourceMaterial.PSIsContainer -or
+            ($sourceMaterial.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Installer signing material is not a regular non-reparse file: $name"
+        }
+        $stagedMaterial = Join-Path $materialInputs $name
+        Copy-Item -LiteralPath $sourceMaterial.FullName -Destination $stagedMaterial
+        $stagedItem = Get-Item -LiteralPath $stagedMaterial -Force
+        if ($stagedItem.PSIsContainer -or
+            ($stagedItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Staged installer signing material is not a regular file: $name"
+        }
+    }
     $exchangeRelative = [IO.Path]::GetRelativePath($outputFull, $exchangeRoot).Replace('\','/')
     $requestRelative = [IO.Path]::GetRelativePath($outputFull, $requestPath).Replace('\','/')
+    $materialRelative = [IO.Path]::GetRelativePath($outputFull, $materialInputs).Replace('\','/')
     Push-Location -LiteralPath $outputFull
     try {
         & $python (Join-Path $projectRoot 'scripts\signing_exchange.py') create-request `
@@ -338,18 +365,19 @@ try {
             --source-tree ([string]$request.release.source_tree) --version $version.semantic_version `
             --publisher $publisher --repository $Repository --workflow-ref $WorkflowRef `
             --run-id $RunId --run-attempt $RunAttempt --job prepare-unsigned-installer `
-            --material-sha256 "iscc=$(Get-Sha256 $iscc)" `
-            --material-sha256 "seven-zip=$(Get-Sha256 $sevenZip)" `
-            --material-sha256 "inno-license=$(Get-Sha256 $licenseText)" `
-            --material-sha256 "installer-definition=$(Get-Sha256 $installerDefinition)" `
-            --material-sha256 "signed-application-inventory=$(Get-Sha256 $signedInventory)" `
-            --material-sha256 "application-signing-request=$(Get-Sha256 $internalRequest)" `
-            --material-sha256 "application-signing-receipt=$(Get-Sha256 $internalReceipt)" `
-            --material-sha256 "compliance-evidence=$(Get-Sha256 $complianceFull)" `
+            --material "iscc=$materialRelative/iscc.exe" `
+            --material "seven-zip=$materialRelative/seven-zip.exe" `
+            --material "inno-license=$materialRelative/inno-license.txt" `
+            --material "installer-definition=$materialRelative/DefenseTracker.iss" `
+            --material "signed-application-inventory=$materialRelative/signed-application-inventory.json" `
+            --material "application-signing-request=$materialRelative/application-signing-request.json" `
+            --material "application-signing-receipt=$materialRelative/application-signing-receipt.json" `
+            --material "compliance-evidence=$materialRelative/compliance-evidence.json" `
             --output $requestRelative
         if ($LASTEXITCODE -ne 0) { throw 'Installer signing request generation failed.' }
     } finally {
         Pop-Location
+        Remove-Item -LiteralPath $materialInputs -Recurse -Force -ErrorAction SilentlyContinue
     }
     Copy-Item -LiteralPath $requestPath -Destination (Join-Path $outputFull 'installer-signing-request.json')
     Remove-Item -LiteralPath $installerWork -Recurse -Force

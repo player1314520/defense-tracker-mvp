@@ -134,6 +134,7 @@ $boundedRequestVerification = Join-Path $requestPathRoot (
 $bundleRelative = [IO.Path]::GetRelativePath($requestPathRoot, $bundleFull).Replace('\','/')
 $requestRelative = [IO.Path]::GetRelativePath($requestPathRoot, $internalRequest).Replace('\','/')
 $verificationRelative = [IO.Path]::GetRelativePath($requestPathRoot, $boundedRequestVerification).Replace('\','/')
+$evidenceRelative = [IO.Path]::GetRelativePath($requestPathRoot, $evidenceRoot).Replace('\','/')
 try {
     Push-Location -LiteralPath $requestPathRoot
     try {
@@ -151,14 +152,14 @@ try {
             --expected-run-attempt $ExpectedPreparationRunAttempt `
             --expected-job prepare-unsigned-application `
             --material-sha256 "python-source=$([string]$marker.python_source_sha256)" `
-            --material-sha256 "build-environment=$(Get-Sha256 $markerPath)" `
-            --material-sha256 "installed-packages=$(Get-Sha256 $packages)" `
-            --material-sha256 "bootstrap-lock=$(Get-Sha256 $bootstrapLock)" `
-            --material-sha256 "runtime-lock=$(Get-Sha256 $runtimeLock)" `
-            --material-sha256 "build-lock=$(Get-Sha256 $buildLock)" `
-            --material-sha256 "component-inventory=$(Get-Sha256 $componentInventory)" `
-            --material-sha256 "publisher-policy=$(Get-Sha256 $policyPath)" `
-            --material-sha256 "version=$(Get-Sha256 $versionPath)" `
+            --material "build-environment=$evidenceRelative/build-environment.json" `
+            --material "installed-packages=$evidenceRelative/installed-packages.txt" `
+            --material "bootstrap-lock=$evidenceRelative/requirements.bootstrap.lock" `
+            --material "runtime-lock=$evidenceRelative/requirements.runtime.lock" `
+            --material "build-lock=$evidenceRelative/requirements.build.lock" `
+            --material "component-inventory=$evidenceRelative/unsigned-component-inventory.json" `
+            --material "publisher-policy=$evidenceRelative/publisher-policy.json" `
+            --material "version=$evidenceRelative/version.json" `
             --output $verificationRelative
         if ($LASTEXITCODE -ne 0) { throw 'Unsigned application request verification failed.' }
     } finally {

@@ -1042,7 +1042,18 @@ if ($PrepareUnsignedApplicationBundle) {
         'version.json' = $versionFile
     }
     foreach ($name in $evidenceCopies.Keys) {
-        Copy-Item -LiteralPath $evidenceCopies[$name] -Destination (Join-Path $bundleEvidence $name)
+        $sourceMaterial = Get-Item -LiteralPath $evidenceCopies[$name] -Force
+        if ($sourceMaterial.PSIsContainer -or
+            ($sourceMaterial.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Release material is not a regular non-reparse file: $name"
+        }
+        $copiedMaterial = Join-Path $bundleEvidence $name
+        Copy-Item -LiteralPath $sourceMaterial.FullName -Destination $copiedMaterial
+        $copiedItem = Get-Item -LiteralPath $copiedMaterial -Force
+        if ($copiedItem.PSIsContainer -or
+            ($copiedItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Staged release material is not a regular non-reparse file: $name"
+        }
     }
     $buildProvenance = [ordered]@{
         schema = 1
@@ -1064,6 +1075,7 @@ if ($PrepareUnsignedApplicationBundle) {
     $requestPathRoot = Split-Path $bundleRoot -Parent
     $requestBundleRelative = [IO.Path]::GetRelativePath($requestPathRoot, $bundleRoot).Replace('\','/')
     $requestOutputRelative = [IO.Path]::GetRelativePath($requestPathRoot, $requestPath).Replace('\','/')
+    $requestEvidenceRelative = [IO.Path]::GetRelativePath($requestPathRoot, $bundleEvidence).Replace('\','/')
     Push-Location -LiteralPath $requestPathRoot
     try {
         & $venvPython (Join-Path $sourceRoot 'scripts\signing_exchange.py') create-request `
@@ -1080,14 +1092,14 @@ if ($PrepareUnsignedApplicationBundle) {
             --run-attempt $PreparationRunAttempt `
             --job prepare-unsigned-application `
             --material-sha256 "python-source=$([string]$buildEnvironmentMarker.python_source_sha256)" `
-            --material-sha256 "build-environment=$(Get-Sha256 $markerPath)" `
-            --material-sha256 "installed-packages=$(Get-Sha256 $packagesFile)" `
-            --material-sha256 "bootstrap-lock=$(Get-Sha256 $bootstrapLock)" `
-            --material-sha256 "runtime-lock=$(Get-Sha256 $runtimeLock)" `
-            --material-sha256 "build-lock=$(Get-Sha256 $buildLock)" `
-            --material-sha256 "component-inventory=$(Get-Sha256 $componentInventoryPath)" `
-            --material-sha256 "publisher-policy=$(Get-Sha256 $policyFull)" `
-            --material-sha256 "version=$(Get-Sha256 $versionFile)" `
+            --material "build-environment=$requestEvidenceRelative/build-environment.json" `
+            --material "installed-packages=$requestEvidenceRelative/installed-packages.txt" `
+            --material "bootstrap-lock=$requestEvidenceRelative/requirements.bootstrap.lock" `
+            --material "runtime-lock=$requestEvidenceRelative/requirements.runtime.lock" `
+            --material "build-lock=$requestEvidenceRelative/requirements.build.lock" `
+            --material "component-inventory=$requestEvidenceRelative/unsigned-component-inventory.json" `
+            --material "publisher-policy=$requestEvidenceRelative/publisher-policy.json" `
+            --material "version=$requestEvidenceRelative/version.json" `
             --output $requestOutputRelative
         if ($LASTEXITCODE -ne 0) { throw "Application signing request generation failed." }
     } finally {

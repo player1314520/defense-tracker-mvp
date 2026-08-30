@@ -109,6 +109,7 @@ PUBLISHER_POLICY_KEYS = {
     "digicert_key_alias",
 }
 RESERVED_METADATA = {"signing-request.json", "signing-receipt.json"}
+RESERVED_METADATA_CASEFOLD = {name.casefold() for name in RESERVED_METADATA}
 WINDOWS_DEVICE_NAMES = {
     "aux",
     "clock$",
@@ -172,10 +173,23 @@ def load_canonical_json(path: Path, *, label: str) -> tuple[dict[str, object], b
 
 def write_canonical_json(path: Path, value: object) -> None:
     destination = path.resolve(strict=False)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    parent = destination.parent
+    try:
+        parent_resolved = parent.resolve(strict=True)
+        parent_before = parent.lstat()
+    except OSError as exc:
+        raise ValueError("Canonical JSON output parent is absent or unstable") from exc
+    if (
+        parent_resolved != parent
+        or _is_reparse(parent)
+        or stat.S_ISLNK(parent_before.st_mode)
+        or not stat.S_ISDIR(parent_before.st_mode)
+    ):
+        raise ValueError("Canonical JSON output parent must be a regular directory")
+    parent_identity = _directory_identity(parent_before)
     payload = canonical_json_bytes(value)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=destination.name + ".", suffix=".tmp", dir=destination.parent
+        prefix=destination.name + ".", suffix=".tmp", dir=parent
     )
     temporary = Path(temporary_name)
     try:
@@ -183,9 +197,41 @@ def write_canonical_json(path: Path, value: object) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
+        _assert_directory_stable(parent, parent_identity, label="Canonical JSON output parent")
+        if destination.exists() and (
+            _is_reparse(destination)
+            or destination.is_symlink()
+            or not destination.is_file()
+            or destination.resolve(strict=True) != destination
+        ):
+            raise ValueError("Canonical JSON destination is not a regular file")
+        _assert_directory_stable(parent, parent_identity, label="Canonical JSON output parent")
         os.replace(temporary, destination)
+        _assert_directory_stable(parent, parent_identity, label="Canonical JSON output parent")
+        if (
+            _is_reparse(destination)
+            or destination.is_symlink()
+            or not destination.is_file()
+            or destination.resolve(strict=True) != destination
+            or _read_stable(
+                destination,
+                label="canonical JSON output",
+                max_bytes=MAX_JSON_BYTES,
+            )
+            != payload
+        ):
+            raise ValueError("Canonical JSON output changed during replacement")
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            _assert_directory_stable(
+                parent,
+                parent_identity,
+                label="Canonical JSON output parent",
+            )
+        except ValueError:
+            pass
+        else:
+            temporary.unlink(missing_ok=True)
 
 
 def _is_reparse(path: Path) -> bool:
@@ -205,6 +251,31 @@ def _stat_identity(result: os.stat_result) -> tuple[int, int, int, int]:
         result.st_size,
         result.st_mtime_ns,
     )
+
+
+def _directory_identity(result: os.stat_result) -> tuple[int, int]:
+    return (result.st_dev, result.st_ino)
+
+
+def _assert_directory_stable(
+    path: Path,
+    expected_identity: tuple[int, int],
+    *,
+    label: str,
+) -> None:
+    try:
+        result = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"{label} is absent or unstable") from exc
+    if (
+        resolved != path
+        or _is_reparse(path)
+        or stat.S_ISLNK(result.st_mode)
+        or not stat.S_ISDIR(result.st_mode)
+        or _directory_identity(result) != expected_identity
+    ):
+        raise ValueError(f"{label} changed during canonical write")
 
 
 def _read_stable(path: Path, *, label: str, max_bytes: int = MAX_FILE_BYTES) -> bytes:
@@ -374,7 +445,9 @@ def _snapshot_payload(root: Path) -> list[dict[str, object]]:
             if folded in casefold_paths:
                 raise ValueError("Bundle contains case-insensitive duplicate paths")
             casefold_paths.add(folded)
-            if relative in RESERVED_METADATA:
+            if folded in RESERVED_METADATA_CASEFOLD:
+                if relative not in RESERVED_METADATA:
+                    raise ValueError("Bundle aliases reserved signing metadata by case")
                 continue
             before = path.lstat()
             identities_before[relative] = _stat_identity(before)
@@ -507,7 +580,11 @@ def _validate_request(value: object) -> dict[str, object]:
         entry = _require_exact_keys(entry_value, FILE_KEYS, label=f"payload_files[{index}]")
         path = _safe_relative_path(entry["path"], label=f"payload_files[{index}].path")
         folded = path.casefold()
-        if path in RESERVED_METADATA or path <= previous or folded in casefold_paths:
+        if (
+            folded in RESERVED_METADATA_CASEFOLD
+            or path <= previous
+            or folded in casefold_paths
+        ):
             raise ValueError("Signing request payload file paths must be unique and sorted")
         casefold_paths.add(folded)
         previous = path
