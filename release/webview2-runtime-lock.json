@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "distribution": "evergreen-standalone",
+  "architecture": "x64",
+  "source_url": "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/b7e683e6-e94c-4576-bfe5-34852785a4d6/MicrosoftEdgeWebView2RuntimeInstallerX64.exe",
+  "sha256": "987a9d8b3107e84f9b53b4a077d28ae4814fc3d964d5a55c559e7334bbf24d61",
+  "bytes": 258438352,
+  "publisher_subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+  "installer_file_version": "1.3.263.3",
+  "original_filename": "MicrosoftEdgeUpdateSetup.exe",
+  "retrieved_utc": "2026-08-30T09:24:04Z"
+}

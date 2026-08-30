@@ -1164,7 +1164,7 @@
 <div class="v9-cloud-panel" id="v9CloudPanel" hidden>
   <article class="v9-cloud-card" role="dialog" aria-modal="true" aria-labelledby="v9CloudTitle">
     <header>
-      <div><span class="v9-kicker">ZERO-KNOWLEDGE · SUPABASE STAGING</span><h2 id="v9CloudTitle">身份与设备</h2></div>
+      <div><span class="v9-kicker">ZERO-KNOWLEDGE · ENCRYPTED SYNC</span><h2 id="v9CloudTitle">身份与设备</h2></div>
       <button class="v9-cloud-close" id="v9CloudClose" type="button" aria-label="关闭">×</button>
     </header>
     <section>
@@ -1242,5 +1242,8 @@
 <script nonce="{{ g.csp_nonce }}" src="/static/js/p5-publication-v9.js?v=20260725-p5"></script>
 <script nonce="{{ g.csp_nonce }}" src="/static/js/command-hub-v9.js?v=20260725-p3"></script>
 <script nonce="{{ g.csp_nonce }}" type="module" src="/static/js/vendor/v9-supabase-auth.mjs?v=20260730-context"></script>
+{% if desktop_release_smoke_enabled %}
+<script nonce="{{ g.csp_nonce }}" src="/static/js/v9-desktop-release-smoke.js"></script>
+{% endif %}
 </body>
 </html>
