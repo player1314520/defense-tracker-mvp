@@ -46,8 +46,15 @@ FORBIDDEN_PARTS = {
 FORBIDDEN_SUFFIXES = {".key", ".pem", ".pfx", ".p12", ".kdbx", ".sqlite", ".db"}
 SECRET_PATTERNS = (
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(rb"(?:sk-(?:proj-)?|ghp_)[A-Za-z0-9_-]{16,}", re.IGNORECASE),
-    re.compile(rb"sb_secret_[A-Za-z0-9_-]{16,}", re.IGNORECASE),
+    re.compile(
+        rb"(?<![A-Za-z0-9_-])(?:sk-(?:proj-)?|ghp_)[A-Za-z0-9_-]{16,}"
+        rb"(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rb"(?<![A-Za-z0-9_-])sb_secret_[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])",
+        re.IGNORECASE,
+    ),
 )
 
 

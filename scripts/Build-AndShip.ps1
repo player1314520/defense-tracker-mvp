@@ -194,7 +194,7 @@ function Get-ArtifactSafetyFindings {
     $secretRules = @(
         [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
         [regex]::new(
-            '(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})',
+            '(?<![A-Za-z0-9_-])(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})(?![A-Za-z0-9_-])',
             [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
         ),
         [regex]::new(
@@ -206,7 +206,7 @@ function Get-ArtifactSafetyFindings {
     $binarySecretRules = @(
         [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
         [regex]::new(
-            '(?:sk-(?:proj-)?[A-Za-z0-9_-]{24,}|ghp_[A-Za-z0-9]{32,}|AKIA[A-Z0-9]{16})',
+            '(?<![A-Za-z0-9_-])(?:sk-(?:proj-)?[A-Za-z0-9_-]{24,}|ghp_[A-Za-z0-9]{32,}|AKIA[A-Z0-9]{16})(?![A-Za-z0-9_-])',
             [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
         )
     )

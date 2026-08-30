@@ -316,7 +316,7 @@ function Get-ArtifactSafetyFindings {
     $forbiddenPattern = '(?i)(?:^|[-_.])(qr(?:code)?|wechat|account|screenshot)(?:[-_.]|$)|二维码|账号|账户截图'
     $secretRules = @(
         [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
-        [regex]::new('(?:sk-(?:proj-)?[A-Za-z0-9_-]{24,}|ghp_[A-Za-z0-9]{32,}|AKIA[A-Z0-9]{16})','IgnoreCase')
+        [regex]::new('(?<![A-Za-z0-9_-])(?:sk-(?:proj-)?[A-Za-z0-9_-]{24,}|ghp_[A-Za-z0-9]{32,}|AKIA[A-Z0-9]{16})(?![A-Za-z0-9_-])','IgnoreCase')
     )
     foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
         $relative = $file.FullName.Substring($rootFull.Length)
