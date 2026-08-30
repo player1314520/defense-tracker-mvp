@@ -197,53 +197,34 @@ def _wait_for_flask(timeout=30):
     return False
 
 
-# ── 加载页（Flask 就绪前显示）────────────────────────────────
-LOADING_HTML = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-  body {
-    margin: 0; background: #0d0c0a;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    height: 100vh; font-family: 'Songti SC','Microsoft YaHei',serif; color: #998f7e;
-  }
-  .logo { font-size: 64px; margin-bottom: 24px; }
-  h1 { font-size: 26px; font-weight: 500; color: #eee7d9; margin: 0 0 8px; }
-  .sub { font: 11px Consolas, monospace; letter-spacing: 3px; margin-bottom: 40px; color: #625b4f; }
-  .spinner {
-    width: 40px; height: 40px;
-    border: 2px solid #302b24;
-    border-top-color: #e34a31;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-  .status { margin-top: 20px; font-size: 12px; color: #625b4f; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-</style>
-</head>
-<body>
-  <div class="logo">🛡️</div>
-  <h1>防务数据追踪系统</h1>
-  <div class="sub">DEFENSE COMMAND HUB · __DISPLAY_VERSION__ · 闭环</div>
-  <div class="spinner"></div>
-  <div class="status">正在初始化情报系统，请稍候…</div>
-</body>
-</html>""".replace("__DISPLAY_VERSION__", PRODUCT_VERSION.display_version)
+def _prepare_desktop_login_url():
+    if not _wait_for_flask():
+        raise RuntimeError("桌面服务启动超时")
+    bootstrap = get_desktop_bootstrap_token()
+    if not bootstrap:
+        raise RuntimeError("桌面安全会话初始化失败")
+    # fragment 不会进入 HTTP 请求/访问日志；登录页立即清除并 POST 交换。
+    return f"http://127.0.0.1:{PORT}/login#desktop={bootstrap}"
 
-WEBVIEW2_REQUIRED_HTML = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><style>
-body { margin:0; background:#0d0c0a; color:#eee7d9; font-family:'Microsoft YaHei',sans-serif;
-display:flex; align-items:center; justify-content:center; height:100vh; }
-main { max-width:680px; padding:40px; border:1px solid #40372d; background:#15120f; }
-h1 { color:#ef6b50; font-size:24px; } p { line-height:1.8; color:#c7bba8; }
-code { color:#f3d18a; }
-</style></head><body><main>
-<h1>需要 Microsoft Edge WebView2 Runtime</h1>
-<p>DefenseTracker V9 已阻止旧版 MSHTML 回退。请安装微软官方的
-<code>Microsoft Edge WebView2 Runtime (x64)</code> 后重新启动软件。</p>
-</main></body></html>"""
+
+def _accept_desktop_renderer(renderer):
+    global _desktop_renderer
+    normalized = normalize_desktop_smoke_renderer(renderer)
+    _desktop_renderer = normalized
+    if normalized != "edgechromium":
+        print("[错误] 桌面渲染器不是 Microsoft Edge WebView2，已安全终止。")
+        # pywebview Event.set() treats literal False as cancellation. This
+        # callback runs before the native window is created and before its URL
+        # is navigated, so rejecting here keeps the bootstrap capability out of
+        # unsupported renderers.
+        return False
+    if _desktop_smoke_store is not None:
+        try:
+            _desktop_smoke_store.set_renderer(normalized)
+        except ValueError:
+            return False
+    # Any value other than literal False allows pywebview to create the window.
+    return None
 
 # ════════════════════════════════════════════════════════════
 # 主程序
@@ -271,58 +252,25 @@ if __name__ == '__main__':
         print("\n[错误] 未安装 pywebview，请运行：pip install pywebview\n")
         sys.exit(1)
 
-    # 5. 创建桌面窗口，先显示加载页
+    # 5. Flask 就绪后生成一次性引导 URL，再创建桌面窗口。
+    try:
+        desktop_login_url = _prepare_desktop_login_url()
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        raise SystemExit(1)
+
     window = webview.create_window(
         title=f'防务数据追踪系统 {PRODUCT_VERSION.display_version} · Defense Command Hub',
-        html=LOADING_HTML,
+        url=desktop_login_url,
         width=1440,
         height=900,
         min_size=(1024, 700),
         background_color='#060d1a',
     )
 
-    # 6. Flask 就绪后跳转到应用
-    def _on_shown():
-        if _desktop_renderer != "edgechromium":
-            window.load_html(WEBVIEW2_REQUIRED_HTML)
-            return
-        if _wait_for_flask():
-            print(f"[启动] 服务就绪，加载应用…")
-            bootstrap = get_desktop_bootstrap_token()
-            if not bootstrap:
-                window.load_html("""<body style="background:#060d1a;color:#ef4444;
-                    font-family:sans-serif;display:flex;align-items:center;
-                    justify-content:center;height:100vh;font-size:18px;">
-                    ❌ 桌面安全会话初始化失败，请重启。</body>""")
-                return
-            # fragment 不会进入 HTTP 请求/访问日志；登录页立即清除并 POST 交换。
-            window.load_url(f'http://127.0.0.1:{PORT}/login#desktop={bootstrap}')
-        else:
-            window.load_html("""<body style="background:#060d1a;color:#ef4444;
-                font-family:sans-serif;display:flex;align-items:center;
-                justify-content:center;height:100vh;font-size:18px;">
-                ❌ 服务启动超时，请重试。</body>""")
+    window.events.initialized += _accept_desktop_renderer
 
-    def _on_renderer_initialized(renderer):
-        global _desktop_renderer
-        normalized = normalize_desktop_smoke_renderer(renderer)
-        _desktop_renderer = normalized
-        if _desktop_smoke_store is None or normalized is None:
-            return
-        try:
-            _desktop_smoke_store.set_renderer(normalized)
-        except ValueError:
-            # The signed release gate accepts only an explicitly recognized
-            # renderer; unsupported fallbacks leave the evidence unavailable.
-            return
-
-    window.events.initialized += _on_renderer_initialized
-    # pywebview starts the optional ``start(func=...)`` callback before the
-    # native window exists. Bind navigation to the real shown event so the
-    # first authenticated URL load cannot be silently dropped by WinForms.
-    window.events.shown += _on_shown
-
-    # Explicit ephemeral WebView profile: auth/CSRF cookies and PKCE state do
+    # 6. Explicit ephemeral WebView profile: auth/CSRF cookies and PKCE state do
     # not survive the desktop process or mix with another local browser app.
     webview.start(
         gui="edgechromium",

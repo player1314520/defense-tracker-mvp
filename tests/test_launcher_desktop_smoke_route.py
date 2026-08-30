@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -116,3 +118,58 @@ print(json.dumps(statuses, sort_keys=True))
         "retrieved": 200,
         "unknown_bearer": 404,
     }
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="pywebview is intentionally locked only in the Windows CI environment",
+)
+def test_desktop_renderer_callback_allows_only_edgechromium(tmp_path):
+    env = os.environ.copy()
+    env["DEFENSE_TRACKER_HOME"] = str(tmp_path / "runtime")
+    probe = r"""
+import launcher
+from webview.event import Event
+
+launcher._wait_for_flask = lambda: True
+launcher.get_desktop_bootstrap_token = lambda: "b" * 64
+assert launcher._prepare_desktop_login_url() == (
+    f"http://127.0.0.1:{launcher.PORT}/login#desktop=" + "b" * 64
+)
+
+launcher._desktop_smoke_store = launcher.DesktopSmokeEvidenceStore(
+    "9.0.0", "V9", "v9.0.0", "a" * 40
+)
+allowed = Event(None, should_lock=True)
+allowed += launcher._accept_desktop_renderer
+assert allowed.set("WebView2") is False
+assert launcher._desktop_renderer == "edgechromium"
+assert launcher._desktop_smoke_store.renderer == "edgechromium"
+
+launcher._desktop_smoke_store = launcher.DesktopSmokeEvidenceStore(
+    "9.0.0", "V9", "v9.0.0", "a" * 40
+)
+rejected = Event(None, should_lock=True)
+rejected += launcher._accept_desktop_renderer
+assert rejected.set("mshtml") is True
+assert launcher._desktop_renderer == "mshtml"
+assert launcher._desktop_smoke_store.renderer is None
+
+launcher._desktop_smoke_store = launcher.DesktopSmokeEvidenceStore(
+    "9.0.0", "V9", "v9.0.0", "a" * 40
+)
+launcher._desktop_smoke_store.set_renderer("edgechromium")
+assert launcher._accept_desktop_renderer("cef") is False
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

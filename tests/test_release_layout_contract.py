@@ -154,12 +154,24 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     )
     assert launcher.index("from state import") < launcher.index("from app import")
     assert "raise SystemExit(78)" in launcher
-    assert '_desktop_renderer != "edgechromium"' in launcher
+    assert 'normalized != "edgechromium"' in launcher
     assert "需要 Microsoft Edge WebView2 Runtime" in launcher
     assert "window.events.initialized" in launcher
-    shown_subscription = "window.events.shown += _on_shown"
-    assert shown_subscription in launcher
-    assert launcher.index(shown_subscription) < launcher.index("    webview.start(")
+    assert "window.events.shown" not in launcher
+    assert "window.load_url(" not in launcher
+    assert "url=desktop_login_url" in launcher
+    assert launcher.index("threading.Thread(target=_run_flask") < launcher.index(
+        "desktop_login_url = _prepare_desktop_login_url()"
+    )
+    assert launcher.index("desktop_login_url = _prepare_desktop_login_url()") < (
+        launcher.index("    window = webview.create_window(")
+    )
+    assert launcher.index("    window = webview.create_window(") < launcher.index(
+        "window.events.initialized"
+    )
+    assert "window.events.initialized += _accept_desktop_renderer" in launcher
+    assert 'if normalized != "edgechromium":' in launcher
+    assert "# pywebview Event.set() treats literal False as cancellation" in launcher
     start_call = launcher[launcher.index("    webview.start(") :]
     assert "_on_shown," not in start_call.split(")", 1)[0]
     assert 'gui="edgechromium"' in launcher
