@@ -126,6 +126,19 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert "RandomNumberGenerator]::Create()" in finalizer_smoke_function
     assert "[System.IO.FileMode]::CreateNew" in smoke_function
     assert "[System.IO.FileMode]::CreateNew" in finalizer_smoke_function
+    assert smoke_function.index("if (-not $workspaceReady)") < smoke_function.index(
+        "Get-NetTCPConnection"
+    )
+    assert finalizer_smoke_function.index(
+        "if (-not $workspaceReady)"
+    ) < finalizer_smoke_function.index("Get-NetTCPConnection")
+    assert "transport=$lastTransportStatus" in smoke_function
+    assert "transport=$lastTransportStatus" in finalizer_smoke_function
+    assert "listener_query=$lastListenerQuery" in smoke_function
+    assert "listener_query=$lastListenerQuery" in finalizer_smoke_function
+    assert "Get-NetTCPConnection" in smoke_function and "-ErrorAction Stop" in smoke_function
+    assert "Get-NetTCPConnection" in finalizer_smoke_function
+    assert "-ErrorAction Stop" in finalizer_smoke_function
     assert "Invoke-InstallerLifecycleSmokeTest" in builder
     assert "Silent uninstall left the installed application executable behind" in builder
     assert "Invoke-DesktopSmokeTest $portableExe" in builder
