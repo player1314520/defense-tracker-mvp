@@ -21,6 +21,8 @@ env:
   GITLEAKS_LINUX_X64_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
   ACTIONLINT_VERSION: "1.7.12"
   ACTIONLINT_LINUX_X64_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+  POSTGRESQL_ISOLATION_VERSION: "15.19"
+  POSTGRESQL_ISOLATION_SHA256: "e1a64a87a46b825b88c082e4518161a47aab53c45694964f8ba1df28f7859f89"
 
 jobs:
   public-tree:
@@ -80,7 +82,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            python-lock: requirements.ci-linux.lock
+            source-exceptions: sgmllib3k
+          - os: windows-latest
+            python-lock: requirements.ci-windows.lock
+            source-exceptions: sgmllib3k,proxy-tools
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -90,10 +98,14 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt "PyYAML==6.0.2"
+            requirements.bootstrap.lock
+            ${{ matrix.python-lock }}
+      - name: Install hash-locked test dependencies
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.bootstrap.lock
+          python -m pip install --require-hashes --only-binary=:all: --no-binary=${{ matrix.source-exceptions }} --no-build-isolation -r ${{ matrix.python-lock }}
+      - name: Verify installed dependency consistency
+        run: python -m pip check
       - name: Compile Python sources
         run: python -m compileall -q .
       - name: Run Python tests
@@ -151,11 +163,19 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.ci-deployment.lock
       - uses: supabase/setup-cli@46f7f98c7f948ad727d22c1e67fab04c223a0520
         with:
           version: 2.116.0
-      - name: Install deployment test dependencies
-        run: python -m pip install pytest "PyYAML==6.0.2"
+      - name: Install hash-locked deployment test dependencies
+        run: >-
+          python -m pip install
+          --require-hashes
+          --only-binary=:all:
+          -r requirements.ci-deployment.lock
+      - name: Verify deployment test dependency consistency
+        run: python -m pip check
       - name: Run deployment contract tests
         run: >-
           python -m pytest -q
@@ -173,6 +193,128 @@ jobs:
           supabase migration list --local
       - name: Run transactional pgTAP database tests
         run: supabase test db
+      - name: Run atomic organization-byte quota isolation test
+        shell: bash
+        env:
+          PGAPPNAME: defense-tracker/v9-byte-quota-isolation
+          PGCONNECT_TIMEOUT: "5"
+          PG_TEST_TIMEOUT_DEFAULT: "15"
+        run: |
+          set -Eeuo pipefail
+          pg_tar="$RUNNER_TEMP/postgresql-${POSTGRESQL_ISOLATION_VERSION}.tar.bz2"
+          pg_src="$RUNNER_TEMP/postgresql-${POSTGRESQL_ISOLATION_VERSION}"
+          pg_build="$RUNNER_TEMP/postgresql-${POSTGRESQL_ISOLATION_VERSION}-build"
+          iso_out="$RUNNER_TEMP/v9-sync-byte-quota-isolation.out"
+
+          for command_name in curl sha256sum tar make cc; do
+            command -v "$command_name" >/dev/null
+          done
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            "https://ftp.postgresql.org/pub/source/v${POSTGRESQL_ISOLATION_VERSION}/postgresql-${POSTGRESQL_ISOLATION_VERSION}.tar.bz2" \
+            --output "$pg_tar"
+          printf '%s  %s\n' "$POSTGRESQL_ISOLATION_SHA256" "$pg_tar" | \
+            sha256sum --check --strict -
+          tar -xjf "$pg_tar" -C "$RUNNER_TEMP"
+          mkdir "$pg_build"
+          cd "$pg_build"
+          "$pg_src/configure" --without-readline --without-zlib
+          make -C src/test/isolation -j2 isolationtester
+          isolationtester="$pg_build/src/test/isolation/isolationtester"
+          export LD_LIBRARY_PATH="$pg_build/src/interfaces/libpq${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          test "$("$isolationtester" -V)" = \
+            "isolationtester (PostgreSQL) ${POSTGRESQL_ISOLATION_VERSION}"
+
+          cd "$GITHUB_WORKSPACE"
+          db_url="$(supabase status -o json | python -c \
+            'import json,sys; print(json.load(sys.stdin)["DB_URL"])')"
+          python - "$db_url" <<'PY'
+          import sys
+          from urllib.parse import urlparse
+
+          url = urlparse(sys.argv[1])
+          if not (
+              url.scheme in {"postgres", "postgresql"}
+              and url.hostname == "127.0.0.1"
+              and url.port == 54322
+              and url.username == "postgres"
+              and url.path == "/postgres"
+          ):
+              raise SystemExit("refusing to run isolation fixture against a non-local database")
+          PY
+
+          if ! "$isolationtester" "$db_url" \
+            < supabase/tests/v9_sync_byte_quota_isolation.spec \
+            > "$iso_out" 2>&1; then
+            cat "$iso_out"
+            exit 1
+          fi
+          python - "$iso_out" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+          expected_headers = [
+              "starting permutation: s1_begin s1_claim s2_begin s2_claim "
+              "s1_reserve s2_reserve s1_commit s2_commit",
+              "starting permutation: s1_begin s1_claim s2_begin s2_claim "
+              "s2_reserve s1_reserve s2_commit s1_commit",
+          ]
+          starts = [
+              index
+              for index, line in enumerate(lines)
+              if line.startswith("starting permutation:")
+          ]
+          headers = [lines[index] for index in starts]
+          if headers != expected_headers:
+              raise SystemExit(f"expected exactly the two reviewed permutations, got {headers!r}")
+          if lines.count("Parsed test spec with 2 sessions") != 1:
+              raise SystemExit("isolationtester did not parse exactly two sessions")
+          sections = [
+              lines[starts[index] : starts[index + 1] if index + 1 < len(starts) else len(lines)]
+              for index in range(len(starts))
+          ]
+          quota_error = re.compile(
+              r"^ERROR:\s+daily organization sync byte limit exceeded$"
+          )
+          forbidden = (
+              "setup failed:",
+              "teardown failed:",
+              "timed out after",
+              "failed to complete permutation",
+              "failed to send query",
+              "unexpected result status:",
+              "isolationtester: canceling",
+          )
+          for number, (section, loser) in enumerate(
+              zip(sections, ("s2_reserve", "s1_reserve"), strict=True), start=1
+          ):
+              errors = [line for line in section if line.startswith("ERROR:")]
+              if len(errors) != 1 or not quota_error.fullmatch(errors[0]):
+                  raise SystemExit(
+                      f"permutation {number} expected one quota rejection, got {errors!r}"
+                  )
+              completion = f"step {loser}: <... completed>"
+              try:
+                  completion_index = section.index(completion)
+              except ValueError as exc:
+                  raise SystemExit(
+                      f"permutation {number} did not serialize the losing reservation"
+                  ) from exc
+              if (
+                  completion_index + 1 >= len(section)
+                  or not quota_error.fullmatch(section[completion_index + 1])
+              ):
+                  raise SystemExit(
+                      f"permutation {number} quota error was not emitted by {loser}"
+                  )
+              if any(token in line for token in forbidden for line in section):
+                  raise SystemExit(
+                      f"permutation {number} contains an unexpected harness failure"
+                  )
+          print("isolation gate passed: 2 permutations; 1 rejection each")
+          PY
       - name: Validate release-input allowlist
         run: python scripts/prepare_mvp_portal_context.py --check-only
       - name: Validate deployment script syntax

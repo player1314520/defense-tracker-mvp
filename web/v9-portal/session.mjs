@@ -37,19 +37,32 @@ export async function clearLegacyAuthSessions(storage) {
 
 
 export async function logoutPortalSession({
+  revokeDeviceSession,
   signOut,
   removeWakeChannel,
   clearAuth,
   clearMemory,
 }) {
-  let remoteError = null;
+  let revocationError = null;
+  let signOutError = null;
   let localError = null;
 
   try {
-    const result = await signOut();
-    if (result?.error) remoteError = result.error;
+    const result = await revokeDeviceSession();
+    if (result?.error) {
+      revocationError = result.error;
+    } else if (result?.data?.revoked !== true) {
+      revocationError = new Error("device session revocation was not confirmed");
+    }
   } catch (error) {
-    remoteError = error;
+    revocationError = error;
+  }
+
+  try {
+    const result = await signOut({ scope: "local" });
+    if (result?.error) signOutError = result.error;
+  } catch (error) {
+    signOutError = error;
   }
 
   try {
@@ -69,9 +82,12 @@ export async function logoutPortalSession({
   }
 
   return {
-    remoteConfirmed: remoteError === null,
+    remoteConfirmed: revocationError === null && signOutError === null,
+    deviceSessionRevoked: revocationError === null,
+    authSignedOut: signOutError === null,
     localCleared: localError === null,
-    remoteError,
+    revocationError,
+    signOutError,
     localError,
   };
 }

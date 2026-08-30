@@ -1,4 +1,5 @@
 from io import BytesIO
+import os
 import types
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -125,6 +126,51 @@ def test_pdf_extraction_converts_timeout_to_stable_error(monkeypatch):
 
     assert exc.value.code == "PDF_PARSE_TIMEOUT"
     assert "worker" not in str(exc.value)
+
+
+def test_pdf_worker_environment_drops_credentials(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-cross-parser-boundary")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "must-not-cross-parser-boundary")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-cross-parser-boundary")
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+
+    worker_environment = document_safety._pdf_worker_environment()
+
+    assert "OPENAI_API_KEY" not in worker_environment
+    assert "SUPABASE_SERVICE_ROLE_KEY" not in worker_environment
+    assert "AWS_SECRET_ACCESS_KEY" not in worker_environment
+    assert worker_environment.get("PATH") == os.environ.get("PATH", "")
+    assert worker_environment["PYTHONHASHSEED"] == "0"
+
+
+def test_windows_worker_limit_setup_is_mandatory(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(document_safety, "_RUNNING_ON_WINDOWS", True)
+    monkeypatch.setattr(
+        document_safety,
+        "_create_and_assign_windows_job",
+        lambda: sentinel,
+    )
+    monkeypatch.setattr(document_safety, "_WINDOWS_JOB_HANDLE", None)
+
+    document_safety._apply_worker_limits()
+
+    assert document_safety._WINDOWS_JOB_HANDLE is sentinel
+
+
+def test_windows_worker_limit_setup_fails_closed(monkeypatch):
+    def fail_job_setup():
+        raise OSError("simulated job setup failure")
+
+    monkeypatch.setattr(document_safety, "_RUNNING_ON_WINDOWS", True)
+    monkeypatch.setattr(
+        document_safety,
+        "_create_and_assign_windows_job",
+        fail_job_setup,
+    )
+
+    with pytest.raises(OSError, match="simulated job setup failure"):
+        document_safety._apply_worker_limits()
 
 
 def test_frozen_pdf_parser_reenters_signed_executable_worker(monkeypatch):

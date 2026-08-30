@@ -148,6 +148,9 @@ test("远程注销失败仍清空浏览器 Auth 与内存，但不触碰设备�
   const calls = [];
   let deviceStoreCleared = false;
   const result = await logoutPortalSession({
+    revokeDeviceSession: async () => ({
+      error: new Error("device revocation network unavailable"),
+    }),
     signOut: async () => ({
       error: new Error("auth network unavailable"),
     }),
@@ -164,7 +167,10 @@ test("远程注销失败仍清空浏览器 Auth 与内存，但不触碰设备�
 
   assert.deepEqual(calls, ["channel", "auth", "memory"]);
   assert.equal(result.remoteConfirmed, false);
-  assert.match(result.remoteError.message, /network unavailable/);
+  assert.equal(result.deviceSessionRevoked, false);
+  assert.match(result.revocationError.message, /revocation network unavailable/);
+  assert.equal(result.authSignedOut, false);
+  assert.match(result.signOutError.message, /auth network unavailable/);
   assert.equal(result.localCleared, true);
   assert.equal(deviceStoreCleared, false);
 });
@@ -172,6 +178,10 @@ test("远程注销失败仍清空浏览器 Auth 与内存，但不触碰设备�
 
 test("本地清理失败不能被误报为已安全注销", async () => {
   const result = await logoutPortalSession({
+    revokeDeviceSession: async () => ({
+      data: { revoked: true },
+      error: null,
+    }),
     signOut: async () => ({ error: null }),
     removeWakeChannel: async () => {},
     clearAuth: async () => {
@@ -181,6 +191,33 @@ test("本地清理失败不能被误报为已安全注销", async () => {
   });
 
   assert.equal(result.remoteConfirmed, true);
+  assert.equal(result.deviceSessionRevoked, true);
+  assert.equal(result.authSignedOut, true);
   assert.equal(result.localCleared, false);
   assert.match(result.localError.message, /IndexedDB unavailable/);
+});
+
+
+test("设备会话撤销先于 Supabase signOut 且失败不阻断本地锁定", async () => {
+  const calls = [];
+  let signOutOptions;
+  const result = await logoutPortalSession({
+    revokeDeviceSession: async () => {
+      calls.push("revoke");
+      return { data: { revoked: true }, error: null };
+    },
+    signOut: async (options) => {
+      calls.push("signout");
+      signOutOptions = options;
+      return { error: null };
+    },
+    removeWakeChannel: async () => calls.push("channel"),
+    clearAuth: async () => calls.push("auth"),
+    clearMemory: () => calls.push("memory"),
+  });
+
+  assert.deepEqual(calls, ["revoke", "signout", "channel", "auth", "memory"]);
+  assert.deepEqual(signOutOptions, { scope: "local" });
+  assert.equal(result.remoteConfirmed, true);
+  assert.equal(result.localCleared, true);
 });

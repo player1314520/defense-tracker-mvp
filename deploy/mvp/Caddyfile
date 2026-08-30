@@ -61,9 +61,9 @@ https://{$API_DOMAIN} {
     import security_headers
     encode zstd gzip
     request_body {
-        # V9 accepts at most a 24 MiB encoded sync event.  32 MiB is the
-        # transport ceiling, leaving framing overhead without weakening the
-        # database's 16 MiB ciphertext constraint.
+        # The 32 MiB transport ceiling accommodates one legacy 16 MiB record
+        # in a bounded pull page plus JSON/base64 framing.  New writes remain
+        # subject to the database's 1 MiB ciphertext constraint.
         max_size 32MB
     }
 

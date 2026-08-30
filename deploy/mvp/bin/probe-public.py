@@ -196,10 +196,18 @@ def probe_realtime_websocket(api_domain: str, key: str) -> None:
         raise ProbeFailure("Realtime WebSocket accept value is invalid")
 
 
+def parse_cli_args(argv: list[str]) -> tuple[Path, str | None]:
+    if len(argv) > 3:
+        raise SystemExit("usage: probe-public.py [PRODUCTION_ENV] [EXPECTED_RELEASE_SHA]")
+    production_path = Path(
+        argv[1] if len(argv) >= 2 else "/etc/defense-tracker/production.env"
+    )
+    expected_release_sha = argv[2] if len(argv) == 3 else None
+    return production_path, expected_release_sha
+
+
 def main() -> int:
-    if len(sys.argv) > 2:
-        raise SystemExit("usage: probe-public.py [PRODUCTION_ENV]")
-    production_path = Path(sys.argv[1] if len(sys.argv) == 2 else "/etc/defense-tracker/production.env")
+    production_path, expected_release_sha = parse_cli_args(sys.argv)
     product_version = load_product_version_metadata()
     production = load_env(production_path)
     stack_dir = Path(production["SUPABASE_STACK_DIR"])
@@ -214,7 +222,11 @@ def main() -> int:
     api_domain = production["API_DOMAIN"]
     portal_origin = f"https://{portal_domain}"
     api_origin = f"https://{api_domain}"
-    release_commit = production["MVP_EXPECTED_RELEASE_SHA"]
+    release_commit = (
+        expected_release_sha
+        if expected_release_sha is not None
+        else production["MVP_EXPECTED_RELEASE_SHA"]
+    )
     if len(release_commit) != 40 or any(
         character not in "0123456789abcdef" for character in release_commit
     ):

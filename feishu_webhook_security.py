@@ -18,8 +18,11 @@ import secrets
 import sqlite3
 import threading
 import time
+import re
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024
@@ -41,6 +44,22 @@ class WebhookMisconfigured(RuntimeError):
         super().__init__(code)
 
 
+class WebhookRateLimited(RuntimeError):
+    """A verified actor exceeded one of the bounded admission budgets."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+class WebhookCapacityUnavailable(RuntimeError):
+    """The bounded worker admission pool has no free lease."""
+
+    def __init__(self, code: str = "webhook_capacity_exhausted"):
+        self.code = code
+        super().__init__(code)
+
+
 def _env_true(name: str) -> bool:
     return (os.environ.get(name) or "").strip().casefold() in {"1", "true", "yes", "on"}
 
@@ -48,6 +67,334 @@ def _env_true(name: str) -> bool:
 def token_only_development_enabled() -> bool:
     """Legacy token-only callbacks require an explicit development opt-in."""
     return _env_true("FEISHU_WEBHOOK_ALLOW_TOKEN_ONLY")
+
+
+_ACTOR_ID_KINDS = ("open_id", "user_id", "union_id")
+_ACTOR_VALUE_RE = re.compile(r"\A[A-Za-z0-9._-]{1,256}\Z")
+_MAX_ALLOWLIST_CHARS = 8192
+_MAX_ALLOWLIST_ENTRIES = 1000
+
+
+@dataclass(frozen=True)
+class WebhookActor:
+    """Canonical, signed Feishu actor identity used by authorization and quotas."""
+
+    sender_ids: tuple[str, ...]
+    chat_id: str
+    is_admin: bool
+
+    @property
+    def primary_sender(self) -> str:
+        return self.sender_ids[0]
+
+
+def _validated_actor_value(value, *, code: str) -> str:
+    if not isinstance(value, str):
+        raise WebhookRejected(code)
+    normalized = value.strip()
+    if not _ACTOR_VALUE_RE.fullmatch(normalized):
+        raise WebhookRejected(code)
+    return normalized
+
+
+def extract_event_actor(data: dict) -> WebhookActor:
+    """Extract the sender namespace IDs and chat ID from a signed event.
+
+    Values are never guessed from message content or request headers.  Each
+    sender ID retains its namespace so an allowlisted user ID cannot collide
+    with an open ID or union ID that happens to contain the same text.
+    """
+    event = data.get("event") if isinstance(data, dict) else None
+    if not isinstance(event, dict):
+        raise WebhookRejected("event_actor_missing")
+    message = event.get("message")
+    if not isinstance(message, dict):
+        raise WebhookRejected("event_message_missing")
+    chat_id = _validated_actor_value(
+        message.get("chat_id"), code="event_chat_id_invalid",
+    )
+
+    sender = event.get("sender")
+    sender_ids = sender.get("sender_id") if isinstance(sender, dict) else None
+    if not isinstance(sender_ids, dict):
+        raise WebhookRejected("event_sender_missing")
+    canonical = []
+    for kind in _ACTOR_ID_KINDS:
+        raw = sender_ids.get(kind)
+        if raw in (None, ""):
+            continue
+        canonical.append(
+            f"{kind}:{_validated_actor_value(raw, code='event_sender_invalid')}"
+        )
+    if not canonical:
+        raise WebhookRejected("event_sender_missing")
+    return WebhookActor(tuple(canonical), chat_id, False)
+
+
+def _parse_authorization_allowlist(name: str, *, sender_ids: bool) -> frozenset[str]:
+    raw = os.environ.get(name) or ""
+    if len(raw) > _MAX_ALLOWLIST_CHARS:
+        raise WebhookMisconfigured("invalid_authorization_allowlist")
+    entries = [part for part in re.split(r"[,;\s]+", raw.strip()) if part]
+    if len(entries) > _MAX_ALLOWLIST_ENTRIES:
+        raise WebhookMisconfigured("invalid_authorization_allowlist")
+
+    parsed = set()
+    for entry in entries:
+        if sender_ids:
+            kind, separator, value = entry.partition(":")
+            if not separator or kind not in _ACTOR_ID_KINDS:
+                raise WebhookMisconfigured("invalid_authorization_allowlist")
+        else:
+            if entry.startswith("chat_id:"):
+                value = entry.removeprefix("chat_id:")
+            elif ":" in entry:
+                raise WebhookMisconfigured("invalid_authorization_allowlist")
+            else:
+                value = entry
+            kind = "chat_id"
+        if not _ACTOR_VALUE_RE.fullmatch(value):
+            raise WebhookMisconfigured("invalid_authorization_allowlist")
+        parsed.add(f"{kind}:{value}" if sender_ids else value)
+    return frozenset(parsed)
+
+
+def authorize_event_actor(
+    data: dict,
+    *,
+    require_admin: bool = False,
+    allow_unlisted_development: bool | None = None,
+) -> WebhookActor:
+    """Authorize a signed event against explicit sender/chat allowlists.
+
+    Production is fail-closed.  The compatibility bypass requires two explicit
+    development flags and never grants administrator privileges.  A sender
+    identity is mandatory even when that development bypass is enabled.
+    """
+    actor = extract_event_actor(data)
+    allowed_senders = _parse_authorization_allowlist(
+        "FEISHU_ALLOWED_SENDER_IDS", sender_ids=True,
+    )
+    allowed_chats = _parse_authorization_allowlist(
+        "FEISHU_ALLOWED_CHAT_IDS", sender_ids=False,
+    )
+    admin_senders = _parse_authorization_allowlist(
+        "FEISHU_ADMIN_SENDER_IDS", sender_ids=True,
+    )
+    configured_development_bypass = (
+        token_only_development_enabled()
+        and _env_true("FEISHU_AUTH_ALLOW_UNLISTED_DEV")
+    )
+    if allow_unlisted_development is None:
+        allow_unlisted_development = configured_development_bypass
+    else:
+        allow_unlisted_development = (
+            bool(allow_unlisted_development) and configured_development_bypass
+        )
+
+    identity_set = frozenset(actor.sender_ids)
+    is_admin = bool(identity_set & admin_senders)
+    is_allowed = bool(
+        is_admin
+        or identity_set & allowed_senders
+        or actor.chat_id in allowed_chats
+    )
+    if not allowed_senders and not allowed_chats and not admin_senders:
+        if not allow_unlisted_development:
+            raise WebhookMisconfigured("authorization_allowlist_not_configured")
+        is_allowed = True
+    elif not is_allowed and allow_unlisted_development:
+        is_allowed = True
+    if not is_allowed:
+        raise WebhookRejected("event_actor_not_allowed")
+    if require_admin and not is_admin:
+        raise WebhookRejected("event_admin_required")
+    return WebhookActor(actor.sender_ids, actor.chat_id, is_admin)
+
+
+@dataclass(frozen=True)
+class WebhookAdmissionLimits:
+    window_seconds: int = 60
+    sender_events: int = 12
+    chat_events: int = 30
+    global_events: int = 120
+    sender_cost: int = 48
+    chat_cost: int = 120
+    global_cost: int = 480
+    max_inflight: int = 8
+
+
+class WebhookAdmissionLease:
+    """Idempotent ownership token for one bounded concurrent work slot."""
+
+    def __init__(self, controller: "WebhookAdmissionController"):
+        self._controller = controller
+        self._lock = threading.Lock()
+        self._released = False
+        self._handed_off = False
+
+    @property
+    def handed_off(self) -> bool:
+        with self._lock:
+            return self._handed_off
+
+    def mark_handed_off(self) -> None:
+        with self._lock:
+            self._handed_off = True
+
+    def release(self) -> bool:
+        with self._lock:
+            if self._released:
+                return False
+            self._released = True
+        self._controller._release_slot()
+        return True
+
+    def __enter__(self) -> "WebhookAdmissionLease":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> bool:
+        self.release()
+        return False
+
+
+class WebhookAdmissionController:
+    """Atomic per-sender/chat/global sliding-window and concurrency gate."""
+
+    def __init__(
+        self,
+        limits: WebhookAdmissionLimits,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        if not isinstance(limits, WebhookAdmissionLimits):
+            raise TypeError("limits must be WebhookAdmissionLimits")
+        numeric_limits = (
+            limits.window_seconds,
+            limits.sender_events,
+            limits.chat_events,
+            limits.global_events,
+            limits.sender_cost,
+            limits.chat_cost,
+            limits.global_cost,
+            limits.max_inflight,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+               for value in numeric_limits):
+            raise WebhookMisconfigured("invalid_admission_config")
+        self.limits = limits
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._events: dict[tuple[str, str], deque[tuple[float, int]]] = {}
+        self._inflight = 0
+        self._next_cleanup = 0.0
+
+    @property
+    def inflight(self) -> int:
+        with self._lock:
+            return self._inflight
+
+    def _release_slot(self) -> None:
+        with self._lock:
+            if self._inflight <= 0:
+                raise RuntimeError("admission lease accounting underflow")
+            self._inflight -= 1
+
+    def acquire(self, actor: WebhookActor, *, cost: int) -> WebhookAdmissionLease:
+        if not isinstance(actor, WebhookActor) or not actor.sender_ids or not actor.chat_id:
+            raise WebhookMisconfigured("invalid_admission_actor")
+        if isinstance(cost, bool) or not isinstance(cost, int) or cost < 1:
+            raise WebhookMisconfigured("invalid_admission_cost")
+        now = self._clock()
+        cutoff = now - self.limits.window_seconds
+        sender_scopes = tuple(("sender", sender_id) for sender_id in actor.sender_ids)
+        scopes = sender_scopes + (("chat", actor.chat_id), ("global", "all"))
+        event_limits = (
+            (self.limits.sender_events,) * len(sender_scopes)
+            + (self.limits.chat_events, self.limits.global_events)
+        )
+        cost_limits = (
+            (self.limits.sender_cost,) * len(sender_scopes)
+            + (self.limits.chat_cost, self.limits.global_cost)
+        )
+        event_codes = (
+            ("sender_rate_limit",) * len(sender_scopes)
+            + ("chat_rate_limit", "global_rate_limit")
+        )
+        cost_codes = (
+            ("sender_cost_limit",) * len(sender_scopes)
+            + ("chat_cost_limit", "global_cost_limit")
+        )
+
+        with self._lock:
+            if now >= self._next_cleanup:
+                for scope, bucket in tuple(self._events.items()):
+                    while bucket and bucket[0][0] <= cutoff:
+                        bucket.popleft()
+                    if not bucket:
+                        del self._events[scope]
+                self._next_cleanup = now + min(self.limits.window_seconds, 60)
+            buckets = []
+            for scope in scopes:
+                bucket = self._events.get(scope)
+                if bucket is None:
+                    bucket = deque()
+                while bucket and bucket[0][0] <= cutoff:
+                    bucket.popleft()
+                buckets.append(bucket)
+            for index, bucket in enumerate(buckets):
+                if len(bucket) + 1 > event_limits[index]:
+                    raise WebhookRateLimited(event_codes[index])
+                if sum(item_cost for _timestamp, item_cost in bucket) + cost > cost_limits[index]:
+                    raise WebhookRateLimited(cost_codes[index])
+            if self._inflight >= self.limits.max_inflight:
+                raise WebhookCapacityUnavailable()
+            for scope, bucket in zip(scopes, buckets):
+                self._events[scope] = bucket
+                bucket.append((now, cost))
+            self._inflight += 1
+        return WebhookAdmissionLease(self)
+
+
+def _bounded_environment_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = (os.environ.get(name) or str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise WebhookMisconfigured("invalid_admission_config") from exc
+    if value < minimum or value > maximum:
+        raise WebhookMisconfigured("invalid_admission_config")
+    return value
+
+
+def load_webhook_admission_controller() -> WebhookAdmissionController:
+    limits = WebhookAdmissionLimits(
+        window_seconds=_bounded_environment_int(
+            "FEISHU_RATE_WINDOW_SECONDS", 60, 1, 3600,
+        ),
+        sender_events=_bounded_environment_int(
+            "FEISHU_RATE_SENDER_EVENTS", 12, 1, 10_000,
+        ),
+        chat_events=_bounded_environment_int(
+            "FEISHU_RATE_CHAT_EVENTS", 30, 1, 50_000,
+        ),
+        global_events=_bounded_environment_int(
+            "FEISHU_RATE_GLOBAL_EVENTS", 120, 1, 100_000,
+        ),
+        sender_cost=_bounded_environment_int(
+            "FEISHU_COST_SENDER_LIMIT", 48, 1, 100_000,
+        ),
+        chat_cost=_bounded_environment_int(
+            "FEISHU_COST_CHAT_LIMIT", 120, 1, 500_000,
+        ),
+        global_cost=_bounded_environment_int(
+            "FEISHU_COST_GLOBAL_LIMIT", 480, 1, 1_000_000,
+        ),
+        max_inflight=_bounded_environment_int(
+            "FEISHU_MAX_INFLIGHT_JOBS", 8, 1, 64,
+        ),
+    )
+    return WebhookAdmissionController(limits)
 
 
 def signature_max_skew_seconds() -> int:

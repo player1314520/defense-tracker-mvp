@@ -8,9 +8,9 @@ services:
 
   storage:
     environment:
-      # 16 MiB plaintext plus the AES-GCM tag.  Caddy's 32 MiB transport
-      # ceiling accounts for JSON/base64 framing on non-Storage RPCs.
-      FILE_SIZE_LIMIT: "16777232"
+      # 1 MiB plaintext plus the AES-GCM tag.  Caddy's transport ceiling also
+      # accommodates legacy sync reads and JSON/base64 framing.
+      FILE_SIZE_LIMIT: "1048592"
 
   functions:
     environment:

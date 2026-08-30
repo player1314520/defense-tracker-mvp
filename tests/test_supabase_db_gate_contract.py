@@ -46,6 +46,7 @@ def test_database_suites_are_transactional_pgtap_not_static_migration_checks():
         "v9_capacity_quota_test.sql",
         "v9_cross_role_rls_test.sql",
         "v9_retention_provisioning_test.sql",
+        "v9_sync_byte_session_quarantine_test.sql",
     }
     combined = "\n".join(path.read_text(encoding="utf-8") for path in suites)
     for path in suites:
@@ -58,6 +59,9 @@ def test_database_suites_are_transactional_pgtap_not_static_migration_checks():
     for runtime_boundary in (
         "private.organization_seat_usage",
         "daily sync event limit exceeded",
+        "daily organization sync byte limit exceeded",
+        "report_sync_event_quarantine",
+        "revoke_current_device_session",
         "on conflict (event_id) do nothing",
         "private.purge_access_application_data",
         "private.claim_member_invitation_provisioning",

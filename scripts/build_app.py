@@ -21,7 +21,10 @@ if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
 from product_version import PRODUCT_VERSION  # noqa: E402
-from scripts.generate_windows_version_info import render_version_info  # noqa: E402
+from scripts.generate_windows_version_info import (  # noqa: E402
+    UNSIGNED_DEVELOPMENT_COMPANY_NAME,
+    render_version_info,
+)
 
 
 BUILD_ROOT = Path(os.environ.get("DEFENSE_TRACKER_BUILD_OUTPUT_ROOT", BASE / "build")).resolve()
@@ -34,6 +37,9 @@ EXPECTED_VENV = Path(
 VERSION_INFO_FILE = BUILD_ROOT / "windows-version-info.txt"
 BUILD_METADATA_FILE = BUILD_ROOT / "build-metadata.json"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+BUILD_KINDS = frozenset(
+    {"signed-release-candidate", "unsigned-development-candidate"}
+)
 
 
 def _assert_isolated_toolchain() -> None:
@@ -55,7 +61,21 @@ def _required_build_value(name: str, *, pattern: re.Pattern[str] | None = None) 
 
 
 def _write_generated_metadata() -> None:
-    publisher = _required_build_value("DEFENSE_TRACKER_PUBLISHER")
+    company_name = _required_build_value(
+        "DEFENSE_TRACKER_VERSION_INFO_COMPANY_NAME"
+    )
+    build_kind = _required_build_value("DEFENSE_TRACKER_BUILD_KIND")
+    if build_kind not in BUILD_KINDS:
+        raise SystemExit("DEFENSE_TRACKER_BUILD_KIND is not an allowed build kind")
+    unsigned_development = build_kind == "unsigned-development-candidate"
+    if unsigned_development and company_name != UNSIGNED_DEVELOPMENT_COMPANY_NAME:
+        raise SystemExit(
+            "Unsigned development builds must use the fixed non-identity CompanyName"
+        )
+    if not unsigned_development and company_name == UNSIGNED_DEVELOPMENT_COMPANY_NAME:
+        raise SystemExit(
+            "Signed candidate builds require a verified legal Publisher CompanyName"
+        )
     commit = _required_build_value("DEFENSE_TRACKER_EXPECTED_RELEASE_SHA", pattern=SHA_RE)
     source_tree = _required_build_value("DEFENSE_TRACKER_SOURCE_TREE", pattern=SHA_RE)
     source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH", "").strip()
@@ -67,7 +87,13 @@ def _write_generated_metadata() -> None:
         "+00:00", "Z"
     )
     VERSION_INFO_FILE.write_text(
-        render_version_info(PRODUCT_VERSION, publisher), encoding="utf-8", newline="\n"
+        render_version_info(
+            PRODUCT_VERSION,
+            company_name,
+            unsigned_development=unsigned_development,
+        ),
+        encoding="utf-8",
+        newline="\n",
     )
     BUILD_METADATA_FILE.write_text(
         json.dumps(

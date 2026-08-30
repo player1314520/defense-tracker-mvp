@@ -13,7 +13,22 @@ import document_safety
 @pytest.fixture(autouse=True)
 def _isolated_webhook_runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("FEISHU_WEBHOOK_ALLOW_TOKEN_ONLY", "1")
+    monkeypatch.setenv("FEISHU_AUTH_ALLOW_UNLISTED_DEV", "1")
+    monkeypatch.setenv("FEISHU_ALLOWED_SENDER_IDS", "open_id:ou_test")
+    monkeypatch.delenv("FEISHU_ALLOWED_CHAT_IDS", raising=False)
+    monkeypatch.delenv("FEISHU_ADMIN_SENDER_IDS", raising=False)
     monkeypatch.setenv("FEISHU_DEDUPE_DB", str(tmp_path / "events.sqlite3"))
+    for name in (
+        "FEISHU_RATE_WINDOW_SECONDS",
+        "FEISHU_RATE_SENDER_EVENTS",
+        "FEISHU_RATE_CHAT_EVENTS",
+        "FEISHU_RATE_GLOBAL_EVENTS",
+        "FEISHU_COST_SENDER_LIMIT",
+        "FEISHU_COST_CHAT_LIMIT",
+        "FEISHU_COST_GLOBAL_LIMIT",
+        "FEISHU_MAX_INFLIGHT_JOBS",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _load_feishu_cloud(monkeypatch):
@@ -54,6 +69,8 @@ def _text_webhook_payload(
     production=False,
     event_id="evt-cloud",
     text="https://example.com/news",
+    sender_open_id="ou_test",
+    message_id=None,
 ):
     header = {"event_type": "im.message.receive_v1"}
     if token is not None:
@@ -61,10 +78,17 @@ def _text_webhook_payload(
     payload = {
         "header": header,
         "event": {
+            "sender": {
+                "sender_id": {
+                    "open_id": sender_open_id,
+                    "user_id": "user_test",
+                    "union_id": "on_test",
+                },
+            },
             "message": {
                 "chat_id": "oc_test",
                 "chat_type": "p2p",
-                "message_id": "om_auth_test",
+                "message_id": message_id or f"om-{event_id}",
                 "message_type": "text",
                 "content": json.dumps({"text": text}),
             }
@@ -126,6 +150,274 @@ def test_feishu_webhook_accepts_correct_verify_token(monkeypatch):
     assert resp.status_code == 200
     assert len(submitted) == 1
     assert submitted[0][0] == "_process_async"
+
+
+def test_feishu_group_messages_still_require_a_mention_and_strip_its_placeholder(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    submitted = _fake_pool(monkeypatch, cloud)
+    client = cloud.app.test_client()
+
+    ignored = _text_webhook_payload(
+        token="verify_secret_xyz", event_id="evt-group-ignored",
+    )
+    ignored["event"]["message"]["chat_type"] = "group"
+    ignored_response = client.post("/api/feishu/webhook", json=ignored)
+
+    mentioned = _text_webhook_payload(
+        token="verify_secret_xyz", event_id="evt-group-mentioned",
+    )
+    mentioned["event"]["message"]["chat_type"] = "group"
+    mentioned["event"]["message"]["content"] = json.dumps({
+        "text": "@_user_1 https://example.com/news",
+    })
+    mentioned["event"]["message"]["mentions"] = [{"key": "@_user_1"}]
+    mentioned_response = client.post("/api/feishu/webhook", json=mentioned)
+
+    legacy = _text_webhook_payload(
+        token="verify_secret_xyz", event_id="evt-group-legacy-mention",
+    )
+    legacy["event"]["message"]["chat_type"] = "group"
+    legacy["event"]["message"]["content"] = json.dumps({
+        "text": "@_user_1 legacy text",
+        "mentions": [{"key": "@_user_1"}],
+    })
+    legacy_response = client.post("/api/feishu/webhook", json=legacy)
+
+    assert ignored_response.status_code == 200
+    assert mentioned_response.status_code == 200
+    assert legacy_response.status_code == 200
+    assert submitted == [
+        ("_process_async", ("oc_test", "https://example.com/news")),
+        ("_process_async", ("oc_test", "legacy text")),
+    ]
+
+
+def test_feishu_group_mention_parsing_is_bounded_before_authorization_or_dispatch(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    submitted = _fake_pool(monkeypatch, cloud)
+    payload = _text_webhook_payload(
+        token="verify_secret_xyz", event_id="evt-too-many-mentions",
+    )
+    payload["event"]["message"]["chat_type"] = "group"
+    payload["event"]["message"]["mentions"] = [
+        {"key": f"@_user_{index}"}
+        for index in range(cloud.MAX_MESSAGE_MENTIONS + 1)
+    ]
+
+    response = cloud.app.test_client().post("/api/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.get_json() == {"code": 0}
+    assert submitted == []
+
+
+def test_feishu_webhook_rejects_missing_or_unlisted_sender_before_dispatch(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    cloud.app.config["TESTING"] = True
+    submitted = _fake_pool(monkeypatch, cloud)
+    client = cloud.app.test_client()
+
+    missing = _text_webhook_payload(token="verify_secret_xyz", event_id="evt-missing")
+    del missing["event"]["sender"]
+    missing_response = client.post("/api/feishu/webhook", json=missing)
+
+    denied = _text_webhook_payload(
+        token="verify_secret_xyz",
+        event_id="evt-denied",
+        sender_open_id="ou_denied",
+    )
+    monkeypatch.delenv("FEISHU_AUTH_ALLOW_UNLISTED_DEV", raising=False)
+    denied_response = client.post("/api/feishu/webhook", json=denied)
+
+    assert missing_response.status_code == 403
+    assert missing_response.get_json() == {
+        "code": 1,
+        "msg": "webhook authorization denied",
+    }
+    assert denied_response.status_code == 403
+    assert denied_response.get_json() == {
+        "code": 1,
+        "msg": "webhook authorization denied",
+    }
+    assert submitted == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["订阅", "unsubscribe", "扫描", "brief模式", "headlines", "状态"],
+)
+def test_feishu_global_or_high_cost_commands_require_admin(monkeypatch, command):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    submitted = _fake_pool(monkeypatch, cloud)
+    original_push = dict(cloud.PUSH_CONFIG)
+    payload = _text_webhook_payload(
+        token="verify_secret_xyz",
+        event_id=f"evt-admin-{command}",
+        text=command,
+    )
+
+    response = cloud.app.test_client().post("/api/feishu/webhook", json=payload)
+
+    assert response.status_code == 403
+    assert response.get_json() == {
+        "code": 1,
+        "msg": "webhook authorization denied",
+    }
+    assert cloud.PUSH_CONFIG == original_push
+    assert submitted == []
+
+
+def test_feishu_explicit_admin_can_run_management_command(monkeypatch):
+    monkeypatch.setenv("FEISHU_ADMIN_SENDER_IDS", "open_id:ou_test")
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    replies = []
+    monkeypatch.setattr(cloud, "_start_rss_scheduler", lambda: None)
+    monkeypatch.setattr(cloud, "send_text", lambda chat_id, text: replies.append((chat_id, text)) or True)
+    payload = _text_webhook_payload(
+        token="verify_secret_xyz",
+        event_id="evt-admin-subscribe",
+        text="订阅",
+    )
+
+    response = cloud.app.test_client().post("/api/feishu/webhook", json=payload)
+
+    assert response.status_code == 200
+    assert cloud.PUSH_CONFIG["chat_id"] == "oc_test"
+    assert replies and replies[0][0] == "oc_test"
+
+
+def test_feishu_webhook_returns_429_for_atomic_sender_rate_limit(monkeypatch):
+    monkeypatch.setenv("FEISHU_RATE_SENDER_EVENTS", "1")
+    monkeypatch.setenv("FEISHU_RATE_CHAT_EVENTS", "10")
+    monkeypatch.setenv("FEISHU_RATE_GLOBAL_EVENTS", "10")
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    submitted = _fake_pool(monkeypatch, cloud)
+    client = cloud.app.test_client()
+
+    first = client.post(
+        "/api/feishu/webhook",
+        json=_text_webhook_payload(token="verify_secret_xyz", event_id="evt-rate-one"),
+    )
+    second = client.post(
+        "/api/feishu/webhook",
+        json=_text_webhook_payload(token="verify_secret_xyz", event_id="evt-rate-two"),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.get_json() == {"code": 1, "msg": "webhook rate limit exceeded"}
+    assert len(submitted) == 1
+
+
+def test_feishu_webhook_returns_503_when_bounded_admission_is_full(monkeypatch):
+    monkeypatch.setenv("FEISHU_MAX_INFLIGHT_JOBS", "1")
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    submitted = _fake_pool(monkeypatch, cloud)
+    client = cloud.app.test_client()
+
+    first = client.post(
+        "/api/feishu/webhook",
+        json=_text_webhook_payload(token="verify_secret_xyz", event_id="evt-capacity-one"),
+    )
+    second = client.post(
+        "/api/feishu/webhook",
+        json=_text_webhook_payload(token="verify_secret_xyz", event_id="evt-capacity-two"),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 503
+    assert second.get_json() == {"code": 1, "msg": "webhook capacity unavailable"}
+    assert len(submitted) == 1
+
+
+def test_feishu_unexpected_admission_failure_releases_event_for_retry(monkeypatch):
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    submitted = _fake_pool(monkeypatch, cloud)
+    calls = []
+
+    class BrokenAdmission:
+        def acquire(self, *_args, **_kwargs):
+            calls.append("acquire")
+            raise RuntimeError("private upstream detail")
+
+    monkeypatch.setattr(cloud, "_webhook_admission", BrokenAdmission())
+    payload = _text_webhook_payload(
+        token="verify_secret_xyz", event_id="evt-admission-failure",
+    )
+    client = cloud.app.test_client()
+
+    first = client.post("/api/feishu/webhook", json=payload)
+    second = client.post("/api/feishu/webhook", json=payload)
+
+    assert first.status_code == 503
+    assert second.status_code == 503
+    assert first.get_json() == {"code": 1, "msg": "webhook capacity unavailable"}
+    assert second.get_json() == first.get_json()
+    assert calls == ["acquire", "acquire"]
+    assert "private upstream detail" not in first.get_data(as_text=True)
+    assert submitted == []
+
+
+def test_feishu_sync_exception_releases_event_and_capacity_leases(monkeypatch):
+    monkeypatch.setenv("FEISHU_MAX_INFLIGHT_JOBS", "1")
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+    cloud.app.config["TESTING"] = False
+    payload = _text_webhook_payload(
+        token="verify_secret_xyz",
+        event_id="evt-sync-failure",
+        text="帮助",
+    )
+    monkeypatch.setattr(
+        cloud,
+        "send_text",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("reply failed")),
+    )
+    client = cloud.app.test_client()
+
+    failed = client.post("/api/feishu/webhook", json=payload)
+    assert failed.status_code == 500
+    assert cloud._webhook_admission.inflight == 0
+
+    monkeypatch.setattr(cloud, "send_text", lambda *_args: True)
+    retried = client.post("/api/feishu/webhook", json=payload)
+    assert retried.status_code == 200
+    assert cloud._webhook_admission.inflight == 0
+
+
+def test_feishu_worker_exception_releases_event_and_capacity_leases(monkeypatch):
+    monkeypatch.setenv("FEISHU_MAX_INFLIGHT_JOBS", "1")
+    cloud = _load_feishu_cloud_with_token(monkeypatch, "verify_secret_xyz")
+
+    class DeferredPool:
+        task = None
+
+        def submit(self, function, *args):
+            self.task = lambda: function(*args)
+            return object()
+
+    pool = DeferredPool()
+    monkeypatch.setattr(cloud, "_worker_pool", pool)
+    monkeypatch.setattr(
+        cloud,
+        "_process_async",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("worker failed")),
+    )
+    payload = _text_webhook_payload(
+        token="verify_secret_xyz",
+        event_id="evt-worker-failure",
+    )
+    client = cloud.app.test_client()
+
+    accepted = client.post("/api/feishu/webhook", json=payload)
+    assert accepted.status_code == 200
+    assert cloud._webhook_admission.inflight == 1
+    with pytest.raises(RuntimeError, match="worker failed"):
+        pool.task()
+    assert cloud._webhook_admission.inflight == 0
+
+    monkeypatch.setattr(cloud, "_process_async", lambda *_args: None)
+    retried = client.post("/api/feishu/webhook", json=payload)
+    assert retried.status_code == 200
 
 
 def test_feishu_webhook_acknowledges_overlong_text_without_parsing_or_dispatch(monkeypatch):
@@ -582,6 +874,13 @@ def test_feishu_webhook_deduplicates_message(monkeypatch):
             "token": "verify_secret_xyz",
         },
         "event": {
+            "sender": {
+                "sender_id": {
+                    "open_id": "ou_test",
+                    "user_id": "user_test",
+                    "union_id": "on_test",
+                },
+            },
             "message": {
                 "chat_id": "oc_test",
                 "chat_type": "p2p",

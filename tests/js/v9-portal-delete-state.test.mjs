@@ -10,7 +10,7 @@ const source = await readFile(
 
 
 test("移动门户按已验证密文载荷的 deleted 状态更新记录头", () => {
-  const start = source.indexOf("for (const event of events || [])");
+  const start = source.indexOf("async function pullCiphertextChanges");
   const end = source.indexOf("state.records = [...heads.values()]", start);
   const block = source.slice(start, end);
 

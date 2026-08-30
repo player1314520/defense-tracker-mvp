@@ -153,8 +153,10 @@ VPS 上线前依次执行：
    `supabase/migrations/*.sql`，最后强制重建 Functions 容器并核验关键 RPC。
    每个迁移的文件名、SHA-256 和状态写入私有账本；另一个私有 backend release
    账本绑定项目 release SHA、source manifest、wire token、migration policy、Functions
-   digest 与官方 Supabase SHA，并在主机 `MVP_RELEASE_STATE_DIR/backend.*` 留下同值
-   状态。已登记迁移发生内容漂移、release 元数据不一致或上次尝试状态不明时会
+   digest 与官方 Supabase SHA，并原子写入主机
+   `MVP_RELEASE_STATE_DIR/backend-state.json` 的完整 active generation。旧
+   `backend.*` 只允许由安装器执行一次性完整迁移；缺项或不一致即拒绝，且不再作为
+   权威读取源。已登记迁移发生内容漂移、release 元数据不一致或上次尝试状态不明时会
    fail-closed，不能静默重跑。API 域名只放行 Auth、REST、
    GraphQL、Realtime、Storage 及两个指定函数路径，其他路径统一 404；Realtime
    WebSocket 使用单独的 Caddy matcher，供上游 WAF 明确放行 Upgrade；默认
@@ -255,9 +257,12 @@ production 和部署证据必须使用 receipt 中同一个 `repository@sha256:.
    核验迁移与 Functions，backend 失败时不会启动候选 Portal。随后等待容器健康，并通过
    一个不打印 key 的探测器
    检查 Portal `/ready`、公共配置与官方 key 完全一致、Auth、Storage health、
-   匿名 access apply 运行路径及 Realtime WebSocket 的 TLS/HTTP 101 握手。成功后
-   才原子更新 current/previous 的 image/SHA/wire/manifest；失败只在 current 的 wire
-   仍与 active backend 完全相同时恢复 current，且从不 image prune。
+   匿名 access apply 运行路径及 Realtime WebSocket 的 TLS/HTTP 101 握手。容器切换前
+   会先 fsync `portal-switch-intent.json`，并核对实际运行容器 digest 与权威状态完全
+   一致；探测成功后才提交单一 `portal-state.json` generation 并清理意图日志。失败只在
+   current 的 wire 仍与 active backend 完全相同时恢复 current，核对恢复后的真实 digest
+   再撤销意图，且从不 image prune。宿主在切换窗口中断会保留意图并阻断下一次操作，
+   不会把文件中的旧版本默认为真实运行版本。
    `/ready` 需要 Portal 容器访问精确 Supabase HTTPS origin，因此 Portal 同时加入
    一个不承载其他服务的 egress bridge；原有 `portal-internal` 仍为 internal。
 5. 保持 `ACCESS_APPLICATIONS_ENABLED=false`，先用两名已邀请的真实账号走一次邮件、
@@ -265,10 +270,11 @@ production 和部署证据必须使用 receipt 中同一个 `repository@sha256:.
    P95、内存、磁盘、邮件失败与同步滞后。全部通过后，公开发布时才把申请入口改为
    `true` 并重启 Portal，再做一次匿名申请到人工邀请的完整验证。
 
-上传限制按层明确：Portal 请求上限 256 KiB；V9 record ciphertext 是
-`16 MiB + 16 byte` AES-GCM tag，Storage 同样限制为 16 MiB 加 tag；同步事件的
-编码 JSON 上限 24 MiB；Caddy API 传输上限 32 MiB 只用于容纳 JSON/base64 与协议
-开销。Caddy 的 32 MiB 不是业务对象可以达到 32 MiB 的承诺。
+上传限制按层明确：Portal 普通请求上限 256 KiB；V9 新 record ciphertext 是
+`1 MiB + 16 byte` AES-GCM tag，Storage 使用同一上限。同步 pull JSON 数组上限
+24 MiB，用于兼容迁移前已存在的合法 16 MiB 密文经 base64url 编码后的单个事件；
+Caddy API 传输上限 32 MiB 只为该兼容读取和协议开销。新写入不得利用 pull/Caddy
+上限绕过数据库、桌面客户端和 Storage 一致的 1 MiB 约束。
 
 匿名申请的来源契约固定在最外层 Caddy：`WAF_TRUSTED_PROXY_CIDRS` 必须逐项填写
 供应商公开且已复核的出口 CIDR，Caddy 使用 `trusted_proxies_strict` 从最右侧可信
@@ -490,7 +496,8 @@ GitHub-hosted seal 只从 `requirements.deployment-evidence.lock` 以 `--require
 
 回滚触发条件：任一核心流程失败、5xx 持续超过 1%、P95 API 持续超过 2 秒、
 出现跨用户/跨角色数据、备份超过 26 小时或磁盘剩余低于 20%。执行 `rollback.sh`
-前，脚本先从数据库私有账本、Functions digest 与主机 `backend.*` 状态复验 active
+前，脚本先从数据库私有账本、Functions digest 与主机原子
+`backend-state.json` 状态复验 active
 backend，再要求 previous 镜像的 revision/manifest 与保留状态一致、policy 为
 `expand-contract`，且 previous wire token 精确等于 active backend wire；任一缺失或
 不一致都在 Portal 切换前 fail-closed。通过后只切换到 retained previous Portal，并把
@@ -523,12 +530,16 @@ systemctl enable --now defense-tracker-backup.timer \
 在下一次每日运行清除邮箱密文、邮箱/IP/UA 摘要和邀请关联，最迟不超过 24 小时；终态
 邀请的邮箱摘要也在下一次运行清除；审计在第 179 天起进入删除条件，确保正常运行
 的每日任务下不超过 180 天。
-过期 invited membership 会被撤销，每日事件计数只保留完成限额核对所需的最近
-7 天。定时器成功并不证明数据库备份成功，二者必须分别监控。
+过期 invited membership 会被撤销；用户事件计数和组织密文字节计数只保留完成限额
+核对所需的最近 7 个 UTC 日。设备会话撤销审计和已 `tombstoned/repaired` 的隔离报告
+在 180 天边界清除；仍为 `open` 的隔离报告属于待修复队列，不因年龄被静默删除。
+定时器成功并不证明数据库备份成功，二者必须分别监控。
 
 安装 `defense-tracker-backup.service/.timer` 后，systemd 每晚 02:15
-（Asia/Shanghai，最多随机延迟 15 分钟）进入停写维护窗口。`backup.sh` 先取得与
-发布/迁移共用的锁，停止 Kong、Auth、REST、Realtime、Storage、Functions 等所有
+（Asia/Shanghai，最多随机延迟 15 分钟）进入停写维护窗口。Portal 发布、回滚、切换
+恢复、Supabase 启动/安装、Owner 引导和备份都先取得同一全局部署锁；父流程调用安装器
+时只继承并验证同一锁文件描述符，不能绕开或重新竞争。`backup.sh` 随后停止 Kong、
+Auth、REST、Realtime、Storage、Functions 等所有
 写入口，再生成 `postgres` 与 `_supabase` 的 custom-format dump、无密码的全局
 角色清单、`/etc/postgresql-custom` 密钥卷和 Storage tar。数据库与文件快照完成后
 立即恢复服务，后续配置打包、`age` 加密与异机上传不占用维护窗口。远端密文哈希
@@ -590,10 +601,15 @@ staging 中先签 EXE，使用 `/fd SHA256 /tr <URL> /td SHA256`，再由 Inno S
    和 portable 内每个文件的最终哈希。当前 reviewer registry 明确为 inactive，因此
    signed candidate 和 stable Release 都会在首次签名前 fail-closed；法律主体、审核者
    公钥与完整组件复核完成后才能生成不含 `NOASSERTION` 的私有候选。
-8. `current/previous` 的 image、SHA、wire、manifest 仍是多个文件分别原子 `mv`，不是单一 generation 的事务提交。
-   进程或宿主在中间崩溃会留下混合状态；后续 release/
-   rollback 会 fail-closed，但需要运营方按镜像 digest、backend 账本和备份手工复核
-   修复，不能宣称该状态更新对断电完全原子。
+8. Portal/backend 的字段已分别收敛到单一 generation 文档，并用带状态摘要的 durable
+   marker 阻止保留的旧字段在 JSON 丢失后复活；marker 绑定不可变的第 1 代谱系锚点，
+   后续 generation 只需一次原子文档替换。容器切换也使用预写意图日志。文件系统
+   和 Docker 仍不可能组成一个真正的跨系统原子事务：切换中断后下一次 release/rollback
+   会 fail-closed。运营方只能运行 `deploy/mvp/bin/recover-portal-switch.sh [生产env]`；
+   该恢复入口自行读取意图、检查 Docker 实际运行 digest、复核 active backend 并重新执行
+   公网 probe，匹配目标时续交 generation，匹配来源时撤销意图，其他状态继续阻断。
+   `portal-intent-complete/abort` 是该包装器的内部原语，不是人工操作接口；不得向它们手填
+   digest，也不得直接删除意图、marker 或权威 JSON 来“修复”。
 9. 外部 origin-isolation probe 能证明执行当时 GitHub-hosted runner 无法直连所登记的
    两个源站目标，但不能证明随后防火墙规则没有漂移、其他未登记地址不存在，也不能
    代替持续外部监控。证据中的目标是带密钥摘要，不能供公众反推出或独立核对真实 IP；

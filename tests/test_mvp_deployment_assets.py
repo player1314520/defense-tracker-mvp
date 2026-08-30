@@ -212,7 +212,7 @@ def test_reverse_proxy_uses_two_exact_domains_and_loopback_upstreams():
     assert "ACCESS_APPLICATION_ENCRYPTION_KEY" in override
     assert "V9_ACCESS_APPLICATIONS_ENABLED" in override
     assert "SUPABASE_FUNCTIONS_DEPLOY_DIR" in override
-    assert "FILE_SIZE_LIMIT: \"16777232\"" in override
+    assert "FILE_SIZE_LIMIT: \"1048592\"" in override
     assert "kong:" in override
     assert "host_ip: 127.0.0.1" in override
     assert "supavisor:" in override
@@ -372,13 +372,21 @@ def test_release_and_rollback_retain_git_sha_images():
     assert 'docker pull "$candidate_image"' in release
     assert 'candidate_image="$image_repository:$release_sha"' not in release
     assert "org.opencontainers.image.revision" in release
-    assert "previous.image" in release
+    assert "portal-state.json" in release
+    assert "portal-intent-begin" in release
+    assert "portal-intent-complete" in release
     assert "--wait" in release
     assert "docker image prune" not in release
     assert "restore_current" in release
+    assert "for service in portal edge" in release
+    assert "ps --status running --quiet" in release
+    assert "initial Portal rollback left a public service running" in release
+    assert release.index("initial Portal rollback left a public service running") < release.index(
+        'portal-intent-abort "$state_dir" "$restored_image"'
+    )
     assert 'install-supabase-app.sh" "$release_sha" "$config_file"' in release
     assert 'verify-supabase-app.sh" "$release_sha" "$config_file"' in release
-    assert "probe-public.py" in release
+    assert 'probe-public.py" "$config_file" "$release_sha"' in release
     assert 'https://$PORTAL_DOMAIN/ready' not in release  # one redaction-safe probe owns live checks
 
     # Every source/image/Compose gate must fail before the first Supabase
@@ -398,7 +406,9 @@ def test_release_and_rollback_retain_git_sha_images():
         assert release.index(pre_mutation_gate) < install_at
     assert "backend migrations are forward-only" in release
 
-    assert "previous.image" in rollback
+    assert "portal-state.json" in rollback
+    assert "portal-intent-begin" in rollback
+    assert "portal-intent-complete" in rollback
     assert "org.opencontainers.image.revision" in rollback
     assert "io.defensetracker.mvp.backend-wire-compatibility" in rollback
     assert "retained Portal image must be pinned by repository digest" in rollback
@@ -407,6 +417,8 @@ def test_release_and_rollback_retain_git_sha_images():
         'docker compose --env-file "$config_file" --file "$compose_file" up'
     )
     assert 'verify-supabase-app.sh" "$backend_sha" "$config_file"' in rollback
+    assert 'probe-public.py" "$config_file" "$previous_sha"' in rollback
+    assert 'probe-public.py" "$config_file" "$current_sha"' in rollback
     assert "--wait" in rollback
     assert "docker image prune" not in rollback
 
@@ -444,7 +456,6 @@ def test_supabase_install_is_hash_tracked_and_deploys_migrations_and_functions()
     assert 'install-supabase-app.sh" --prepare-functions "$release_sha" "$config_file"' in starter
     assert 'install-supabase-app.sh" "$release_sha" "$config_file"' in starter
     assert 'preflight.sh" "$config_file"' in starter
-
     for signature in (
         "public.bind_device_session(uuid,uuid)",
         "public.bootstrap_mvp_first_owner(uuid,text,uuid,text,text,uuid,text,text,text)",
@@ -468,9 +479,11 @@ def test_supabase_install_is_hash_tracked_and_deploys_migrations_and_functions()
     assert "access retention RPC grants are not service-role-only" in verifier
     assert "register_device_acl" in verifier
     assert "mvp_backend_releases" in verifier
-    assert "backend.sha" in verifier
-    assert "backend.manifest" in verifier
-    assert "backend.wire" in verifier
+    assert "backend-state.json" in installer
+    assert "backend-state.json" in verifier
+    assert 'get backend "$MVP_RELEASE_STATE_DIR" active.release_sha' in verifier
+    assert 'get backend "$MVP_RELEASE_STATE_DIR" active.source_manifest_sha256' in verifier
+    assert 'get backend "$MVP_RELEASE_STATE_DIR" active.wire_compatibility' in verifier
     migration_025 = read(
         ROOT / "supabase" / "migrations" / "202608100025_mvp_first_owner_key_envelope.sql"
     )
@@ -493,6 +506,56 @@ def test_supabase_install_is_hash_tracked_and_deploys_migrations_and_functions()
     image_builder = read(MVP / "bin" / "build-portal-image.sh")
     assert "RepoDigests" in image_builder
     assert "Immutable release reference" in image_builder
+
+
+def test_operator_entrypoints_share_one_inherited_deployment_lock():
+    helper = read(MVP / "bin" / "deployment-lock.sh")
+    assert "MVP_DEPLOYMENT_LOCK_FD=9" in helper
+    assert "readlink -f /proc/self/fd/9" in helper
+    assert "inherited deployment lock does not match" in helper
+    assert "deployment state path is too broad" in helper
+    for broad_path in (
+        "/|/bin|/boot|/dev|/etc|/home|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var",
+    ):
+        assert broad_path in helper
+
+    names = (
+        "release.sh",
+        "rollback.sh",
+        "recover-portal-switch.sh",
+        "start-supabase.sh",
+        "install-supabase-app.sh",
+        "bootstrap-owner.sh",
+        "backup.sh",
+    )
+    for name in names:
+        script = read(MVP / "bin" / name)
+        assert "deployment-lock.sh" in script
+        assert "acquire_mvp_deployment_lock" in script
+
+    installer = read(MVP / "bin" / "install-supabase-app.sh")
+    starter = read(MVP / "bin" / "start-supabase.sh")
+    release = read(MVP / "bin" / "release.sh")
+    bootstrap = read(MVP / "bin" / "bootstrap-owner.sh")
+    backup = read(MVP / "bin" / "backup.sh")
+    assert installer.index("acquire_mvp_deployment_lock") < installer.index(
+        ".supabase-app.lock"
+    )
+    assert starter.index("acquire_mvp_deployment_lock") < starter.index(
+        "install-supabase-app.sh"
+    )
+    assert release.index("acquire_mvp_deployment_lock") < release.index(
+        "install-supabase-app.sh"
+    )
+    for script in (bootstrap, backup):
+        assert "release-state.py" in script
+        assert 'prepare "$MVP_RELEASE_STATE_DIR"' in script
+        assert script.index('prepare "$MVP_RELEASE_STATE_DIR"') < script.index(
+            "acquire_mvp_deployment_lock"
+        )
+        assert 'chmod 0700 "$MVP_RELEASE_STATE_DIR"' not in script
+    assert 'prepare "$BACKUP_STAGING_DIR"' in backup
+    assert 'prepare "$state_dir"' in backup
 
 
 def test_backend_release_manifest_is_git_exact_and_rejects_invalid_policy(tmp_path):
@@ -677,6 +740,16 @@ def test_public_probe_reads_release_values_from_version_json(tmp_path):
     with pytest.raises(module.ProbeFailure):
         module.verify_release_metadata(payload | {"version": "9.0.0"}, "a" * 40, version)
 
+    custom_env = tmp_path / "staging.env"
+    parsed_path, parsed_sha = module.parse_cli_args(
+        ["probe-public.py", str(custom_env), "b" * 40]
+    )
+    assert parsed_path == custom_env
+    assert parsed_sha == "b" * 40
+    default_path, default_sha = module.parse_cli_args(["probe-public.py"])
+    assert default_path == Path("/etc/defense-tracker/production.env")
+    assert default_sha is None
+
 
 def test_first_owner_bootstrap_is_out_of_band_empty_database_and_idempotent():
     bootstrap = read(MVP / "bin" / "bootstrap-owner.sh")
@@ -771,7 +844,7 @@ def test_runbook_records_unverified_boundaries_and_recovery_targets():
         "owner-bootstrap.json",
         "--finalize",
         "停写维护窗口",
-        "16 MiB + 16 byte",
+        "1 MiB + 16 byte",
         "32 MiB",
         "Realtime WebSocket",
         "Storage health",
@@ -783,6 +856,6 @@ def test_runbook_records_unverified_boundaries_and_recovery_targets():
         "上线前必须由 VPS 防火墙或 CDN/WAF",
         "provenance attestation",
         "--require-hashes",
-        "不是单一 generation 的事务提交",
+        "不可能组成一个真正的跨系统原子事务",
     ):
         assert required in runbook

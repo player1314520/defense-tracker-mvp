@@ -54,7 +54,7 @@ set +a
 : "${V9_AUTH_HOOK_ENABLED:?V9_AUTH_HOOK_ENABLED is required}"
 : "${MVP_RELEASE_STATE_DIR:?MVP_RELEASE_STATE_DIR is required}"
 
-for command_name in docker python3 stat flock mkdir chmod sleep; do
+for command_name in docker python3 stat flock sleep; do
     command -v "$command_name" >/dev/null 2>&1 || {
         printf '%s\n' "required Owner bootstrap command is missing: $command_name" >&2
         exit 69
@@ -72,10 +72,11 @@ case "$MVP_RELEASE_STATE_DIR" in
     /*) ;;
     *) printf '%s\n' "MVP_RELEASE_STATE_DIR must be absolute" >&2; exit 64 ;;
 esac
-mkdir -p "$MVP_RELEASE_STATE_DIR"
-chmod 0700 "$MVP_RELEASE_STATE_DIR"
-exec 9>"$MVP_RELEASE_STATE_DIR/.release.lock"
-flock -n 9 || { printf '%s\n' "a release, rollback or backup is active" >&2; exit 75; }
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+python3 "$script_dir/release-state.py" prepare "$MVP_RELEASE_STATE_DIR"
+# shellcheck disable=SC1090
+. "$script_dir/deployment-lock.sh"
+acquire_mvp_deployment_lock "$MVP_RELEASE_STATE_DIR"
 exec 8>"$MVP_RELEASE_STATE_DIR/.supabase-app.lock"
 flock -n 8 || { printf '%s\n' "a Supabase application install is active" >&2; exit 75; }
 

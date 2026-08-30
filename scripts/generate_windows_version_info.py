@@ -15,22 +15,45 @@ if str(PROJECT_ROOT) not in sys.path:
 from product_version import ProductVersion, load_product_version  # noqa: E402
 
 
-def _validated_publisher(value: str) -> str:
-    publisher = value.strip()
-    if not publisher or len(publisher) > 160:
-        raise ValueError("Publisher must be a non-empty legal name of at most 160 characters")
-    if any(ord(char) < 32 for char in publisher):
-        raise ValueError("Publisher contains a control character")
-    return publisher
+UNSIGNED_DEVELOPMENT_COMPANY_NAME = (
+    "DefenseTracker Community Edition (Unsigned Development Build)"
+)
 
 
-def render_version_info(version: ProductVersion, publisher: str) -> str:
-    publisher = _validated_publisher(publisher)
+def _validated_company_name(value: str) -> str:
+    company_name = value.strip()
+    if not company_name or len(company_name) > 160:
+        raise ValueError("CompanyName must be non-empty and at most 160 characters")
+    if any(ord(char) < 32 for char in company_name):
+        raise ValueError("CompanyName contains a control character")
+    return company_name
+
+
+def render_version_info(
+    version: ProductVersion,
+    company_name: str,
+    *,
+    unsigned_development: bool = False,
+) -> str:
+    company_name = _validated_company_name(company_name)
+    if unsigned_development:
+        if company_name != UNSIGNED_DEVELOPMENT_COMPANY_NAME:
+            raise ValueError(
+                "Unsigned development builds must use the fixed non-identity CompanyName"
+            )
+        copyright_text = (
+            "Unsigned development build; no publisher identity asserted"
+        )
+    else:
+        if company_name == UNSIGNED_DEVELOPMENT_COMPANY_NAME:
+            raise ValueError(
+                "The unsigned development CompanyName cannot be used for signed builds"
+            )
+        copyright_text = f"Copyright (c) 2026 {company_name}"
     file_version = version.windows_file_version_tuple
     product_version = (*file_version[:3], 0)
-    copyright_text = f"Copyright (c) 2026 {publisher}"
     strings = {
-        "CompanyName": publisher,
+        "CompanyName": company_name,
         "FileDescription": f"{version.product_name} {version.display_version}",
         "FileVersion": version.windows_file_version,
         "InternalName": version.product_name,
@@ -68,15 +91,25 @@ VSVersionInfo(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--publisher", required=True)
+    identity = parser.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--company-name")
+    identity.add_argument("--publisher")
+    parser.add_argument("--unsigned-development", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--version-file", type=Path, default=PROJECT_ROOT / "version.json")
     args = parser.parse_args()
+    if args.unsigned_development and args.publisher is not None:
+        parser.error("--publisher cannot be used for an unsigned development build")
+    company_name = args.company_name or args.publisher
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     version = load_product_version(args.version_file)
     output.write_text(
-        render_version_info(version, args.publisher),
+        render_version_info(
+            version,
+            company_name,
+            unsigned_development=args.unsigned_development,
+        ),
         encoding="utf-8",
         newline="\n",
     )

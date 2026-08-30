@@ -14,8 +14,13 @@
   FEISHU_VERIFY_TOKEN    飞书事件 Verification Token（webhook 必填）
   FEISHU_ENCRYPT_KEY     飞书事件 Encrypt Key（生产签名必填）
   FEISHU_TENANT_KEY      允许的租户 Key（生产身份绑定必填）
+  FEISHU_ALLOWED_SENDER_IDS  允许调用者，格式 open_id:ou_x（逗号分隔）
+  FEISHU_ALLOWED_CHAT_IDS    允许会话 chat_id（逗号分隔）
+  FEISHU_ADMIN_SENDER_IDS    管理员调用者，格式 open_id:ou_x（逗号分隔）
   FEISHU_EVENT_LEASE_SECONDS  后台任务租约秒数（默认 900，范围 30-3600）
   FEISHU_WEBHOOK_ALLOW_TOKEN_ONLY=1  仅本地开发兼容旧 token-only 回调
+  FEISHU_AUTH_ALLOW_UNLISTED_DEV=1   仅与 token-only 同时启用的开发兼容
+  FEISHU_MAX_INFLIGHT_JOBS  后台任务并发准入上限（默认 8）
   AI_BASE_URL            AI 服务地址（默认 https://api.deepseek.com）
   AI_ALLOWED_HOSTS       额外允许的 AI HTTPS 主机名（逗号分隔，不支持通配符/IP）
   AI_MODEL               模型名称（默认 deepseek-chat）
@@ -30,6 +35,7 @@ RSS 自动推送（选填）：
 """
 
 import base64
+import functools
 import hmac
 import ipaddress
 import json
@@ -55,18 +61,22 @@ from docx import Document as DocxDocument
 from docx.shared import Pt, Emu
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
-from flask import Flask, request, jsonify
+from flask import Flask, g, request, jsonify
 from feishu_common import (
     ascii_fallback_name as _ascii_fallback_name,
     sanitize_feishu_filename as _sanitize_feishu_filename,
 )
 from document_safety import DocumentSafetyError, extract_docx_text_safe, extract_pdf_text_isolated
 from feishu_webhook_security import (
+    WebhookCapacityUnavailable,
     WebhookMisconfigured,
+    WebhookRateLimited,
     WebhookRejected,
     MAX_WEBHOOK_BODY_BYTES,
     acquire_event_lease,
+    authorize_event_actor,
     decrypt_event_payload,
+    load_webhook_admission_controller,
     submit_leased_event,
     token_only_development_enabled,
     validate_event_identity,
@@ -116,20 +126,73 @@ FEISHU_API = "https://open.feishu.cn/open-apis"
 # 全局线程池（替代无限 daemon thread，防止线程爆炸）
 # ════════════════════════════════════════════════════════════
 _worker_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="feishu_worker")
+try:
+    _webhook_admission = load_webhook_admission_controller()
+    _webhook_admission_error = ""
+except WebhookMisconfigured as exc:
+    _webhook_admission = None
+    _webhook_admission_error = exc.code
+    logger.error("webhook admission unavailable (%s)", exc.code)
 
 
-def _queue_webhook_job(event_lease, function, *args) -> bool:
+def _queue_webhook_job(event_lease, admission_lease, function, *args) -> bool:
+    @functools.wraps(function)
+    def _run_with_admission(*worker_args):
+        try:
+            return function(*worker_args)
+        finally:
+            admission_lease.release()
+
     try:
-        submit_leased_event(_worker_pool, event_lease, function, *args)
+        submit_leased_event(_worker_pool, event_lease, _run_with_admission, *args)
+        admission_lease.mark_handed_off()
         return True
     except WebhookMisconfigured as exc:
+        admission_lease.release()
         logger.error("webhook dispatch unavailable (%s)", exc.code)
         return False
 
 
-def _ack_webhook_event(event_lease):
-    event_lease.complete()
+def _ack_webhook_event(event_lease, admission_lease):
+    try:
+        event_lease.complete()
+    finally:
+        admission_lease.release()
     return jsonify({"code": 0})
+
+
+@app.teardown_request
+def _release_unhanded_webhook_leases(_error):
+    lease_pair = getattr(g, "webhook_lease_pair", None)
+    if not lease_pair:
+        return
+    event_lease, admission_lease = lease_pair
+    if not admission_lease.handed_off:
+        try:
+            event_lease.release()
+        finally:
+            admission_lease.release()
+
+
+_ADMIN_COMMANDS = frozenset({
+    "订阅", "subscribe",
+    "取消订阅", "unsubscribe",
+    "扫描", "scan",
+    "状态", "status",
+    "brief模式", "brief",
+    "headlines模式", "headlines",
+})
+
+
+def _webhook_work_cost(message_type: str, text: str = "") -> int:
+    if message_type in {"image", "file"}:
+        return 8
+    normalized = text.casefold()
+    if normalized in {"扫描", "scan"}:
+        return 12
+    if normalized in _ADMIN_COMMANDS:
+        return 2
+    return 4
 
 # ════════════════════════════════════════════════════════════
 # RSS 自动推送配置
@@ -146,6 +209,8 @@ MAX_FEISHU_DOWNLOAD_BYTES = 10 * 1024 * 1024
 MAX_REDIRECTS = 5
 MAX_MESSAGE_TEXT_CHARS = 8192
 MAX_RENAME_FILENAME_BYTES = 120
+MAX_MESSAGE_MENTIONS = 16
+MAX_MENTION_KEY_CHARS = 128
 
 # ════════════════════════════════════════════════════════════
 # 启动校验：必填环境变量
@@ -1733,7 +1798,7 @@ def _parse_brief_sections(text: str) -> dict:
         else:
             remaining.append(s)
 
-    non_empty = [l for l in remaining if l]
+    non_empty = [line for line in remaining if line]
     if non_empty:
         longest_idx = max(range(len(non_empty)), key=lambda i: len(non_empty[i]))
         sec['body'] = non_empty[longest_idx]
@@ -2493,14 +2558,16 @@ def _rss_push_job():
 
 
 _rss_scheduler_running = False
+_rss_scheduler_lock = threading.Lock()
 
 def _start_rss_scheduler():
     """启动 RSS 定时推送后台线程（幂等，不会重复启动）"""
     global _rss_scheduler_running
-    if _rss_scheduler_running:
-        return
-    _rss_scheduler_running = True
-    interval = PUSH_CONFIG["interval_min"] * 60
+    with _rss_scheduler_lock:
+        if _rss_scheduler_running:
+            return
+        _rss_scheduler_running = True
+        interval = PUSH_CONFIG["interval_min"] * 60
 
     def _loop():
         time.sleep(10)  # 启动后延迟 10 秒再执行首次
@@ -2511,8 +2578,13 @@ def _start_rss_scheduler():
                 logger.error("RSS scheduler error: %s", e)
             time.sleep(interval)
 
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
+    try:
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+    except Exception:
+        with _rss_scheduler_lock:
+            _rss_scheduler_running = False
+        raise
     logger.info("RSS 定时推送已启动（间隔 %d 分钟）", PUSH_CONFIG["interval_min"])
 
 
@@ -2641,8 +2713,64 @@ def feishu_webhook():
     chat_id = message.get("chat_id", "")
     msg_id = message.get("message_id", "")
 
-    if not chat_id:
+    if not isinstance(chat_id, str) or not chat_id.strip():
         return jsonify({"code": 0})
+    chat_id = chat_id.strip()
+
+    content = None
+    text = ""
+    if msg_type == "text":
+        try:
+            content = json.loads(message.get("content", "{}"))
+            if not isinstance(content, dict):
+                return jsonify({"code": 0})
+            raw_text = content.get("text", "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return jsonify({"code": 0})
+        if not isinstance(raw_text, str):
+            return jsonify({"code": 0})
+        if len(raw_text) > MAX_MESSAGE_TEXT_CHARS:
+            logger.warning("text message ignored (TEXT_TOO_LONG)")
+            return jsonify({"code": 0})
+        text = raw_text.strip()
+
+        # ── @机器人 群聊支持：剥离 @mention 占位符 ──────────
+        mentions = message.get("mentions")
+        if mentions is None:
+            # 接受 message.mentions，同时保留旧开发夹具的 content.mentions 兼容。
+            mentions = content.get("mentions")
+        mention_items = mentions if isinstance(mentions, list) else []
+        if len(mention_items) > MAX_MESSAGE_MENTIONS:
+            logger.warning("text message ignored (TOO_MANY_MENTIONS)")
+            return jsonify({"code": 0})
+        mention_keys = []
+        for mention in mention_items:
+            if not isinstance(mention, dict):
+                continue
+            key = mention.get("key", "")
+            if (
+                isinstance(key, str)
+                and 0 < len(key) <= MAX_MENTION_KEY_CHARS
+                and key in text
+            ):
+                mention_keys.append(key)
+        for key in mention_keys:
+            text = text.replace(key, "").strip()
+        # 群聊中如果没有 @机器人，则不处理（避免干扰正常聊天）。
+        if message.get("chat_type", "") == "group" and not mention_keys:
+            return jsonify({"code": 0})
+        if not text:
+            return jsonify({"code": 0})
+
+    require_admin = msg_type == "text" and text.casefold() in _ADMIN_COMMANDS
+    try:
+        actor = authorize_event_actor(data, require_admin=require_admin)
+    except WebhookRejected as exc:
+        logger.warning("webhook authorization rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook authorization denied"}), 403
+    except WebhookMisconfigured as exc:
+        logger.error("webhook authorization unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook authorization unavailable"}), 503
 
     # 持久租约：处理中/已完成事件去重，崩溃后由过期租约接管。
     try:
@@ -2657,6 +2785,33 @@ def feishu_webhook():
         logger.info("in-flight or completed webhook event skipped")
         return jsonify({"code": 0})
 
+    if _webhook_admission is None:
+        event_lease.release()
+        logger.error("webhook admission unavailable (%s)", _webhook_admission_error)
+        return jsonify({"code": 1, "msg": "webhook capacity unavailable"}), 503
+    try:
+        admission_lease = _webhook_admission.acquire(
+            actor,
+            cost=_webhook_work_cost(str(msg_type), text),
+        )
+    except WebhookRateLimited as exc:
+        event_lease.release()
+        logger.warning("webhook rate limit rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook rate limit exceeded"}), 429
+    except WebhookCapacityUnavailable as exc:
+        event_lease.release()
+        logger.warning("webhook capacity rejected (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook capacity unavailable"}), 503
+    except WebhookMisconfigured as exc:
+        event_lease.release()
+        logger.error("webhook admission unavailable (%s)", exc.code)
+        return jsonify({"code": 1, "msg": "webhook capacity unavailable"}), 503
+    except Exception:
+        event_lease.release()
+        logger.error("webhook admission unavailable (UNEXPECTED_FAILURE)")
+        return jsonify({"code": 1, "msg": "webhook capacity unavailable"}), 503
+    g.webhook_lease_pair = (event_lease, admission_lease)
+
     # ── 图片消息处理 ─────────────────────────────────
     if msg_type == "image":
         try:
@@ -2664,10 +2819,12 @@ def feishu_webhook():
             image_key = content.get("image_key", "")
         except Exception:
             logger.warning("图片消息解析失败")
-            return _ack_webhook_event(event_lease)
+            return _ack_webhook_event(event_lease, admission_lease)
         if not image_key:
-            return _ack_webhook_event(event_lease)
-        if not _queue_webhook_job(event_lease, _process_image_async, chat_id, image_key):
+            return _ack_webhook_event(event_lease, admission_lease)
+        if not _queue_webhook_job(
+            event_lease, admission_lease, _process_image_async, chat_id, image_key,
+        ):
             return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
         return jsonify({"code": 0})
 
@@ -2679,50 +2836,23 @@ def feishu_webhook():
             file_name = content.get("file_name", "")
         except Exception:
             logger.warning("文件消息解析失败")
-            return _ack_webhook_event(event_lease)
+            return _ack_webhook_event(event_lease, admission_lease)
         if not file_key:
-            return _ack_webhook_event(event_lease)
+            return _ack_webhook_event(event_lease, admission_lease)
         if not _queue_webhook_job(
-            event_lease, _process_file_async, chat_id, msg_id, file_key, file_name,
+            event_lease, admission_lease,
+            _process_file_async, chat_id, msg_id, file_key, file_name,
         ):
             return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
         return jsonify({"code": 0})
 
     if msg_type != "text":
         send_text(chat_id, "支持：文字/链接/图片/PDF文件。发送「帮助」查看说明。")
-        return _ack_webhook_event(event_lease)
-
-    try:
-        content = json.loads(message.get("content", "{}"))
-        raw_text = content.get("text", "")
-    except Exception:
-        return _ack_webhook_event(event_lease)
-    if not isinstance(raw_text, str):
-        return _ack_webhook_event(event_lease)
-    if len(raw_text) > MAX_MESSAGE_TEXT_CHARS:
-        logger.warning("text message ignored (TEXT_TOO_LONG)")
-        return _ack_webhook_event(event_lease)
-    text = raw_text.strip()
-
-    # ── @机器人 群聊支持：剥离 @mention 占位符 ──────────
-    mentions = content.get("mentions") if isinstance(content, dict) else None
-    if mentions:
-        # 飞书在 text 中用 @_user_N 占位，需要去掉
-        for m in mentions:
-            key = m.get("key", "")
-            if key:
-                text = text.replace(key, "").strip()
-    # 群聊中如果没有 @机器人，则不处理（避免干扰正常聊天）
-    chat_type = message.get("chat_type", "")
-    if chat_type == "group" and not mentions:
-        return _ack_webhook_event(event_lease)
-
-    if not text:
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     if text in ["帮助", "help", "?", "？", "/help"]:
         send_text(chat_id, HELP_TEXT)
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     # ── RSS 推送控制指令 ────────────────────────────
     if text in ["订阅", "subscribe"]:
@@ -2733,17 +2863,17 @@ def feishu_webhook():
                   f"模式：{PUSH_CONFIG['mode']}　间隔：{PUSH_CONFIG['interval_min']}分钟\n"
                   f"每轮最多推送 {PUSH_CONFIG['max_articles']} 篇\n\n"
                   f"发送「扫描」立即执行一次")
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     if text in ["取消订阅", "unsubscribe"]:
         PUSH_CONFIG["chat_id"] = ""
         send_text(chat_id, "已关闭自动情报推送")
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     if text in ["扫描", "scan"]:
         send_text(chat_id, "正在扫描 15 个核心 RSS 源...")
         PUSH_CONFIG["chat_id"] = chat_id
-        if not _queue_webhook_job(event_lease, _rss_push_job):
+        if not _queue_webhook_job(event_lease, admission_lease, _rss_push_job):
             return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
         return jsonify({"code": 0})
 
@@ -2760,17 +2890,17 @@ def feishu_webhook():
                   f"  AI模型：{AI_CONFIG['model']}\n"
                   f"  trafilatura：{'可用' if _HAS_TRAFILATURA else '未安装'}\n"
                   "  PDF解析：受限子进程（解析器缺失时安全拒绝）")
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     if text in ["brief模式", "brief"]:
         PUSH_CONFIG["mode"] = "brief"
         send_text(chat_id, "已切换为 brief 模式（AI生成完整要讯，消耗token）")
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     if text in ["headlines模式", "headlines"]:
         PUSH_CONFIG["mode"] = "headlines"
         send_text(chat_id, "已切换为 headlines 模式（仅推送标题摘要，免费）")
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     # ── 文件名重命名意图（无论有无会话都可识别）────────────
     rename_to = _try_extract_rename(text)
@@ -2780,7 +2910,7 @@ def feishu_webhook():
                 chat_id,
                 "文件名不能为空，且 UTF-8 编码后不得超过 120 字节（含 .docx）。",
             )
-            return _ack_webhook_event(event_lease)
+            return _ack_webhook_event(event_lease, admission_lease)
         sanitized = _sanitize_feishu_filename(
             rename_to if rename_to.lower().endswith(".docx") else f"{rename_to}.docx"
         )
@@ -2800,7 +2930,7 @@ def feishu_webhook():
                 f"已记录文件名「{sanitized}」（目前没有进行中的会话）。\n"
                 "请接着发送文章链接或正文，生成的要讯会自动使用该文件名导出。"
             )
-        return _ack_webhook_event(event_lease)
+        return _ack_webhook_event(event_lease, admission_lease)
 
     # ── 交互会话路由（在其他命令之后、文章生成之前检查）──────
     session = _session_get(chat_id)
@@ -2812,35 +2942,43 @@ def feishu_webhook():
         elif text in ["完成", "done", "结束", "exit", "退出", "取消", "cancel"]:
             _session_clear(chat_id)
             send_text(chat_id, "已退出要讯优化会话。如需生成新要讯，请发送文章或链接。")
-            return _ack_webhook_event(event_lease)
+            return _ack_webhook_event(event_lease, admission_lease)
         elif text in ["导出", "export", "发docx", "DOCX", "docx", "发DOCX"]:
-            if not _queue_webhook_job(event_lease, _export_docx_async, chat_id):
+            if not _queue_webhook_job(
+                event_lease, admission_lease, _export_docx_async, chat_id,
+            ):
                 return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
             return jsonify({"code": 0})
         elif text in ["查看", "预览", "show", "preview"]:
             evidence = session.get("evidence")
             if not evidence:
                 send_text(chat_id, "当前会话缺少原始素材证据，已阻止预览；请重新生成要讯。")
-                return _ack_webhook_event(event_lease)
+                return _ack_webhook_event(event_lease, admission_lease)
             if not _validate_brief_before_send(chat_id, session["current_draft"], evidence):
-                return _ack_webhook_event(event_lease)
+                return _ack_webhook_event(event_lease, admission_lease)
             send_card(
                 chat_id,
                 _build_brief_card(session["current_draft"], session["source_info"], evidence),
             )
-            return _ack_webhook_event(event_lease)
+            return _ack_webhook_event(event_lease, admission_lease)
         elif text in ["重新生成", "重写", "重来", "regenerate", "重置"]:
-            if not _queue_webhook_job(event_lease, _regenerate_async, chat_id):
+            if not _queue_webhook_job(
+                event_lease, admission_lease, _regenerate_async, chat_id,
+            ):
                 return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
             return jsonify({"code": 0})
         else:
             # 任意其他文字 → 视为细化指令
-            if not _queue_webhook_job(event_lease, _refine_async, chat_id, text):
+            if not _queue_webhook_job(
+                event_lease, admission_lease, _refine_async, chat_id, text,
+            ):
                 return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
             return jsonify({"code": 0})
 
     # ── 文章生成（异步线程池，立即返回 200）────────────────
-    if not _queue_webhook_job(event_lease, _process_async, chat_id, text):
+    if not _queue_webhook_job(
+        event_lease, admission_lease, _process_async, chat_id, text,
+    ):
         return jsonify({"code": 1, "msg": "webhook dispatch unavailable"}), 503
     return jsonify({"code": 0})
 

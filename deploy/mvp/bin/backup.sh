@@ -17,12 +17,15 @@ for name in MVP_RELEASE_STATE_DIR SUPABASE_STACK_DIR SUPABASE_UPSTREAM_SHA SUPAB
     require_value "$name"
 done
 
-for command_name in docker age rclone flock tar sha256sum git; do
+for command_name in docker age rclone flock tar sha256sum git python3; do
     command -v "$command_name" >/dev/null 2>&1 || {
         printf '%s\n' "required preinstalled backup command is missing: $command_name" >&2
         exit 69
     }
 done
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+state_tool="$script_dir/release-state.py"
 
 stack_compose="$SUPABASE_STACK_DIR/docker-compose.yml"
 stack_env="$SUPABASE_STACK_DIR/.env"
@@ -44,20 +47,16 @@ actual_supabase_sha=$(git -C "$SUPABASE_STACK_DIR" rev-parse HEAD 2>/dev/null ||
     exit 77
 }
 
-mkdir -p "$BACKUP_STAGING_DIR"
-case "$(cd "$BACKUP_STAGING_DIR" && pwd -P)" in
-    /|/home|/root|/opt|/srv|/var) printf '%s\n' "BACKUP_STAGING_DIR is too broad" >&2; exit 64 ;;
-esac
-chmod 0700 "$BACKUP_STAGING_DIR"
+python3 "$state_tool" prepare "$BACKUP_STAGING_DIR"
 
-exec 9>"$BACKUP_STAGING_DIR/.backup.lock"
-flock -n 9 || { printf '%s\n' "another backup is already running" >&2; exit 75; }
-mkdir -p "$MVP_RELEASE_STATE_DIR"
-chmod 0700 "$MVP_RELEASE_STATE_DIR"
-exec 8>"$MVP_RELEASE_STATE_DIR/.release.lock"
-flock -n 8 || { printf '%s\n' "a release or rollback is active" >&2; exit 75; }
-exec 7>"$MVP_RELEASE_STATE_DIR/.supabase-app.lock"
-flock -n 7 || { printf '%s\n' "a Supabase application install is active" >&2; exit 75; }
+exec 6>"$BACKUP_STAGING_DIR/.backup.lock"
+flock -n 6 || { printf '%s\n' "another backup is already running" >&2; exit 75; }
+python3 "$state_tool" prepare "$MVP_RELEASE_STATE_DIR"
+# shellcheck disable=SC1090
+. "$script_dir/deployment-lock.sh"
+acquire_mvp_deployment_lock "$MVP_RELEASE_STATE_DIR"
+exec 8>"$MVP_RELEASE_STATE_DIR/.supabase-app.lock"
+flock -n 8 || { printf '%s\n' "a Supabase application install is active" >&2; exit 75; }
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir=$(mktemp -d "$BACKUP_STAGING_DIR/plain-$timestamp-XXXXXX")
@@ -194,8 +193,7 @@ local_hash=$(sha256sum "$encrypted" | awk '{print $1}')
 }
 
 state_dir=${BACKUP_STATE_DIR:-/var/lib/defense-tracker-backup}
-mkdir -p "$state_dir"
-chmod 0700 "$state_dir"
+python3 "$state_tool" prepare "$state_dir"
 state_tmp="$state_dir/.last-success.tmp"
 printf '%s\n' \
     "schema=1" \

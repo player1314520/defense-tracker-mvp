@@ -55,6 +55,8 @@ actual_release_sha=$(git -C "$project_root" rev-parse HEAD 2>/dev/null || true)
     exit 65
 }
 metadata_tool="$script_dir/backend-release-metadata.py"
+state_tool="$script_dir/release-state.py"
+lock_tool="$script_dir/deployment-lock.sh"
 backend_manifest=$(python3 "$metadata_tool" --repo "$project_root" --git-sha "$release_sha" \
     --field source_manifest_sha256)
 backend_wire=$(python3 "$metadata_tool" --repo "$project_root" --git-sha "$release_sha" \
@@ -62,23 +64,73 @@ backend_wire=$(python3 "$metadata_tool" --repo "$project_root" --git-sha "$relea
 backend_policy=$(python3 "$metadata_tool" --repo "$project_root" --git-sha "$release_sha" \
     --field migration_policy)
 
-mkdir -p "$state_dir"
-chmod 0700 "$state_dir"
-exec 9>"$state_dir/.release.lock"
-flock -n 9 || { printf '%s\n' "another release or rollback is active" >&2; exit 75; }
+python3 "$state_tool" prepare "$state_dir"
+# shellcheck disable=SC1090
+. "$lock_tool"
+acquire_mvp_deployment_lock "$state_dir"
+python3 "$state_tool" migrate portal "$state_dir" >/dev/null
+python3 "$state_tool" portal-intent-check "$state_dir"
+
+running_portal_image() {
+    lookup_image=$1
+    container_id=$(PORTAL_IMAGE="$lookup_image" docker compose \
+        --env-file "$config_file" --file "$compose_file" ps --all --quiet portal)
+    if [ -z "$container_id" ]; then
+        printf '%s\n' none
+        return 0
+    fi
+    printf '%s' "$container_id" | grep -Eq '^[0-9a-f]{12,64}$' || {
+        printf '%s\n' "Portal container identity is invalid or ambiguous" >&2
+        return 65
+    }
+    running=$(docker inspect --format '{{.State.Running}}' "$container_id")
+    if [ "$running" != true ]; then
+        printf '%s\n' none
+        return 0
+    fi
+    docker inspect --format '{{.Config.Image}}' "$container_id"
+}
+
+running_portal_commit() {
+    lookup_image=$1
+    lookup_sha=$2
+    container_id=$(PORTAL_IMAGE="$lookup_image" MVP_EXPECTED_RELEASE_SHA="$lookup_sha" \
+        docker compose --env-file "$config_file" --file "$compose_file" \
+        ps --all --quiet portal)
+    if [ -z "$container_id" ]; then
+        printf '%s\n' none
+        return 0
+    fi
+    docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" | \
+        awk -F= '$1 == "DEFENSE_TRACKER_BUILD_COMMIT" { sub(/^[^=]*=/, ""); print }'
+}
 
 current_image=''
 current_sha=''
-[ ! -f "$state_dir/current.image" ] || current_image=$(tr -d '\r\n' < "$state_dir/current.image")
-[ ! -f "$state_dir/current.sha" ] || current_sha=$(tr -d '\r\n' < "$state_dir/current.sha")
-if { [ -n "$current_image" ] && [ -z "$current_sha" ]; } || \
-   { [ -z "$current_image" ] && [ -n "$current_sha" ]; }; then
-    printf '%s\n' "current release state is incomplete" >&2
-    exit 65
+current_wire=''
+current_manifest=''
+# portal-state.json is the only authoritative current/previous generation.
+if python3 "$state_tool" exists portal "$state_dir"; then
+    current_image=$(python3 "$state_tool" get portal "$state_dir" current.image)
+    current_sha=$(python3 "$state_tool" get portal "$state_dir" current.release_sha)
+    current_wire=$(python3 "$state_tool" get portal "$state_dir" current.wire_compatibility)
+    current_manifest=$(python3 "$state_tool" get portal "$state_dir" current.source_manifest_sha256)
 fi
-if [ -n "$current_sha" ]; then
-    printf '%s' "$current_sha" | grep -Eq '^[0-9a-f]{40}$' || {
-        printf '%s\n' "current release state SHA is invalid" >&2
+
+observed_image=$(running_portal_image "${current_image:-$candidate_image}")
+if [ -n "$current_image" ]; then
+    [ "$observed_image" = "$current_image" ] || {
+        printf '%s\n' "running Portal image differs from authoritative release state" >&2
+        exit 65
+    }
+    observed_commit=$(running_portal_commit "$current_image" "$current_sha")
+    [ "$observed_commit" = "$current_sha" ] || {
+        printf '%s\n' "running Portal commit differs from authoritative release state" >&2
+        exit 65
+    }
+else
+    [ "$observed_image" = none ] || {
+        printf '%s\n' "a running Portal exists without authoritative release state" >&2
         exit 65
     }
 fi
@@ -109,6 +161,7 @@ candidate_policy=$(docker image inspect --format '{{ index .Config.Labels "io.de
 }
 
 export PORTAL_IMAGE=$candidate_image
+export MVP_EXPECTED_RELEASE_SHA=$release_sha
 docker compose --env-file "$config_file" --file "$compose_file" config --quiet
 
 if [ -n "$current_image" ]; then
@@ -117,8 +170,8 @@ if [ -n "$current_image" ]; then
         printf '%s\n' "current Portal image revision differs from retained release state" >&2
         exit 65
     }
-    current_manifest=$(docker image inspect --format '{{ index .Config.Labels "io.defensetracker.mvp.backend-source-manifest" }}' "$current_image")
-    printf '%s' "$current_manifest" | grep -Eq '^[0-9a-f]{64}$' || {
+    current_label_manifest=$(docker image inspect --format '{{ index .Config.Labels "io.defensetracker.mvp.backend-source-manifest" }}' "$current_image")
+    [ "$current_label_manifest" = "$current_manifest" ] || {
         printf '%s\n' "current Portal image lacks a valid backend source manifest" >&2
         exit 65
     }
@@ -127,8 +180,8 @@ if [ -n "$current_image" ]; then
         printf '%s\n' "current Portal image does not declare the required forward migration policy" >&2
         exit 65
     }
-    current_wire=$(docker image inspect --format '{{ index .Config.Labels "io.defensetracker.mvp.backend-wire-compatibility" }}' "$current_image")
-    [ "$current_wire" = "$backend_wire" ] || {
+    current_label_wire=$(docker image inspect --format '{{ index .Config.Labels "io.defensetracker.mvp.backend-wire-compatibility" }}' "$current_image")
+    [ "$current_label_wire" = "$current_wire" ] && [ "$current_wire" = "$backend_wire" ] || {
         printf '%s\n' "current Portal is not compatible with the candidate backend wire contract" >&2
         exit 65
     }
@@ -141,14 +194,14 @@ MVP_EXPECTED_RELEASE_SHA=$release_sha "$script_dir/preflight.sh" "$config_file"
 
 restore_current() {
     if [ -n "$current_image" ]; then
-        if [ ! -s "$state_dir/backend.wire" ]; then
+        if ! python3 "$state_tool" exists backend "$state_dir"; then
             printf '%s\n' "[RELEASE] Active backend wire state is missing; stopping the candidate fail-closed." >&2
             export PORTAL_IMAGE=$candidate_image
             docker compose --env-file "$config_file" --file "$compose_file" stop \
                 --timeout 30 portal edge >/dev/null 2>&1 || true
             return 1
         fi
-        active_backend_wire=$(tr -d '\r\n' < "$state_dir/backend.wire")
+        active_backend_wire=$(python3 "$state_tool" get backend "$state_dir" active.wire_compatibility)
         if [ "$current_wire" != "$active_backend_wire" ]; then
             printf '%s\n' "[RELEASE] Refusing incompatible Portal restore; stopping the candidate fail-closed." >&2
             export PORTAL_IMAGE=$candidate_image
@@ -158,46 +211,48 @@ restore_current() {
         fi
         printf '%s\n' "[RELEASE] Candidate failed; restoring the wire-compatible retained Portal image."
         export PORTAL_IMAGE=$current_image
+        export MVP_EXPECTED_RELEASE_SHA=$current_sha
         docker compose --env-file "$config_file" --file "$compose_file" up \
             --detach --wait --wait-timeout 180 portal edge >/dev/null 2>&1 || true
     else
         export PORTAL_IMAGE=$candidate_image
         docker compose --env-file "$config_file" --file "$compose_file" stop \
             --timeout 30 portal edge >/dev/null 2>&1 || true
+        for service in portal edge; do
+            running_id=$(PORTAL_IMAGE="$candidate_image" \
+                MVP_EXPECTED_RELEASE_SHA="$release_sha" docker compose \
+                --env-file "$config_file" --file "$compose_file" \
+                ps --status running --quiet "$service")
+            [ -z "$running_id" ] || {
+                printf '%s\n' "initial Portal rollback left a public service running" >&2
+                return 1
+            }
+        done
     fi
+    restored_image=$(running_portal_image "${current_image:-$candidate_image}")
+    if [ -n "$current_image" ]; then
+        python3 "$script_dir/probe-public.py" "$config_file" "$current_sha"
+    fi
+    python3 "$state_tool" portal-intent-abort "$state_dir" "$restored_image"
 }
 
+python3 "$state_tool" portal-intent-begin "$state_dir" promote \
+    "$candidate_image" "$release_sha" "$candidate_wire" "$candidate_manifest"
 export PORTAL_IMAGE=$candidate_image
+export MVP_EXPECTED_RELEASE_SHA=$release_sha
 if ! docker compose --env-file "$config_file" --file "$compose_file" up \
     --detach --wait --wait-timeout 180 portal edge; then
     restore_current
     exit 70
 fi
 
-if ! python3 "$script_dir/probe-public.py" "$config_file"; then
+if ! python3 "$script_dir/probe-public.py" "$config_file" "$release_sha"; then
     restore_current
     exit 70
 fi
 
-if [ -n "$current_image" ] && [ "$current_image" != "$candidate_image" ]; then
-    printf '%s\n' "$current_image" > "$state_dir/.previous.image.tmp"
-    printf '%s\n' "$current_sha" > "$state_dir/.previous.sha.tmp"
-    printf '%s\n' "$current_wire" > "$state_dir/.previous.wire.tmp"
-    printf '%s\n' "$current_manifest" > "$state_dir/.previous.manifest.tmp"
-    mv -f "$state_dir/.previous.image.tmp" "$state_dir/previous.image"
-    mv -f "$state_dir/.previous.sha.tmp" "$state_dir/previous.sha"
-    mv -f "$state_dir/.previous.wire.tmp" "$state_dir/previous.wire"
-    mv -f "$state_dir/.previous.manifest.tmp" "$state_dir/previous.manifest"
-fi
-printf '%s\n' "$candidate_image" > "$state_dir/.current.image.tmp"
-printf '%s\n' "$release_sha" > "$state_dir/.current.sha.tmp"
-printf '%s\n' "$candidate_wire" > "$state_dir/.current.wire.tmp"
-printf '%s\n' "$candidate_manifest" > "$state_dir/.current.manifest.tmp"
-mv -f "$state_dir/.current.image.tmp" "$state_dir/current.image"
-mv -f "$state_dir/.current.sha.tmp" "$state_dir/current.sha"
-mv -f "$state_dir/.current.wire.tmp" "$state_dir/current.wire"
-mv -f "$state_dir/.current.manifest.tmp" "$state_dir/current.manifest"
-chmod 0600 "$state_dir"/*.image "$state_dir"/*.sha "$state_dir"/*.wire "$state_dir"/*.manifest
+observed_image=$(running_portal_image "$candidate_image")
+python3 "$state_tool" portal-intent-complete "$state_dir" "$observed_image"
 
 printf '%s\n' "[RELEASE] Portal/Supabase public probe and exact backend release verification passed."
 printf '%s\n' "[RELEASE] Current Git SHA: $release_sha"

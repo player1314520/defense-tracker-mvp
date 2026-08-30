@@ -3,6 +3,7 @@ dist/
 build/
 .venv-build/
 *.spec
+!supabase/tests/v9_sync_byte_quota_isolation.spec
 __pycache__/
 *.py[cod]
 *.egg-info/

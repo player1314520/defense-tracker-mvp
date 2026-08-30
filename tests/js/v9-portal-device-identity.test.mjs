@@ -46,6 +46,7 @@ function installFakeIndexedDb() {
           return {
             get: (key) => requestFor(() => values.get(key)),
             getAll: () => requestFor(() => [...values.values()]),
+            getAllKeys: () => requestFor(() => [...values.keys()]),
             put: (value, key) => requestFor(() => {
               values.set(key, value);
               return key;
@@ -100,6 +101,13 @@ async function loadPortal(organizationId) {
   let keyNumber = 0;
   const behaviors = {
     decryptRecord: async () => ({}),
+    encryptRecord: async () => ({
+      ciphertext: "ciphertext",
+      nonce: "nonce",
+      wrapped_data_key: "wrapped-data-key",
+      wrap_nonce: "wrap-nonce",
+      content_hash: "a".repeat(64),
+    }),
     openOrgKeyForP256: async () => new Uint8Array(32),
   };
   globalThis.__portalTestDeps = {
@@ -119,6 +127,7 @@ async function loadPortal(organizationId) {
       };
     },
     decryptRecord: (...args) => behaviors.decryptRecord(...args),
+    encryptRecord: (...args) => behaviors.encryptRecord(...args),
     openOrgKeyForP256: (...args) => behaviors.openOrgKeyForP256(...args),
     sealOrgKeyForP256: async () => ({}),
     decideAccessApplication: async () => ({}),
@@ -166,6 +175,7 @@ async function loadPortal(organizationId) {
         bytesToBase64url,
         createBrowserDeviceKeyPair,
         decryptRecord,
+        encryptRecord,
         openOrgKeyForP256,
         sealOrgKeyForP256,
         decideAccessApplication,
@@ -190,7 +200,9 @@ async function loadPortal(organizationId) {
       byteaToBase64url,
       storedDevice,
       createAndStoreDevice,
+      buildQuarantineTombstoneEvent,
       restoreCachedWorkspace,
+      retryPendingQuarantineReports,
       pullCiphertextChanges,
       refreshFromWakeup,
       subscribeToWakeups,
@@ -864,6 +876,115 @@ test("密文缓存恢复记录头且 IndexedDB 不落盘解密正文", async () 
 });
 
 
+test("任一缓存头解密失败时原子清空当前工作区并从游标零重放", async () => {
+  const organizationId = "org-invalid-cache";
+  const userId = "user-invalid-cache";
+  const otherOrganizationId = "org-unrelated-cache";
+  const portal = await loadPortal(organizationId);
+  await portal.storedDevice(organizationId, userId);
+  const recordHeads = portal.stores.get("recordHeads");
+  const syncState = portal.stores.get("syncState");
+  const currentWorkspaceKey = JSON.stringify([organizationId, userId]);
+  const otherWorkspaceKey = JSON.stringify([otherOrganizationId, userId]);
+
+  recordHeads.set(JSON.stringify([organizationId, userId, "record-valid"]), {
+    organizationId,
+    userId,
+    recordId: "record-valid",
+    payload: { record_type: "alert", version: 1 },
+  });
+  recordHeads.set(JSON.stringify([organizationId, userId, "record-invalid"]), {
+    organizationId,
+    userId,
+    payload: { record_type: "alert", version: 2 },
+  });
+  recordHeads.set(JSON.stringify([otherOrganizationId, userId, "record-other"]), {
+    organizationId: otherOrganizationId,
+    userId,
+    recordId: "record-other",
+    payload: { record_type: "alert", version: 1 },
+  });
+  syncState.set(currentWorkspaceKey, { cursor: 321 });
+  syncState.set(otherWorkspaceKey, { cursor: 654 });
+  portal.state.records = [{ record_id: "stale-memory-record" }];
+  portal.state.cursor = 999;
+  portal.behaviors.decryptRecord = async (_key, payload) => {
+    if (payload.version === 2) throw new Error("cache authentication failed");
+    return { title: "不应保留的部分恢复记录" };
+  };
+
+  await portal.restoreCachedWorkspace(
+    organizationId,
+    userId,
+    { key: "in-memory-only" },
+  );
+
+  assert.deepEqual(portal.state.records, []);
+  assert.equal(portal.state.cursor, 0);
+  assert.equal(
+    [...recordHeads.values()].some((entry) => (
+      entry.organizationId === organizationId && entry.userId === userId
+    )),
+    false,
+  );
+  assert.equal(syncState.has(currentWorkspaceKey), false);
+  assert.equal(
+    [...recordHeads.values()].some((entry) => (
+      entry.organizationId === otherOrganizationId
+    )),
+    true,
+  );
+  assert.deepEqual(syncState.get(otherWorkspaceKey), { cursor: 654 });
+});
+
+
+test("隔离上报每批五十条时保留未处理尾部并可继续重试", async () => {
+  const organizationId = "org-quarantine-retry";
+  const userId = "user-quarantine-retry";
+  const portal = await loadPortal(organizationId);
+  await portal.storedDevice(organizationId, userId);
+  const quarantine = portal.stores.get("syncQuarantine");
+  for (let index = 0; index < 51; index += 1) {
+    const eventId = `event-${String(index).padStart(2, "0")}`;
+    quarantine.set(JSON.stringify([organizationId, userId, eventId]), {
+      organizationId,
+      userId,
+      eventId,
+      cursor: index + 1,
+      recordId: `record-${index}`,
+      versionId: `version-${index}`,
+      failureCode: "invalid_schema",
+    });
+  }
+  let reports = 0;
+  portal.state.client = {
+    rpc: async (name) => {
+      assert.equal(name, "report_sync_event_quarantine");
+      reports += 1;
+      return { data: { report_id: `report-${reports}` }, error: null };
+    },
+  };
+
+  const afterFirstBatch = await portal.retryPendingQuarantineReports(
+    organizationId,
+    userId,
+  );
+  assert.equal(afterFirstBatch, 1);
+  assert.equal(reports, 50);
+  assert.equal(
+    [...quarantine.values()].filter((entry) => !entry.reportedAt).length,
+    1,
+  );
+
+  const afterSecondBatch = await portal.retryPendingQuarantineReports(
+    organizationId,
+    userId,
+  );
+  assert.equal(afterSecondBatch, 0);
+  assert.equal(reports, 51);
+});
+
+
 test("完整同步页以单次 IndexedDB 事务提交记录头与游标", async () => {
   const organizationId = "org-page-transaction";
   const userId = "user-page-transaction";
@@ -897,6 +1018,123 @@ test("完整同步页以单次 IndexedDB 事务提交记录头与游标", async 
 
   assert.equal(portal.stores.getOpenCount() - before, 1);
   assert.equal(portal.state.cursor, 3);
+});
+
+
+test("单条已认证但非 JSON 的事件被隔离且后继游标继续提交", async () => {
+  const organizationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const userId = "00000000-0000-4000-8000-000000000001";
+  const portal = await loadPortal(organizationId);
+  portal.state.organizationId = organizationId;
+  portal.state.session = { user: { id: userId } };
+  portal.state.orgKey = { key: "in-memory-only" };
+  portal.behaviors.decryptRecord = async (_key, payload) => {
+    if (payload.version === 1) {
+      const error = new Error("must-not-be-reported");
+      error.code = "invalid_json";
+      throw error;
+    }
+    return { title: "安全后继记录", status: "new" };
+  };
+  const reports = [];
+  let pulls = 0;
+  portal.state.client = {
+    rpc: async (name, request) => {
+      if (name === "report_sync_event_quarantine") {
+        reports.push(request);
+        return {
+          data: { report_id: "90000000-0000-4000-8000-000000000001" },
+          error: null,
+        };
+      }
+      assert.equal(name, "pull_sync_events");
+      pulls += 1;
+      if (pulls > 1) return { data: [], error: null };
+      return {
+        data: [1, 2].map((cursor) => ({
+          applied: true,
+          cursor,
+          event_id: `50000000-0000-4000-8000-00000000000${cursor}`,
+          operation: "upsert",
+          payload: {
+            organization_id: organizationId,
+            record_id: `30000000-0000-4000-8000-00000000000${cursor}`,
+            version_id: `40000000-0000-4000-8000-00000000000${cursor}`,
+            record_type: "alert",
+            version: cursor,
+            content_hash: "a".repeat(64),
+            ciphertext: `opaque-${cursor}`,
+          },
+        })),
+        error: null,
+      };
+    },
+  };
+
+  await portal.pullCiphertextChanges();
+
+  assert.equal(portal.state.cursor, 2);
+  assert.deepEqual(
+    portal.state.records.map((record) => record.content.title),
+    ["安全后继记录"],
+  );
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].p_failure_code, "invalid_json");
+  assert.equal(Object.hasOwn(reports[0], "message"), false);
+  const quarantine = [...portal.stores.get("syncQuarantine").values()][0];
+  assert.equal(quarantine.cursor, 1);
+  assert.equal(quarantine.failureCode, "invalid_json");
+  assert.equal(Object.hasOwn(quarantine, "ciphertext"), false);
+  assert.ok(quarantine.reportedAt);
+});
+
+
+test("管理员隔离墓碑由当前浏览器设备加密且绑定报告版本", async () => {
+  const organizationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const userId = "00000000-0000-4000-8000-000000000001";
+  const portal = await loadPortal(organizationId);
+  portal.state.organizationId = organizationId;
+  portal.state.session = { user: { id: userId } };
+  portal.state.orgKey = new Uint8Array(32).fill(7);
+  portal.state.orgKeyVersion = 3;
+  portal.state.client = {
+    rpc: async (name) => {
+      assert.equal(name, "register_device");
+      return { data: null, error: null };
+    },
+  };
+  const device = await portal.createAndStoreDevice(organizationId, userId);
+  let encryptionRequest;
+  portal.behaviors.encryptRecord = async (_key, request) => {
+    encryptionRequest = request;
+    return {
+      ciphertext: "safe-ciphertext",
+      nonce: "safe-nonce",
+      wrapped_data_key: "safe-wrapped-key",
+      wrap_nonce: "safe-wrap-nonce",
+      content_hash: "b".repeat(64),
+    };
+  };
+
+  const event = await portal.buildQuarantineTombstoneEvent({
+    record_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    version_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    logical_version: 8,
+    record_type: "alert",
+  });
+
+  assert.equal(encryptionRequest.version, 9);
+  assert.equal(encryptionRequest.keyVersion, 3);
+  assert.equal(encryptionRequest.content.schema_version, 1);
+  assert.equal(event.organization_id, organizationId);
+  assert.equal(event.record_id, encryptionRequest.recordId);
+  assert.equal(event.operation, "delete");
+  assert.equal(event.payload.version, 9);
+  assert.equal(event.payload.base_version_id, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+  assert.equal(event.payload.device_id, device.id);
+  assert.equal(event.payload.deleted, true);
+  assert.equal(event.payload.ciphertext, "safe-ciphertext");
+  assert.equal(JSON.stringify(event).includes("已删除的隔离记录"), false);
 });
 
 
