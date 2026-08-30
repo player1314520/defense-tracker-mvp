@@ -385,10 +385,18 @@ function Invoke-DesktopSmokeTest {
     param([string]$ExePath,[string]$RuntimeRoot,$Version,[string]$ExpectedCommit)
     $previousHome = [Environment]::GetEnvironmentVariable('DEFENSE_TRACKER_HOME','Process')
     $previousEvidence = [Environment]::GetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_EVIDENCE','Process')
+    $previousSmokeToken = [Environment]::GetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_TOKEN','Process')
     $smokeEvidence = Join-Path $RuntimeRoot 'desktop-smoke.json'
+    $tokenBytes = New-Object byte[] 32
+    $tokenGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $tokenGenerator.GetBytes($tokenBytes) } finally { $tokenGenerator.Dispose() }
+    $smokeToken = -join ($tokenBytes | ForEach-Object { $_.ToString('x2') })
+    $smokeEndpoint = '/_internal/v9/desktop-release-smoke'
     New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
+    if (Test-Path -LiteralPath $smokeEvidence) { throw 'Desktop smoke evidence path must be new.' }
     [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_HOME',$RuntimeRoot,'Process')
-    [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_EVIDENCE',$smokeEvidence,'Process')
+    [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_EVIDENCE','authenticated-loopback-v1','Process')
+    [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_TOKEN',$smokeToken,'Process')
     $process = $null
     try {
         # The authenticated WebView probe starts from pywebview's shown callback.
@@ -401,16 +409,50 @@ function Invoke-DesktopSmokeTest {
             if ($process.HasExited) { throw "Desktop smoke process exited early." }
             $process.Refresh()
             if ($process.MainWindowTitle -like '*V9*Defense Command Hub*') { $windowReady = $true }
-            if (Test-Path -LiteralPath $smokeEvidence -PathType Leaf) {
+            $ownedListeners = @(
+                Get-NetTCPConnection -State Listen -OwningProcess $process.Id -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.LocalAddress -eq '127.0.0.1' -and
+                        $_.LocalPort -in 49231..49235
+                    }
+            )
+            if ($ownedListeners.Count -gt 1) {
+                throw 'Desktop smoke process owns multiple registered loopback listeners.'
+            }
+            if ($ownedListeners.Count -eq 1) {
+                $response = $null
                 try {
-                    $evidence = Get-Content -LiteralPath $smokeEvidence -Raw | ConvertFrom-Json
-                    if ($evidence.schema -eq 1 -and $evidence.http_status -eq 200 -and
+                    $response = Invoke-RestMethod `
+                        -Uri ("http://127.0.0.1:{0}{1}" -f $ownedListeners[0].LocalPort, $smokeEndpoint) `
+                        -Headers @{ 'X-Defense-Tracker-Smoke' = $smokeToken } `
+                        -Method Get -TimeoutSec 1 -ErrorAction Stop
+                } catch {}
+                if ($null -ne $response) {
+                    $evidence = $response.evidence
+                    if ($response.process_id -eq $process.Id -and
+                        $evidence.schema -eq 1 -and $evidence.http_status -eq 200 -and
                         $evidence.pathname -eq '/' -and $evidence.workspace_ready -eq $true -and
                         $evidence.version -eq $Version.semantic_version -and
                         $evidence.display_version -eq $Version.display_version -and
                         $evidence.release_tag -eq $Version.release_tag -and
-                        $evidence.build_commit -eq $ExpectedCommit) { $workspaceReady = $true }
-                } catch {}
+                        $evidence.build_commit -eq $ExpectedCommit) {
+                        $evidenceJson = $evidence | ConvertTo-Json -Compress
+                        $evidenceBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
+                            $evidenceJson + [Environment]::NewLine
+                        )
+                        $evidenceStream = [System.IO.FileStream]::new(
+                            $smokeEvidence,
+                            [System.IO.FileMode]::CreateNew,
+                            [System.IO.FileAccess]::Write,
+                            [System.IO.FileShare]::None
+                        )
+                        try {
+                            $evidenceStream.Write($evidenceBytes, 0, $evidenceBytes.Length)
+                            $evidenceStream.Flush($true)
+                        } finally { $evidenceStream.Dispose() }
+                        $workspaceReady = $true
+                    }
+                }
             }
             if ($workspaceReady -and $windowReady) { return }
             Start-Sleep -Milliseconds 400
@@ -423,6 +465,7 @@ function Invoke-DesktopSmokeTest {
         }
         [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_HOME',$previousHome,'Process')
         [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_EVIDENCE',$previousEvidence,'Process')
+        [Environment]::SetEnvironmentVariable('DEFENSE_TRACKER_SMOKE_TOKEN',$previousSmokeToken,'Process')
     }
 }
 

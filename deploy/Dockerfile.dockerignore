@@ -35,6 +35,7 @@
 !v9/cloud.py
 !v9/crypto.py
 !v9/diagnostics.py
+!v9/desktop_smoke.py
 !v9/errors.py
 !v9/migration.py
 !v9/orchestration.py
