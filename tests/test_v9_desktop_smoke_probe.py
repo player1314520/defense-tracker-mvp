@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-import json
-from pathlib import Path
-
 import pytest
 
 from v9.desktop_smoke import (
@@ -64,9 +61,9 @@ def test_desktop_smoke_validation_rejects_wrong_or_malformed_fields(field, value
     assert _validate(payload) is None
 
 
-def test_desktop_smoke_probe_uses_csp_safe_bridge_and_writes_atomically(tmp_path):
-    evidence_path = tmp_path / "desktop-smoke.json"
+def test_desktop_smoke_probe_uses_csp_safe_bridge_and_emits_once():
     payload = _valid_evidence()
+    accepted = []
 
     class FakeWindow:
         def __init__(self):
@@ -92,7 +89,7 @@ def test_desktop_smoke_probe_uses_csp_safe_bridge_and_writes_atomically(tmp_path
     window = FakeWindow()
     thread = start_desktop_smoke_probe(
         window,
-        evidence_path=Path(evidence_path),
+        evidence_sink=accepted.append,
         expected_version="9.0.0",
         expected_display_version="V9",
         expected_release_tag="v9.0.0",
@@ -103,11 +100,21 @@ def test_desktop_smoke_probe_uses_csp_safe_bridge_and_writes_atomically(tmp_path
     thread.join(timeout=2)
 
     assert not thread.is_alive()
-    stored = evidence_path.read_text(encoding="utf-8")
-    assert json.loads(stored) == payload
+    assert accepted == [payload]
     window.state.handler("change", "desktopSmokeEvidence", dict(payload, version="0.0.0"))
-    assert evidence_path.read_text(encoding="utf-8") == stored
-    assert not evidence_path.with_suffix(".json.tmp").exists()
+    assert accepted == [payload]
     assert window.scripts == [DESKTOP_SMOKE_SCRIPT, DESKTOP_SMOKE_SCRIPT]
     assert "window.pywebview.state.desktopSmokeEvidence" in DESKTOP_SMOKE_SCRIPT
     assert "eval(" not in DESKTOP_SMOKE_SCRIPT
+
+
+def test_desktop_smoke_probe_rejects_non_callable_evidence_sink():
+    with pytest.raises(TypeError, match="must be callable"):
+        start_desktop_smoke_probe(
+            object(),
+            evidence_sink=None,
+            expected_version="9.0.0",
+            expected_display_version="V9",
+            expected_release_tag="v9.0.0",
+            expected_build_commit=COMMIT,
+        )

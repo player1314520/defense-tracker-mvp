@@ -2,8 +2,13 @@
 防务数据追踪系统 V9 — 桌面应用启动器
 使用 PyWebView 创建原生桌面窗口（无浏览器地址栏）
 """
-import sys, os, threading, time, socket
-from pathlib import Path
+import hmac
+import os
+import re
+import socket
+import sys
+import threading
+import time
 
 # The packaged EXE doubles as the isolated PDF parser worker. Dispatch before
 # runtime migration, Flask, scheduler, or GUI initialization so untrusted PDF
@@ -27,10 +32,10 @@ else:
 os.chdir(BASE_DIR)
 
 from product_version import PRODUCT_VERSION, current_build_commit
-from v9.desktop_smoke import start_desktop_smoke_probe as run_desktop_smoke_probe
 
 # ── 可写运行目录（程序目录始终只读）──────────────────────────
 from state import RUNTIME_LAYOUT, ensure_runtime_layout, migrate_legacy_runtime
+from v9.desktop_smoke import start_desktop_smoke_probe as run_desktop_smoke_probe
 
 ensure_runtime_layout(RUNTIME_LAYOUT)
 if getattr(sys, "frozen", False):
@@ -61,6 +66,54 @@ from app import (
     get_desktop_bootstrap_token,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
+from flask import jsonify, request
+
+
+_DESKTOP_SMOKE_TRANSPORT = "authenticated-loopback-v1"
+_DESKTOP_SMOKE_ENDPOINT = "/_internal/v9/desktop-release-smoke"
+_DESKTOP_SMOKE_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+_desktop_smoke_lock = threading.Lock()
+_desktop_smoke_evidence = None
+
+
+def _desktop_smoke_transport_token():
+    transport = os.environ.get("DEFENSE_TRACKER_SMOKE_EVIDENCE", "").strip()
+    if not transport:
+        return None
+    if transport != _DESKTOP_SMOKE_TRANSPORT:
+        raise RuntimeError("unsupported desktop smoke evidence transport")
+    token = os.environ.get("DEFENSE_TRACKER_SMOKE_TOKEN", "").strip()
+    if _DESKTOP_SMOKE_TOKEN_RE.fullmatch(token) is None:
+        raise RuntimeError("desktop smoke transport requires a 256-bit lowercase token")
+    return token
+
+
+_desktop_smoke_token = _desktop_smoke_transport_token()
+
+
+def _store_desktop_smoke_evidence(evidence):
+    global _desktop_smoke_evidence
+    with _desktop_smoke_lock:
+        if _desktop_smoke_evidence is None:
+            _desktop_smoke_evidence = dict(evidence)
+
+
+if _desktop_smoke_token is not None:
+    @flask_app.get(_DESKTOP_SMOKE_ENDPOINT)
+    def _get_desktop_smoke_evidence():
+        supplied = request.headers.get("X-Defense-Tracker-Smoke", "")
+        if not hmac.compare_digest(supplied, _desktop_smoke_token):
+            return "", 404
+        with _desktop_smoke_lock:
+            if _desktop_smoke_evidence is None:
+                return "", 425
+            payload = {
+                "process_id": os.getpid(),
+                "evidence": dict(_desktop_smoke_evidence),
+            }
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 # ── 后台 Flask 线程 ──────────────────────────────────────────
 def _run_flask():
@@ -84,24 +137,12 @@ def _wait_for_flask(timeout=30):
     return False
 
 
-def _desktop_smoke_evidence_path():
-    configured = os.environ.get("DEFENSE_TRACKER_SMOKE_EVIDENCE", "").strip()
-    if not configured:
-        return None
-    runtime_root = Path(os.environ.get("DEFENSE_TRACKER_HOME", "")).resolve()
-    evidence_path = Path(configured).resolve()
-    if not runtime_root.is_dir() or evidence_path.parent != runtime_root:
-        raise RuntimeError("desktop smoke evidence must be a direct child of the runtime directory")
-    return evidence_path
-
-
 def _start_desktop_smoke_probe(window):
-    evidence_path = _desktop_smoke_evidence_path()
-    if evidence_path is None:
+    if _desktop_smoke_token is None:
         return
     run_desktop_smoke_probe(
         window,
-        evidence_path=evidence_path,
+        evidence_sink=_store_desktop_smoke_evidence,
         expected_version=PRODUCT_VERSION.semantic_version,
         expected_display_version=PRODUCT_VERSION.display_version,
         expected_release_tag=PRODUCT_VERSION.release_tag,

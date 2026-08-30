@@ -107,6 +107,25 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert "window.expose" not in smoke_probe
     assert "window.state += receive_desktop_smoke_state" in smoke_probe
     assert "window.pywebview.state.desktopSmokeEvidence" in smoke_probe
+    assert "evidence_path" not in smoke_probe
+    assert "evidence_sink=_store_desktop_smoke_evidence" in launcher
+    assert '"authenticated-loopback-v1"' in launcher
+    assert '"X-Defense-Tracker-Smoke"' in launcher
+    assert "hmac.compare_digest" in launcher
+    assert "DEFENSE_TRACKER_SMOKE_TOKEN" in builder
+    assert "DEFENSE_TRACKER_SMOKE_TOKEN" in finalizer
+    assert "Invoke-RestMethod" in smoke_function
+    assert "Invoke-RestMethod" in finalizer_smoke_function
+    assert "$response.process_id -eq $process.Id" in smoke_function
+    assert "$response.process_id -eq $process.Id" in finalizer_smoke_function
+    assert "Get-NetTCPConnection -State Listen -OwningProcess $process.Id" in smoke_function
+    assert "Get-NetTCPConnection -State Listen -OwningProcess $process.Id" in finalizer_smoke_function
+    assert "foreach ($port in 49231..49235)" not in smoke_function
+    assert "foreach ($port in 49231..49235)" not in finalizer_smoke_function
+    assert "RandomNumberGenerator]::Create()" in smoke_function
+    assert "RandomNumberGenerator]::Create()" in finalizer_smoke_function
+    assert "[System.IO.FileMode]::CreateNew" in smoke_function
+    assert "[System.IO.FileMode]::CreateNew" in finalizer_smoke_function
     assert "Invoke-InstallerLifecycleSmokeTest" in builder
     assert "Silent uninstall left the installed application executable behind" in builder
     assert "Invoke-DesktopSmokeTest $portableExe" in builder

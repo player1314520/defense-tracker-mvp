@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import threading
 import time
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -89,7 +86,7 @@ def validate_desktop_smoke_evidence(
 def start_desktop_smoke_probe(
     window,
     *,
-    evidence_path: Path,
+    evidence_sink: Callable[[dict[str, object]], None],
     expected_version: str,
     expected_display_version: str,
     expected_release_tag: str,
@@ -98,9 +95,8 @@ def start_desktop_smoke_probe(
     retry_seconds: float = 0.5,
 ) -> threading.Thread:
     """Start a fail-closed WebView probe and return its daemon thread."""
-    evidence_path = evidence_path.resolve()
-    if not evidence_path.parent.is_dir() or evidence_path.exists():
-        raise RuntimeError("desktop smoke evidence path must be new in an existing directory")
+    if not callable(evidence_sink):
+        raise TypeError("desktop smoke evidence sink must be callable")
     if _SHA_RE.fullmatch(expected_build_commit) is None:
         raise ValueError("desktop smoke expected commit must be a full lowercase Git SHA")
     if timeout_seconds <= 0 or retry_seconds <= 0:
@@ -126,12 +122,10 @@ def start_desktop_smoke_probe(
         with write_lock:
             if accepted.is_set():
                 return
-            temporary = evidence_path.with_suffix(evidence_path.suffix + ".tmp")
-            with temporary.open("x", encoding="utf-8", newline="\n") as stream:
-                stream.write(
-                    json.dumps(normalized, ensure_ascii=False, sort_keys=True) + "\n"
-                )
-            os.replace(temporary, evidence_path)
+            # The desktop process never accepts or writes a caller-supplied path.
+            # The release harness retrieves this allowlisted payload over an
+            # authenticated loopback-only endpoint and owns evidence persistence.
+            evidence_sink(dict(normalized))
             accepted.set()
 
     window.state += receive_desktop_smoke_state
