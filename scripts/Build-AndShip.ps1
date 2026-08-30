@@ -398,6 +398,22 @@ function Assert-CleanReleaseCommit {
     }
 }
 
+function ConvertTo-ReleaseUtc {
+    param([Parameter(Mandatory = $true)]$Value)
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.UtcDateTime
+    }
+    if ($Value -is [DateTime]) {
+        return $Value.ToUniversalTime()
+    }
+    $parsed = [DateTimeOffset]::Parse(
+        [string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    )
+    return $parsed.UtcDateTime
+}
+
 function Assert-AndConsumeBuildEnvironment {
     param(
         [Parameter(Mandatory = $true)][string]$VenvRoot,
@@ -416,7 +432,7 @@ function Assert-AndConsumeBuildEnvironment {
     if ($marker.schema -ne 1 -or $null -ne $marker.consumed_at_utc) {
         throw "Build environment is not fresh and unused. Run Prepare-BuildEnv.ps1 again."
     }
-    $prepared = [DateTime]::Parse($marker.prepared_at_utc).ToUniversalTime()
+    $prepared = ConvertTo-ReleaseUtc $marker.prepared_at_utc
     if (([DateTime]::UtcNow - $prepared).TotalHours -gt 2) {
         throw "Build environment is older than two hours; prepare a fresh environment."
     }
@@ -734,7 +750,7 @@ function Invoke-DefenderScan {
         [Parameter(Mandatory = $true)][string]$Tool,
         [Parameter(Mandatory = $true)][string]$Path
     )
-    & $Tool -DisableRemediation -Scan -ScanType 3 -File $Path
+    & $Tool -Scan -ScanType 3 -File $Path -DisableRemediation
     if ($LASTEXITCODE -ne 0) { throw "Microsoft Defender scan failed for $Path (exit $LASTEXITCODE)." }
 }
 

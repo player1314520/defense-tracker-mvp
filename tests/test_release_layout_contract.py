@@ -15,10 +15,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _powershell() -> str:
-    executable = shutil.which("pwsh") or shutil.which("powershell")
-    if executable is None:
+    return _powershells()[0]
+
+
+def _powershells() -> list[str]:
+    executables = [
+        executable
+        for name in ("pwsh", "powershell")
+        if (executable := shutil.which(name)) is not None
+    ]
+    if not executables:
         pytest.skip("PowerShell is unavailable")
-    return executable
+    return executables
 
 
 def test_release_layout_uses_tag_and_never_guesses_legacy_archive_identity():
@@ -68,6 +76,98 @@ def test_release_manifest_times_require_real_utc_ordering():
     assert finished > started
     with pytest.raises(ValueError, match="ending in Z"):
         parse_utc("2026-08-28T00:00:00+08:00", field="started")
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "scripts/Build-AndShip.ps1",
+        "scripts/Finalize-SignedCandidate.ps1",
+    ),
+)
+def test_build_environment_marker_preserves_utc_across_powershell_versions(
+    tmp_path, relative_path
+):
+    source = (ROOT / relative_path).read_text(encoding="utf-8-sig")
+    function_start = source.index("function ConvertTo-ReleaseUtc")
+    function_end = source.index(
+        "function Assert-AndConsumeBuildEnvironment", function_start
+    )
+    function_source = source[function_start:function_end]
+    probe = tmp_path / f"release-utc-{Path(relative_path).stem}.ps1"
+    probe.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        "Set-StrictMode -Version Latest\n"
+        + function_source
+        + "\n"
+        + "$marker = '{\"prepared_at_utc\":\"2026-08-30T11:00:00.0000000Z\"}' "
+        "| ConvertFrom-Json\n"
+        + "$utc = ConvertTo-ReleaseUtc $marker.prepared_at_utc\n"
+        + "$utc.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ', "
+        "[Globalization.CultureInfo]::InvariantCulture)\n",
+        encoding="utf-8-sig",
+    )
+    for executable in _powershells():
+        result = subprocess.run(
+            [executable, "-NoProfile", "-File", str(probe)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "2026-08-30T11:00:00.0000000Z"
+    assert "ConvertTo-ReleaseUtc $marker.prepared_at_utc" in source
+    assert "[DateTime]::Parse($marker.prepared_at_utc).ToUniversalTime()" not in source
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "scripts/Build-AndShip.ps1",
+        "scripts/Finalize-SignedCandidate.ps1",
+    ),
+)
+def test_defender_scan_uses_supported_argument_order(tmp_path, relative_path):
+    source = (ROOT / relative_path).read_text(encoding="utf-8-sig")
+    function_start = source.index("function Invoke-DefenderScan")
+    function_end = source.index("\n}\n", function_start + 1) + len("\n}\n")
+    function_source = source[function_start:function_end]
+
+    assert "& $Tool -Scan -ScanType 3 -File $Path -DisableRemediation" in function_source
+    assert "& $Tool -DisableRemediation -Scan" not in function_source
+
+    stub = tmp_path / "fake-defender.ps1"
+    stub.write_text(
+        "Write-Output ('ARGS=' + ($args -join '|'))\nexit 0\n",
+        encoding="utf-8-sig",
+    )
+    probe = tmp_path / f"defender-args-{Path(relative_path).stem}.ps1"
+    escaped_stub = str(stub).replace("'", "''")
+    probe.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        "Set-StrictMode -Version Latest\n"
+        + function_source
+        + "\n"
+        + f"Invoke-DefenderScan -Tool '{escaped_stub}' -Path 'candidate path'\n",
+        encoding="utf-8-sig",
+    )
+    for executable in _powershells():
+        result = subprocess.run(
+            [executable, "-NoProfile", "-File", str(probe)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == (
+            "ARGS=-Scan|-ScanType|3|-File|candidate path|-DisableRemediation"
+        )
 
 
 def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
