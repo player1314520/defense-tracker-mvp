@@ -77,6 +77,16 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
             "function Invoke-InstallerLifecycleSmokeTest"
         )
     ]
+    installer_smoke_function = builder[
+        builder.index("function Invoke-InstallerLifecycleSmokeTest") : builder.index(
+            "function Invoke-LegacyMigrationSmokeTest"
+        )
+    ]
+    finalizer_installer_smoke_function = finalizer[
+        finalizer.index("function Invoke-InstallerLifecycleSmokeTest") : finalizer.index(
+            "function Invoke-LegacyMigrationSmokeTest"
+        )
+    ]
     assert "DEFENSE_TRACKER_SMOKE_EVIDENCE" in builder
     assert "workspace_ready" in builder
     assert "build_commit -eq $ExpectedCommit" in builder
@@ -85,6 +95,10 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert "-WindowStyle Hidden" not in smoke_function
     assert "Start-Process -FilePath $ExePath -PassThru" in finalizer_smoke_function
     assert "-WindowStyle Hidden" not in finalizer_smoke_function
+    assert installer_smoke_function.count("-WindowStyle Hidden") == 2
+    assert finalizer_installer_smoke_function.count("-WindowStyle Hidden") == 2
+    assert "/VERYSILENT" in installer_smoke_function
+    assert "/VERYSILENT" in finalizer_installer_smoke_function
     assert "document.querySelector('main.v9-workspace')" in launcher
     assert "payload.build_commit" in launcher
     assert "Invoke-InstallerLifecycleSmokeTest" in builder
