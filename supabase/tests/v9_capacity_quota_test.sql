@@ -2,7 +2,7 @@ begin;
 
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
-select plan(13);
+select plan(15);
 
 insert into auth.users(id,email)
 values (
@@ -280,12 +280,65 @@ select throws_ok(
     'membership release fails closed while its organization still exists'
 );
 
+insert into public.organizations(
+    id,name_ciphertext,name_nonce,created_by
+) values (
+    '10000000-0000-0000-0000-000000000002'::uuid,
+    decode(repeat('ab',17),'hex'),
+    decode(repeat('bc',12),'hex'),
+    '00000000-0000-0000-0001-000000000001'::uuid
+);
+
+insert into public.memberships(organization_id,user_id,role,status)
+values (
+    '10000000-0000-0000-0000-000000000002'::uuid,
+    '00000000-0000-0000-0001-000000000001'::uuid,
+    'owner','active'
+);
+
+select is(
+    (
+        select used_seats
+        from private.organization_seat_usage
+        where organization_id =
+            '10000000-0000-0000-0000-000000000002'::uuid
+    ),
+    1,
+    'membership-only organization owns one capacity-ledger seat'
+);
+
 select lives_ok(
     $$
-        delete from public.organizations
-        where id = '10000000-0000-0000-0000-000000000001'::uuid
+        do $ordered_cleanup$
+        begin
+            delete from public.memberships
+            where organization_id =
+                '10000000-0000-0000-0000-000000000002'::uuid;
+            delete from public.organizations
+            where id = '10000000-0000-0000-0000-000000000002'::uuid;
+        end;
+        $ordered_cleanup$
     $$,
-    'organization deletion cascades through memberships and capacity state'
+    'membership-only organization cleanup releases capacity before deletion'
+);
+
+select is(
+    (
+        select
+            (select count(*) from public.organizations
+             where id = '10000000-0000-0000-0000-000000000002'::uuid)
+          + (select count(*) from public.memberships
+             where organization_id =
+                 '10000000-0000-0000-0000-000000000002'::uuid)
+          + (select count(*) from private.organization_seat_usage
+             where organization_id =
+                 '10000000-0000-0000-0000-000000000002'::uuid)
+          + (select count(*) from private.organization_seat_reservations
+             where organization_id =
+                 '10000000-0000-0000-0000-000000000002'::uuid)
+    ),
+    0::bigint,
+    'organization, membership, usage, and reservations are all removed'
 );
 
 select * from finish();

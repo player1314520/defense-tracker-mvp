@@ -2,51 +2,6 @@
 -- caller's bound device session without accepting caller-controlled IDs.
 begin;
 
--- Organization deletion may cascade to the capacity ledger before it cascades
--- to memberships.  A missing ledger is corruption while the parent remains,
--- but it is expected once the parent organization has been deleted.
-create or replace function private.release_organization_seat(
-    p_organization_id uuid,
-    p_reservation_key text
-)
-returns void
-language plpgsql
-security definer
-set search_path = ''
-as $$
-declare
-    removed_count integer := 0;
-begin
-    perform u.organization_id
-    from private.organization_seat_usage u
-    where u.organization_id = p_organization_id
-    for update;
-    if not found then
-        if not exists (
-            select 1
-            from public.organizations o
-            where o.id = p_organization_id
-        ) then
-            return;
-        end if;
-        raise exception 'organization capacity state is unavailable';
-    end if;
-    delete from private.organization_seat_reservations r
-    where r.organization_id = p_organization_id
-      and r.reservation_key = p_reservation_key;
-    get diagnostics removed_count = row_count;
-    if removed_count = 1 then
-        update private.organization_seat_usage u
-        set used_seats = greatest(0,u.used_seats - 1),
-            updated_at = statement_timestamp()
-        where u.organization_id = p_organization_id;
-    end if;
-end;
-$$;
-
-revoke all on function private.release_organization_seat(uuid,text)
-    from public, anon, authenticated, service_role;
-
 alter table public.record_versions
     add constraint record_versions_ciphertext_v9_0_size_check
     check (octet_length(ciphertext) between 17 and 1048592)

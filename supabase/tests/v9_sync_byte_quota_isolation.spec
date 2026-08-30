@@ -72,6 +72,15 @@ teardown
     end if;
   end;
   $quota_isolation_assert$;
+  -- Immutable provenance FKs intentionally reject deleting a device or
+  -- record version out from under history.  Test cleanup therefore follows
+  -- an explicit leaf-to-root order without changing production delete rules.
+  delete from public.sync_events
+  where organization_id = '12000000-0000-0000-0000-000000000001';
+  delete from public.record_heads
+  where organization_id = '12000000-0000-0000-0000-000000000001';
+  delete from public.memberships
+  where organization_id = '12000000-0000-0000-0000-000000000001';
   delete from public.organizations
   where id = '12000000-0000-0000-0000-000000000001';
   delete from auth.users
