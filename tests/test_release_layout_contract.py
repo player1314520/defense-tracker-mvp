@@ -134,6 +134,12 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     ) < finalizer_smoke_function.index("Get-NetTCPConnection")
     assert "transport=$lastTransportStatus" in smoke_function
     assert "transport=$lastTransportStatus" in finalizer_smoke_function
+    assert "$_.Exception.Response" not in smoke_function
+    assert "$_.Exception.Response" not in finalizer_smoke_function
+    assert "PSObject.Properties" in smoke_function
+    assert "PSObject.Properties" in finalizer_smoke_function
+    assert "connection-error" in smoke_function
+    assert "connection-error" in finalizer_smoke_function
     assert "listener_query=$lastListenerQuery" in smoke_function
     assert "listener_query=$lastListenerQuery" in finalizer_smoke_function
     assert "Get-NetTCPConnection" in smoke_function and "-ErrorAction Stop" in smoke_function

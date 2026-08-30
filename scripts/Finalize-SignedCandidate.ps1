@@ -443,8 +443,21 @@ function Invoke-DesktopSmokeTest {
                             -Method Get -TimeoutSec 1 -ErrorAction Stop
                         $lastTransportStatus = 'http-200'
                     } catch {
-                        if ($null -ne $_.Exception.Response) {
-                            $lastTransportStatus = 'http-' + [int]$_.Exception.Response.StatusCode
+                        $responseValues = @(
+                            $_.Exception.PSObject.Properties |
+                                Where-Object { $_.Name -eq 'Response' } |
+                                ForEach-Object { $_.Value }
+                        )
+                        $statusValues = @(
+                            $responseValues |
+                                ForEach-Object {
+                                    $_.PSObject.Properties |
+                                        Where-Object { $_.Name -eq 'StatusCode' } |
+                                        ForEach-Object { $_.Value }
+                                }
+                        )
+                        if ($statusValues.Count -eq 1) {
+                            $lastTransportStatus = 'http-' + [int]$statusValues[0]
                         } else {
                             $lastTransportStatus = 'connection-error'
                         }
