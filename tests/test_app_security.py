@@ -85,6 +85,42 @@ def test_explicit_test_mode_opens_api_without_access_token(client):
     assert payload["build_commit"] == tracker.current_build_commit()
 
 
+def test_workspace_health_is_public_and_identifies_the_exact_build(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "status": "ok",
+        "service": "defense-tracker-workspace",
+        "version": tracker.PRODUCT_VERSION.semantic_version,
+        "build_commit": tracker.current_build_commit(),
+        "wire_compatibility": "mvp-wire-v1",
+    }
+
+
+def test_workspace_health_proves_the_supervised_child_without_exposing_secret(
+    client, monkeypatch
+):
+    secret_hex = "42" * 32
+    challenge = "ab" * 16
+    monkeypatch.setenv("DEFENSE_TRACKER_SUPERVISOR_SECRET", secret_hex)
+
+    public_response = client.get("/health")
+    proof_response = client.get(
+        "/health",
+        headers={"X-DefenseTracker-Supervisor-Challenge": challenge},
+    )
+
+    public_payload = public_response.get_json()
+    proof_payload = proof_response.get_json()
+    expected_proof = tracker.hmac.new(
+        bytes.fromhex(secret_hex), challenge.encode("ascii"), tracker.hashlib.sha256
+    ).hexdigest()
+    assert "supervisor_proof" not in public_payload
+    assert proof_payload["supervisor_proof"] == expected_proof
+    assert secret_hex not in json.dumps(proof_payload)
+
+
 def test_access_token_authentication_is_fail_closed_by_default():
     assert tracker._parse_access_token_required(None) is True
     assert tracker._parse_access_token_required("") is True
@@ -1229,6 +1265,68 @@ def test_ai_stream_closes_upstream_response(monkeypatch, client):
     assert upstream.closed is True
 
 
+def test_ai_stream_does_not_reflect_upstream_exception_details(monkeypatch, client):
+    private_error = (
+        "/restricted/private-user/config.private https://secret.example "
+        "token=token-value TRACEBACK"
+    )
+
+    def reject_stream(*_args, **_kwargs):
+        raise RuntimeError(private_error)
+
+    monkeypatch.setattr(tracker, "_ai_is_enabled", lambda: True)
+    monkeypatch.setattr(tracker, "_call_ai", reject_stream)
+    csrf = _csrf_cookie(client)
+
+    response = client.post(
+        "/api/ai/stream",
+        json={"mode": "freeqa", "question": "ping"},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert '"error": "AI 流式分析失败"' in body
+    for private_fragment in (
+        "private-user",
+        "secret.example",
+        "token-value",
+        "TRACEBACK",
+    ):
+        assert private_fragment not in body
+
+
+def test_ai_analyze_does_not_reflect_unknown_value_error(monkeypatch, client):
+    private_error = (
+        "/restricted/private-user/config.private https://secret.example "
+        "token=token-value TRACEBACK"
+    )
+
+    def reject_analysis(*_args, **_kwargs):
+        raise ValueError(private_error)
+
+    monkeypatch.setattr(tracker, "_ai_is_enabled", lambda: True)
+    monkeypatch.setattr(tracker, "_call_ai", reject_analysis)
+    csrf = _csrf_cookie(client)
+
+    response = client.post(
+        "/api/ai/analyze",
+        json={"mode": "freeqa", "question": "ping"},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "AI 请求参数无效"}
+    for private_fragment in (
+        "private-user",
+        "secret.example",
+        "token-value",
+        "TRACEBACK",
+    ):
+        assert private_fragment not in body
+
+
 def test_ai_config_rolls_back_when_secure_persistence_fails(
     monkeypatch, client
 ):
@@ -2190,3 +2288,27 @@ def test_brief_parse_and_validation_reports_short_body():
     result = tracker._validate_brief(parsed)
     assert result["valid"] is False
     assert any("低于下限" in err for err in result["errors"])
+
+
+def test_tracking_status_hides_request_exception_details(client, monkeypatch):
+    private_detail = "connect failed at C:\\Users\\private\\config\r\nINJECTED"
+    monkeypatch.setattr(tracker.tracking, "_sb_ready", lambda: True)
+    monkeypatch.setattr(
+        tracker.tracking,
+        "_sb_rest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            requests.exceptions.ConnectionError(private_detail)
+        ),
+    )
+
+    response = client.get("/api/tracking/status")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload == {
+        "configured": True,
+        "reachable": False,
+        "detail": "云端追踪暂不可达",
+        "code": "supabase_unreachable",
+    }
+    assert private_detail not in response.get_data(as_text=True)

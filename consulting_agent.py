@@ -23,6 +23,45 @@ _DB_LOCK = threading.Lock()
 
 DEFAULT_TARGET_SOURCE_COUNT = 12
 MIN_SOURCE_TARGET = 1
+CAPTURE_FAILURE_FALLBACK = "抓取失败，原因待复核"
+CAPTURE_STOP_REASON_LABELS = {
+    "": "",
+    "target_reached": "已达到客户目标数量",
+    "max_rounds_reached": "已完成本轮最大搜索轮次，仍有缺口",
+    "no_queries": "没有可执行搜索式",
+    "链接失效或页面不存在": "链接失效或页面不存在",
+    "站点拒绝访问或需要授权": "站点拒绝访问或需要授权",
+    "需要登录、验证码或用户授权": "需要登录、验证码或用户授权",
+    "站点响应慢或连接超时": "站点响应慢或连接超时",
+    "文件过大，已跳过自动归档": "文件过大，已跳过自动归档",
+    "当前解析器不支持该文件": "当前解析器不支持该文件",
+    "页面或文档正文不足": "页面或文档正文不足",
+    CAPTURE_FAILURE_FALLBACK: CAPTURE_FAILURE_FALLBACK,
+}
+SOURCE_ASSET_FAILURE_REASONS = frozenset(
+    value for value in CAPTURE_STOP_REASON_LABELS.values() if value
+) | {"正文抽取不足，需人工复核"}
+SOURCE_ASSET_FAILURE_STATUSES = frozenset(
+    {"failed", "partial", "needs_user_input"}
+)
+SOURCE_ASSET_PLACEHOLDER_STATUSES = frozenset({"failed", "needs_user_input"})
+SOURCE_ASSET_PLACEHOLDER_TEXT = (
+    "该来源尚未取得可核验原文，请完成用户授权、重新抓取或上传原文后再使用。"
+)
+SOURCE_FAILURE_CODES = frozenset(
+    {
+        "not_found",
+        "blocked",
+        "needs_user_input",
+        "timeout",
+        "too_large",
+        "unsupported",
+        "too_short",
+        "thin",
+        "unknown",
+    }
+)
+SOURCE_FAILURE_SCRUB_MIGRATION = "2026-08-29-source-failure-privacy-v2"
 
 
 def _now() -> str:
@@ -44,6 +83,149 @@ def _json_loads(value, default):
         return json.loads(value)
     except Exception:
         return default
+
+
+def normalize_capture_stop_reason(reason: str | None) -> str:
+    if reason is None:
+        return ""
+    if not isinstance(reason, str):
+        return CAPTURE_FAILURE_FALLBACK
+    value = reason
+    if value in CAPTURE_STOP_REASON_LABELS:
+        return value
+    return CAPTURE_FAILURE_FALLBACK
+
+
+def capture_stop_reason_label(reason: str | None) -> str:
+    normalized = normalize_capture_stop_reason(reason)
+    return CAPTURE_STOP_REASON_LABELS[normalized]
+
+
+def normalize_source_asset_failure_reason(
+    reason: str | None, *, status: str = ""
+) -> str:
+    if reason in (None, ""):
+        return (
+            CAPTURE_FAILURE_FALLBACK
+            if status in SOURCE_ASSET_FAILURE_STATUSES
+            else ""
+        )
+    if not isinstance(reason, str) or reason not in SOURCE_ASSET_FAILURE_REASONS:
+        return CAPTURE_FAILURE_FALLBACK
+    return reason
+
+
+def _normalize_source_asset_failure_payload(
+    payload, *, status: str, failure_reason: str | None = None
+) -> tuple[str, dict]:
+    safe_payload = dict(payload) if isinstance(payload, dict) else {}
+    candidate = (
+        failure_reason
+        or safe_payload.get("failure_reason")
+        or safe_payload.get("reason")
+    )
+    safe_reason = normalize_source_asset_failure_reason(candidate, status=status)
+    failure_code = safe_payload.get("failure_code")
+    if not isinstance(failure_code, str) or failure_code not in SOURCE_FAILURE_CODES:
+        failure_code = "unknown"
+    safe_diagnosis = {"code": failure_code, "label": safe_reason}
+    if status in SOURCE_ASSET_PLACEHOLDER_STATUSES:
+        safe_payload = {
+            "title": safe_payload.get("title")
+            if isinstance(safe_payload.get("title"), str)
+            else "",
+            "source": safe_payload.get("source")
+            if isinstance(safe_payload.get("source"), str)
+            else "",
+            "url": safe_payload.get("url")
+            if isinstance(safe_payload.get("url"), str)
+            else "",
+            "asset_status": status,
+            "failure_reason": safe_reason,
+            "reason": safe_reason,
+            "failure_code": failure_code,
+            "diagnosis": safe_diagnosis,
+            "text": SOURCE_ASSET_PLACEHOLDER_TEXT,
+            "snippet": SOURCE_ASSET_PLACEHOLDER_TEXT,
+            "is_fetched_original": False,
+            "placeholder_quarantined": True,
+        }
+        return safe_reason, safe_payload
+    if "failure_reason" in safe_payload:
+        safe_payload["failure_reason"] = safe_reason
+    if "reason" in safe_payload or status == "failed":
+        safe_payload["reason"] = safe_reason
+    if status in SOURCE_ASSET_FAILURE_STATUSES:
+        safe_payload["failure_code"] = failure_code
+        safe_payload["diagnosis"] = safe_diagnosis
+    return safe_reason, safe_payload
+
+
+def _normalize_source_failure_event_payload(payload) -> dict:
+    source = dict(payload) if isinstance(payload, dict) else {}
+    safe_reason = normalize_source_asset_failure_reason(
+        source.get("reason"),
+        status="failed",
+    )
+    return {
+        key: value
+        for key in ("asset_id", "evidence_id")
+        if isinstance((value := source.get(key)), str)
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
+    } | {"reason": safe_reason}
+
+
+def _scrub_legacy_source_failure_details(conn) -> None:
+    applied = conn.execute(
+        "SELECT 1 FROM local_migrations WHERE migration_id=?",
+        (SOURCE_FAILURE_SCRUB_MIGRATION,),
+    ).fetchone()
+    if applied:
+        return
+    rows = conn.execute(
+        """
+        SELECT asset_id, status, failure_reason, payload_json
+        FROM source_assets
+        WHERE failure_reason <> ''
+           OR status IN ('failed', 'partial', 'needs_user_input')
+        """
+    ).fetchall()
+    for row in rows:
+        safe_reason, safe_payload = _normalize_source_asset_failure_payload(
+            _json_loads(row["payload_json"], {}),
+            status=row["status"],
+            failure_reason=row["failure_reason"],
+        )
+        conn.execute(
+            """
+            UPDATE source_assets
+            SET failure_reason=?, payload_json=?
+            WHERE asset_id=?
+            """,
+            (safe_reason, _json_dumps(safe_payload), row["asset_id"]),
+        )
+    event_rows = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM events
+        WHERE event_type='source_asset_failed'
+        """
+    ).fetchall()
+    for row in event_rows:
+        safe_payload = _normalize_source_failure_event_payload(
+            _json_loads(row["payload_json"], {})
+        )
+        conn.execute(
+            "UPDATE events SET payload_json=? WHERE id=?",
+            (_json_dumps(safe_payload), row["id"]),
+        )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO local_migrations(migration_id, applied_at)
+        VALUES (?, ?)
+        """,
+        (SOURCE_FAILURE_SCRUB_MIGRATION, _now()),
+    )
 
 
 def _connect():
@@ -118,6 +300,10 @@ def init_consulting_agent_db():
             created_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES sessions(session_id)
         );
+        CREATE TABLE IF NOT EXISTS local_migrations (
+            migration_id TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS source_assets (
             asset_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -178,6 +364,17 @@ def init_consulting_agent_db():
             FOREIGN KEY(session_id) REFERENCES sessions(session_id)
         );
         """)
+        allowed_reasons = tuple(CAPTURE_STOP_REASON_LABELS)
+        placeholders = ",".join("?" for _ in allowed_reasons)
+        conn.execute(
+            f"""
+            UPDATE capture_jobs
+            SET stop_reason=CASE WHEN stop_reason IS NULL THEN '' ELSE ? END
+            WHERE stop_reason IS NULL OR stop_reason NOT IN ({placeholders})
+            """,
+            (CAPTURE_FAILURE_FALLBACK, *allowed_reasons),
+        )
+        _scrub_legacy_source_failure_details(conn)
         conn.commit()
 
 
@@ -501,11 +698,14 @@ def _answer_from_row(row) -> dict:
 
 
 def _event_from_row(row) -> dict:
+    payload = _json_loads(row["payload_json"], {})
+    if row["event_type"] == "source_asset_failed":
+        payload = _normalize_source_failure_event_payload(payload)
     return {
         "id": row["id"],
         "session_id": row["session_id"],
         "event_type": row["event_type"],
-        "payload": _json_loads(row["payload_json"], {}),
+        "payload": payload,
         "created_at": row["created_at"],
     }
 
@@ -657,22 +857,28 @@ def get_evidence(session_id: str, evidence_ids: list[str] | None = None) -> list
 
 
 def _asset_from_row(row) -> dict:
+    failure_reason, payload = _normalize_source_asset_failure_payload(
+        _json_loads(row["payload_json"], {}),
+        status=row["status"],
+        failure_reason=row["failure_reason"],
+    )
+    placeholder_quarantined = bool(payload.get("placeholder_quarantined"))
     return {
         "asset_id": row["asset_id"],
         "session_id": row["session_id"],
         "evidence_id": row["evidence_id"],
         "url": row["url"],
         "status": row["status"],
-        "local_path": row["local_path"],
-        "text_path": row["text_path"],
-        "metadata_path": row["metadata_path"],
-        "checksum": row["checksum"],
+        "local_path": "" if placeholder_quarantined else row["local_path"],
+        "text_path": "" if placeholder_quarantined else row["text_path"],
+        "metadata_path": "" if placeholder_quarantined else row["metadata_path"],
+        "checksum": "" if placeholder_quarantined else row["checksum"],
         "content_type": row["content_type"],
         "document_type": row["document_type"],
         "word_count": row["word_count"],
-        "failure_reason": row["failure_reason"],
+        "failure_reason": failure_reason,
         "fetched_at": row["fetched_at"],
-        "payload": _json_loads(row["payload_json"], {}),
+        "payload": payload,
     }
 
 
@@ -722,6 +928,35 @@ def archive_source_asset(session_id: str, evidence: dict, doc: dict,
     status = (status or "archived").strip()
     if status not in {"archived", "partial", "needs_user_input"}:
         raise ValueError("无效原文资产状态")
+    failure_reason = normalize_source_asset_failure_reason(
+        failure_reason,
+        status=status,
+    )
+    doc = dict(doc or {})
+    if status in SOURCE_ASSET_PLACEHOLDER_STATUSES:
+        failure_code = doc.get("failure_code")
+        if (
+            not isinstance(failure_code, str)
+            or failure_code not in SOURCE_FAILURE_CODES
+        ):
+            failure_code = "unknown"
+        doc = {
+            "title": doc.get("title") if isinstance(doc.get("title"), str) else "",
+            "url": doc.get("url") if isinstance(doc.get("url"), str) else "",
+            "text": SOURCE_ASSET_PLACEHOLDER_TEXT,
+            "snippet": SOURCE_ASSET_PLACEHOLDER_TEXT,
+            "document_type": doc.get("document_type")
+            if isinstance(doc.get("document_type"), str)
+            else "",
+            "content_type": doc.get("content_type")
+            if isinstance(doc.get("content_type"), str)
+            else "",
+            "word_count": 0,
+            "raw_bytes": SOURCE_ASSET_PLACEHOLDER_TEXT.encode("utf-8"),
+            "is_fetched_original": False,
+            "failure_code": failure_code,
+            "diagnosis": {"code": failure_code, "label": failure_reason},
+        }
     evidence_id = evidence.get("evidence_id") or ""
     if not evidence_id:
         raise ValueError("缺少 evidence_id，无法归档原文")
@@ -764,6 +999,11 @@ def archive_source_asset(session_id: str, evidence: dict, doc: dict,
         "quality_radar": doc.get("quality_radar") or {},
         "extraction_method": doc.get("extraction_method") or "",
     })
+    failure_reason, payload = _normalize_source_asset_failure_payload(
+        payload,
+        status=status,
+        failure_reason=failure_reason,
+    )
     word_count = int(doc.get("word_count") or _word_count(text))
     metadata = {
         "asset_id": asset_id,
@@ -820,6 +1060,7 @@ def record_source_asset_failure(session_id: str, evidence: dict, reason: str, ur
     url = (url or evidence.get("url") or "").strip()
     if not evidence_id:
         raise ValueError("缺少 evidence_id，无法记录失败")
+    reason = normalize_source_asset_failure_reason(reason, status="failed")
     asset_id = _asset_id(session_id, evidence_id, url)
     now = _now()
     payload = {
@@ -829,6 +1070,11 @@ def record_source_asset_failure(session_id: str, evidence: dict, reason: str, ur
         "failure_code": failure_code or "",
         "diagnosis": diagnosis or {},
     }
+    reason, payload = _normalize_source_asset_failure_payload(
+        payload,
+        status="failed",
+        failure_reason=reason,
+    )
     init_consulting_agent_db()
     with _DB_LOCK, _connect() as conn:
         conn.execute(
@@ -924,7 +1170,7 @@ def _capture_job_from_row(row, attempts: list[dict] | None = None) -> dict:
         "failed_count": row["failed_count"],
         "needs_user_input_count": row["needs_user_input_count"],
         "rejected_low_relevance": row["rejected_low_relevance"],
-        "stop_reason": row["stop_reason"],
+        "stop_reason": normalize_capture_stop_reason(row["stop_reason"]),
         "payload": _json_loads(row["payload_json"], {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -1011,6 +1257,8 @@ def update_capture_job(job_id: str, status: str | None = None, round_no: int | N
                        counts: dict | None = None, payload: dict | None = None) -> dict:
     init_consulting_agent_db()
     counts = counts or {}
+    if stop_reason is not None:
+        stop_reason = normalize_capture_stop_reason(stop_reason)
     updates = ["updated_at=?"]
     params = [_now()]
     for field, value in (

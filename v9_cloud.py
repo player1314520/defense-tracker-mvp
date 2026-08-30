@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import threading
 import urllib.error
@@ -152,10 +153,129 @@ def _default_readiness_probe(url: str, publishable_key: str) -> bool:
         return False
 
 
+_DEPLOYMENT_DATABASE_PATHS = {
+    "/data/v9-cloud.sqlite3": Path("/data/v9-cloud.sqlite3"),
+    "/data/portal.sqlite3": Path("/data/portal.sqlite3"),
+}
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _existing_database_sidecars(path: Path) -> tuple[Path, ...]:
+    sidecars = [
+        candidate
+        for suffix in _SQLITE_SIDECAR_SUFFIXES
+        if _path_entry_exists(candidate := Path(f"{path}{suffix}"))
+    ]
+    try:
+        sidecars.extend(
+            candidate
+            for candidate in path.parent.iterdir()
+            if candidate.name.startswith(f"{path.name}-mj")
+        )
+    except FileNotFoundError:
+        pass
+    return tuple(sidecars)
+
+
+def _development_database_paths() -> tuple[Path, Path]:
+    temp_root = Path(tempfile.gettempdir())
+    return (
+        temp_root / "defense-tracker-v9-cloud.sqlite3",
+        temp_root / "defense-tracker-v9-cloud" / "cloud.sqlite3",
+    )
+
+
+def _cloud_database_path(
+    database_path: Path | str | None, *, production_mode: bool
+) -> Path:
+    if database_path is not None:
+        return Path(database_path)
+    configured = os.getenv("V9_CLOUD_DB_PATH")
+    if configured:
+        if configured == "/data/v9-cloud.sqlite3":
+            return _DEPLOYMENT_DATABASE_PATHS["/data/v9-cloud.sqlite3"]
+        if configured == "/data/portal.sqlite3":
+            return _DEPLOYMENT_DATABASE_PATHS["/data/portal.sqlite3"]
+        raise ValueError("V9_CLOUD_DB_PATH must use the fixed deployment path")
+    if production_mode:
+        raise ValueError("V9_CLOUD_DB_PATH is required in production")
+    legacy_path, hardened_path = _development_database_paths()
+    legacy_exists = _path_entry_exists(legacy_path)
+    hardened_exists = _path_entry_exists(hardened_path)
+    legacy_sidecars = _existing_database_sidecars(legacy_path)
+    hardened_sidecars = _existing_database_sidecars(hardened_path)
+    if legacy_exists and hardened_exists:
+        raise ValueError(
+            "legacy and hardened development databases both exist; stop all "
+            "writers, then select and migrate one explicitly"
+        )
+    if legacy_exists:
+        if hardened_sidecars:
+            raise ValueError(
+                "orphaned hardened database sidecar exists; stop all writers "
+                "and recover or remove it explicitly"
+            )
+        return legacy_path
+    if hardened_exists:
+        if legacy_sidecars:
+            raise ValueError(
+                "orphaned legacy database sidecar exists; stop all writers "
+                "and recover or remove it explicitly"
+            )
+        return hardened_path
+    if legacy_sidecars or hardened_sidecars:
+        raise ValueError(
+            "orphaned database sidecar exists; recover or remove it explicitly"
+        )
+    return hardened_path
+
+
 class CloudStore:
     def __init__(self, path: Path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        requested_path = Path(path)
+        if ".." in requested_path.parts:
+            raise ValueError("database path must not contain parent traversal")
+        absolute_path = Path(os.path.abspath(os.fspath(requested_path)))
+        if os.name == "nt" and str(absolute_path).startswith("\\\\"):
+            raise ValueError("database parent must be a local directory")
+
+        if absolute_path.suffix.casefold() != ".sqlite3":
+            raise ValueError("database path must name a .sqlite3 file")
+
+        legacy_path, _ = _development_database_paths()
+        self._allow_legacy_temp_parent = (
+            absolute_path == Path(os.path.abspath(os.fspath(legacy_path)))
+            and _path_entry_exists(absolute_path)
+        )
+        parent = absolute_path.parent
+        self._assert_existing_ancestors_are_real(parent)
+        parent_existed = parent.exists()
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._assert_real_directory(parent)
+        if not parent_existed and os.name != "nt":
+            parent.chmod(0o700)
+        self._assert_private_directory(
+            parent, allow_legacy_temp_parent=self._allow_legacy_temp_parent
+        )
+        self._parent = parent.resolve(strict=True)
+        self.path = self._parent / absolute_path.name
+        if self.path.parent != self._parent:
+            raise ValueError("database path escapes its verified parent")
+
+        self._database_identity: tuple[int, int] | None = None
+        self._prepare_database_file()
+        prepared = self.path.lstat()
+        self._database_identity = (prepared.st_dev, prepared.st_ino)
         self._lock = threading.RLock()
         with self._connect() as conn:
             conn.executescript(
@@ -187,8 +307,100 @@ class CloudStore:
                 );
                 """
             )
+        self.path.chmod(0o600)
+
+    @staticmethod
+    def _is_link_or_reparse(path: Path) -> bool:
+        metadata = path.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        file_attributes = getattr(metadata, "st_file_attributes", 0)
+        return stat.S_ISLNK(metadata.st_mode) or bool(
+            file_attributes & reparse_flag
+        )
+
+    @classmethod
+    def _assert_existing_ancestors_are_real(cls, path: Path) -> None:
+        for candidate in (path, *path.parents):
+            try:
+                if cls._is_link_or_reparse(candidate):
+                    raise ValueError(
+                        "database path contains a symbolic link or reparse point"
+                    )
+            except FileNotFoundError:
+                continue
+
+    @classmethod
+    def _assert_real_directory(cls, path: Path) -> None:
+        if cls._is_link_or_reparse(path):
+            raise ValueError(
+                "database path contains a symbolic link or reparse point"
+            )
+        if not stat.S_ISDIR(path.lstat().st_mode):
+            raise ValueError("database parent must be a real local directory")
+
+    @staticmethod
+    def _assert_private_directory(
+        path: Path, *, allow_legacy_temp_parent: bool = False
+    ) -> None:
+        if os.name == "nt":
+            return
+        metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if metadata.st_uid == os.geteuid() and not (mode & 0o077):
+            return
+        if allow_legacy_temp_parent:
+            expected_temp = Path(tempfile.gettempdir()).resolve(strict=True)
+            if (
+                path.resolve(strict=True) == expected_temp
+                and metadata.st_uid in {0, os.geteuid()}
+                and bool(mode & stat.S_ISVTX)
+            ):
+                return
+        raise ValueError("database parent must be a private owner-only directory")
+
+    def _assert_database_file_is_safe(self) -> None:
+        self._assert_real_directory(self.path.parent)
+        self._assert_private_directory(
+            self.path.parent,
+            allow_legacy_temp_parent=self._allow_legacy_temp_parent,
+        )
+        if self.path.parent.resolve(strict=True) != self._parent:
+            raise ValueError("database path escapes its verified parent")
+        try:
+            metadata = self.path.lstat()
+        except FileNotFoundError:
+            return
+        if self._is_link_or_reparse(self.path):
+            raise ValueError(
+                "database path contains a symbolic link or reparse point"
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("database path must be a regular file")
+        if metadata.st_nlink != 1:
+            raise ValueError("database path must not use hard links")
+        if os.name != "nt" and metadata.st_uid != os.geteuid():
+            raise ValueError("database file must be owned by the service user")
+        current_identity = (metadata.st_dev, metadata.st_ino)
+        if (
+            self._database_identity is not None
+            and current_identity != self._database_identity
+        ):
+            raise ValueError("database file was replaced after initialization")
+
+    def _prepare_database_file(self) -> None:
+        self._assert_database_file_is_safe()
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        flags |= getattr(os, "O_BINARY", 0)
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except FileExistsError:
+            self._assert_database_file_is_safe()
+        else:
+            os.close(descriptor)
+        self.path.chmod(0o600)
 
     def _connect(self) -> sqlite3.Connection:
+        self._assert_database_file_is_safe()
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
@@ -306,11 +518,14 @@ def create_app(
 ) -> Flask:
     application = Flask(__name__)
     application.config["MAX_CONTENT_LENGTH"] = 256 * 1024
-    database_path = database_path or os.getenv(
-        "V9_CLOUD_DB_PATH",
-        str(Path(tempfile.gettempdir()) / "defense-tracker-v9-cloud.sqlite3"),
+    production_mode = _strict_bool_setting(
+        production_mode,
+        "V9_PRODUCTION_MODE",
+        setting_name="production_mode",
     )
-    store = CloudStore(Path(database_path))
+    store = CloudStore(
+        _cloud_database_path(database_path, production_mode=production_mode)
+    )
     portal_root = Path(__file__).resolve().parent / "web" / "v9-portal"
     token = (
         coordinator_token
@@ -364,11 +579,6 @@ def create_app(
         access_applications_enabled,
         "V9_ACCESS_APPLICATIONS_ENABLED",
         setting_name="access_applications_enabled",
-    )
-    production_mode = _strict_bool_setting(
-        production_mode,
-        "V9_PRODUCTION_MODE",
-        setting_name="production_mode",
     )
     build_commit = _resolve_build_commit(build_commit)
     if production_mode and build_commit == "development":

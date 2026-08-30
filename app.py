@@ -2041,6 +2041,33 @@ def api_feeds_health():
 @require_auth
 def api_thinktanks(): return jsonify({"data": THINK_TANK_DIRECTORY})
 
+@app.route("/health")
+def workspace_health():
+    """Minimal unauthenticated liveness identity for local supervisors."""
+    payload = {
+        "status": "ok",
+        "service": "defense-tracker-workspace",
+        "version": PRODUCT_VERSION.semantic_version,
+        "build_commit": current_build_commit(),
+        "wire_compatibility": "mvp-wire-v1",
+    }
+    supervisor_secret = os.environ.get(
+        "DEFENSE_TRACKER_SUPERVISOR_SECRET", ""
+    ).strip()
+    challenge = (
+        request.headers.get("X-DefenseTracker-Supervisor-Challenge") or ""
+    ).strip()
+    if re.fullmatch(r"[0-9a-f]{64}", supervisor_secret) and re.fullmatch(
+        r"[0-9a-f]{32}", challenge
+    ):
+        payload["supervisor_proof"] = hmac.new(
+            bytes.fromhex(supervisor_secret),
+            challenge.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+    return jsonify(payload)
+
+
 @app.route("/api/status")
 @require_auth
 def api_status():
@@ -2388,6 +2415,20 @@ SYSTEM_PROMPT_FREEQA = """你是一位资深防务情报分析师，精通全球
 用户会基于当前防务新闻库提出问题，请用中文专业作答。
 当前新闻库概况将作为上下文提供。回答要专业、有深度、有数据支撑。"""
 
+
+def _ai_public_value_error_message(error: ValueError) -> str:
+    """Return only fixed messages for the AI errors safe to expose publicly."""
+    if error.args == ("云端 AI 凭据尚未在当前设备激活",):
+        return "云端 AI 凭据尚未在当前设备激活"
+    if error.args == ("AI API Key 未配置",):
+        return "AI API Key 未配置"
+    if error.args == ("AI endpoint does not match the fixed provider registry",):
+        return "AI 服务配置无效"
+    if error.args == ("AI 返回格式异常：缺少 choices 字段",):
+        return "AI 返回格式异常"
+    return "AI 请求参数无效"
+
+
 @app.route("/api/ai/analyze", methods=["POST"])
 @require_auth
 @require_ai_rate
@@ -2450,7 +2491,8 @@ def api_ai_analyze():
     except requests.exceptions.HTTPError as e:
         return jsonify({"error": f"AI API 请求失败: {e.response.status_code}"}), 502
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        logger.info("AI analyze request rejected error_type=%s", type(e).__name__)
+        return jsonify({"error": _ai_public_value_error_message(e)}), 400
     except Exception as e:
         logger.error("AI analyze error_type=%s", type(e).__name__)
         return jsonify({"error": "分析失败"}), 500
@@ -2523,7 +2565,8 @@ def api_ai_stream():
                 except json.JSONDecodeError:
                     continue
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)[:200]}, ensure_ascii=False)}\n\n"
+            logger.error("AI stream error_type=%s", type(e).__name__)
+            yield f"data: {json.dumps({'error': 'AI 流式分析失败'}, ensure_ascii=False)}\n\n"
         finally:
             if resp is not None:
                 resp.close()
@@ -2709,15 +2752,19 @@ def _build_brief_user_prompt(article: dict) -> str:
 BRIEF_WARNING_WORDS = ("值得警惕", "值得关注")
 MAX_BRIEF_TEXT_CHARS = 16 * 1024
 MAX_BRIEF_LINE_CHARS = 4 * 1024
+BRIEF_STRUCTURED_TEXT_FIELDS = (
+    "event_time",
+    "value_point",
+    "title",
+    "body",
+    "source",
+    "reporter",
+)
 BRIEF_MARKDOWN_RE = re.compile(r"(?:^|\s)(#{1,6}\s|\*\*|__|```|~~~|^\s*[-*+]\s)", re.MULTILINE)
 
 BRIEF_RELATIVE_EVENT_WORDS = ("近期", "近日", "日前", "最近", "当前", "本月", "今年")
 
 BRIEF_EVENT_DATE_RE = re.compile(r"(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日")
-
-BRIEF_SOURCE_ENTRY_RE = re.compile(
-    r"^(?P<name>.+?)\s*(?P<month>\d{1,2})月(?P<day>\d{1,2})日发文《(?P<title>[^》]+)》$"
-)
 
 BRIEF_BODY_ATTRIBUTION_RE = re.compile(r"据(?P<label>[^，,。；;]{1,80}?)报道")
 
@@ -3024,27 +3071,57 @@ def _brief_source_context_from_article(article: dict, *, origin: str = "unknown"
 def _parse_brief_source_entries(source: str) -> tuple[list[dict], list[str], str]:
     """解析“来源名X月X日发文《标题》”条目，保留不合规项供校验报错。"""
     raw = (source or "").strip()
-    raw = re.sub(r"^[（(]?\s*信息来源\s*[:：]\s*", "", raw)
-    raw = re.sub(r"\s*[）)]\s*$", "", raw)
+    candidate = raw[1:].lstrip() if raw.startswith(("（", "(")) else raw
+    if candidate.startswith("信息来源"):
+        candidate = candidate[len("信息来源"):].lstrip()
+        if candidate.startswith(("：", ":")):
+            candidate = candidate[1:].lstrip()
+        raw = candidate
+    raw = raw.rstrip()
+    if raw.endswith(("）", ")")):
+        raw = raw[:-1].rstrip()
     parts = [part.strip() for part in re.split(r"[；;]", raw) if part.strip()]
     entries, invalid = [], []
     for part in parts:
-        match = BRIEF_SOURCE_ENTRY_RE.fullmatch(part)
-        if not match:
+        before_title, marker, title_with_close = part.rpartition("日发文《")
+        if not marker or not title_with_close.endswith("》"):
             invalid.append(part)
             continue
-        month = int(match.group("month"))
-        day = int(match.group("day"))
+        title = title_with_close[:-1]
+        if not title or "》" in title:
+            invalid.append(part)
+            continue
+        month_separator = before_title.rfind("月")
+        if month_separator <= 0:
+            invalid.append(part)
+            continue
+        name_and_month = before_title[:month_separator].rstrip()
+        day_text = before_title[month_separator + 1:]
+        month_start = len(name_and_month)
+        while month_start and "0" <= name_and_month[month_start - 1] <= "9":
+            month_start -= 1
+        name = name_and_month[:month_start].rstrip()
+        month_text = name_and_month[month_start:]
+        if (
+            not name
+            or not (1 <= len(month_text) <= 2)
+            or not (1 <= len(day_text) <= 2)
+            or any(not ("0" <= char <= "9") for char in month_text + day_text)
+        ):
+            invalid.append(part)
+            continue
+        month = int(month_text)
+        day = int(day_text)
         try:
             datetime(2000, month, day)
         except ValueError:
             invalid.append(part)
             continue
         entries.append({
-            "name": match.group("name").strip(),
+            "name": name,
             "month": month,
             "day": day,
-            "title": match.group("title").strip(),
+            "title": title.strip(),
         })
     return entries, invalid, raw
 
@@ -3102,8 +3179,23 @@ def _brief_split_unnumbered_body(body: str) -> tuple[str, str, list[str], int]:
     pool = sized or candidates
     return min(pool, key=lambda item: (len(item[2]), -len(item[0])))
 
+def _enforce_brief_structured_limits(parsed: dict) -> None:
+    if not isinstance(parsed, dict):
+        raise ValueError("要讯字段必须使用对象格式")
+    values = []
+    for field in BRIEF_STRUCTURED_TEXT_FIELDS:
+        value = parsed.get(field, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            raise ValueError("要讯字段必须是字符串")
+        values.append(value)
+    _enforce_brief_text_limits("\n".join(values))
+
+
 def _validate_brief(parsed: dict, *, source_context: dict | None = None) -> dict:
     """校验要讯格式合规性，返回 {valid, errors, warnings, metrics}"""
+    _enforce_brief_structured_limits(parsed)
     errors, warnings = [], []
     title = parsed.get("title", "") or ""
     body = parsed.get("body", "") or ""
@@ -3360,14 +3452,46 @@ def _validate_brief(parsed: dict, *, source_context: dict | None = None) -> dict
         "metrics": metrics,
     }
 
-def _validate_brief_text(brief: str, *, source_context: dict | None = None) -> dict:
-    """从原始要讯文本直接校验（先解析再校验）"""
+def _enforce_brief_text_limits(brief: str) -> None:
     if not isinstance(brief, str):
         raise ValueError("要讯文本必须是字符串")
     if len(brief) > MAX_BRIEF_TEXT_CHARS:
         raise ValueError("要讯文本超过 16 KiB 字符限制")
     if any(len(line) > MAX_BRIEF_LINE_CHARS for line in brief.splitlines()):
         raise ValueError("要讯文本单行超过 4 KiB 字符限制")
+
+
+def _brief_public_value_error_message(error: ValueError) -> str:
+    """Map known validation failures to fixed public messages."""
+    message = str(error)
+    if message == "要讯文本必须是字符串":
+        return "要讯文本必须是字符串"
+    if message == "要讯文本超过 16 KiB 字符限制":
+        return "要讯文本超过 16 KiB 字符限制"
+    if message == "要讯文本单行超过 4 KiB 字符限制":
+        return "要讯文本单行超过 4 KiB 字符限制"
+    if message == "要讯字段必须使用对象格式":
+        return "要讯字段必须使用对象格式"
+    if message == "要讯字段必须是字符串":
+        return "要讯字段必须是字符串"
+    if message == "缺少服务器签发的原始素材证据":
+        return "缺少服务器签发的原始素材证据"
+    if message == "原始素材证据格式无效":
+        return "原始素材证据格式无效"
+    if message == "原始素材证据已失效或被修改，请从原文重新生成":
+        return "原始素材证据已失效或被修改，请从原文重新生成"
+    return "请求参数无效"
+
+
+def _brief_value_error_response(error: ValueError):
+    logger.warning("要讯请求校验失败 error_type=%s", type(error).__name__)
+    public_message = _brief_public_value_error_message(error)
+    return jsonify({"error": f"要讯校验未通过: {public_message}"}), 422
+
+
+def _validate_brief_text(brief: str, *, source_context: dict | None = None) -> dict:
+    """从原始要讯文本直接校验（先解析再校验）"""
+    _enforce_brief_text_limits(brief)
     parsed = _parse_brief_text(brief)
     result = _validate_brief(parsed, source_context=source_context)
     result["parsed"] = parsed
@@ -3383,6 +3507,7 @@ def _brief_validation_error_text(validation: dict) -> str:
 
 def _parse_brief_text(brief: str) -> dict:
     """解析AI生成的要讯文本为结构化字段（事件时间/价值点/标题/正文/信息来源/报送人）"""
+    _enforce_brief_text_limits(brief)
     lines = [ln.rstrip() for ln in brief.strip().split("\n")]
     event_time = ""
     value_point = ""
@@ -4355,21 +4480,28 @@ def api_brief_export_docx():
     """将单篇要讯文本导出为docx文件（按素材1-5通用模板排版）"""
     if not DOCX_AVAILABLE:
         return jsonify({"error": "python-docx 未安装，请 pip install python-docx"}), 500
-    data = request.get_json() or {}
-    brief = data.get("brief", "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求正文必须是JSON对象"}), 400
+    raw_brief = data.get("brief", "")
+    try:
+        _enforce_brief_text_limits(raw_brief)
+    except ValueError as error:
+        return _brief_value_error_response(error)
+    brief = raw_brief.strip()
     if not brief:
         return jsonify({"error": "缺少brief文本"}), 400
     try:
         source_context = _brief_open_source_evidence(data.get("source_evidence"))
+        parsed = _parse_brief_text(brief)
+        # 允许前端覆盖字段，但所有结构化值仍经过同一总量和单行门禁。
+        for key in BRIEF_STRUCTURED_TEXT_FIELDS:
+            value = data.get(key)
+            if value:
+                parsed[key] = value
+        validation = _validate_brief(parsed, source_context=source_context)
     except ValueError as error:
-        return jsonify({"error": f"要讯校验未通过: {error}"}), 422
-    parsed = _parse_brief_text(brief)
-    # 允许前端覆盖字段
-    for k in ("event_time", "value_point", "title", "body", "source", "reporter"):
-        v = data.get(k)
-        if v:
-            parsed[k] = v
-    validation = _validate_brief(parsed, source_context=source_context)
+        return _brief_value_error_response(error)
     if validation.get("valid") is not True:
         return jsonify({
             "error": _brief_validation_error_text(validation),
@@ -4397,7 +4529,7 @@ def api_brief_validate():
         source_context = _brief_open_source_evidence(data.get("source_evidence"))
         validation = _validate_brief_text(brief, source_context=source_context)
     except ValueError as error:
-        return jsonify({"error": f"要讯校验未通过: {error}"}), 422
+        return _brief_value_error_response(error)
     public_validation = _public_brief_validation(validation)
     if validation.get("valid") is not True:
         return jsonify({
@@ -4424,10 +4556,14 @@ def api_brief_export_docx_compiled():
         source_evidence = b.get("source_evidence") if isinstance(b, dict) else None
         try:
             source_context = _brief_open_source_evidence(source_evidence)
+            parsed = _parse_brief_text(text)
         except ValueError as error:
-            invalid_items.append({"index": index, "errors": [str(error)]})
+            logger.warning("要讯汇编请求校验失败 error_type=%s", type(error).__name__)
+            invalid_items.append({
+                "index": index,
+                "errors": [_brief_public_value_error_message(error)],
+            })
             continue
-        parsed = _parse_brief_text(text)
         validation = _validate_brief(
             parsed,
             source_context=source_context,
@@ -4687,11 +4823,52 @@ def api_translate():
         return jsonify({"error": "翻译失败", "code": "ai_error"}), 502
 
 
+def _consult_public_value_error_message(error: ValueError) -> str:
+    """Return only enumerated literals; exception text never becomes response data."""
+    message = str(error)
+    if message == "AI API Key 未配置":
+        return "AI API Key 未配置"
+    if message == "云端 AI 凭据尚未在当前设备激活":
+        return "云端 AI 凭据尚未在当前设备激活"
+    if message == "缺少可用证据，请先执行检索或选择证据":
+        return "缺少可用证据，请先执行检索或选择证据"
+    if message == "客户指令超过 4096 字符限制":
+        return "客户指令超过 4096 字符限制"
+    if message == "缺少客户指令":
+        return "缺少客户指令"
+    if message == "无效原文资产状态":
+        return "无效原文资产状态"
+    if message == "缺少 evidence_id，无法归档原文":
+        return "缺少 evidence_id，无法归档原文"
+    if message == "缺少URL，无法归档原文":
+        return "缺少URL，无法归档原文"
+    if message == "抓取结果没有可提取正文":
+        return "抓取结果没有可提取正文"
+    if message == "缺少 evidence_id，无法记录失败":
+        return "缺少 evidence_id，无法记录失败"
+    if message == "报告内容为空":
+        return "报告内容为空"
+    if message == "无效报告版本类型":
+        return "无效报告版本类型"
+    if message == "资料资产不属于当前任务":
+        return "资料资产不属于当前任务"
+    if message == "evidence_ids必须是字符串数组":
+        return "evidence_ids必须是字符串数组"
+    if message == "缺少可用证据":
+        return "缺少可用证据"
+    if message == "unsupported output kind":
+        return "unsupported output kind"
+    if message == "invalid document name":
+        return "invalid document name"
+    return "请求参数无效"
+
+
 def _consult_error_response(e: Exception):
     if isinstance(e, KeyError):
-        return jsonify({"error": str(e).strip("'")}), 404
+        return jsonify({"error": "资源不存在"}), 404
     if isinstance(e, ValueError):
-        return jsonify({"error": str(e)}), 400
+        logger.info("Consulting agent request rejected error_type=%s", type(e).__name__)
+        return jsonify({"error": _consult_public_value_error_message(e)}), 400
     logger.error("Consulting agent error_type=%s", type(e).__name__)
     return jsonify({"error": "防务咨询Agent处理失败"}), 500
 
@@ -5435,17 +5612,20 @@ def api_consult_asset_preview(session_id, asset_id):
     try:
         _session, asset = _consult_get_session_asset(session_id, asset_id)
         payload = asset.get("payload") or {}
-        text = ""
-        try:
-            handle, _text_path = _open_consult_asset(
-                session_id, asset.get("text_path") or ""
-            )
-            with handle:
-                text = handle.read(720001).decode(
-                    "utf-8", errors="replace"
-                )[:180000]
-        except Exception:
-            text = payload.get("text") or payload.get("snippet") or ""
+        placeholder_quarantined = payload.get("placeholder_quarantined") is True
+        text = consulting_agent.SOURCE_ASSET_PLACEHOLDER_TEXT
+        if not placeholder_quarantined:
+            text = ""
+            try:
+                handle, _text_path = _open_consult_asset(
+                    session_id, asset.get("text_path") or ""
+                )
+                with handle:
+                    text = handle.read(720001).decode(
+                        "utf-8", errors="replace"
+                    )[:180000]
+            except Exception:
+                text = payload.get("text") or payload.get("snippet") or ""
         if not text and asset.get("failure_reason"):
             diagnosis = payload.get("diagnosis") or _consult_failure_diagnosis(asset.get("failure_reason") or "")
             text = "\n".join([
@@ -5465,7 +5645,7 @@ def api_consult_asset_preview(session_id, asset_id):
                 break
         file_url = ""
         download_url = ""
-        if asset.get("local_path"):
+        if asset.get("local_path") and not placeholder_quarantined:
             try:
                 _consult_safe_asset_path(session_id, asset.get("local_path") or "")
                 file_url = url_for("api_consult_asset_file", session_id=session_id, asset_id=asset_id)
@@ -5473,7 +5653,11 @@ def api_consult_asset_preview(session_id, asset_id):
             except Exception:
                 file_url = ""
                 download_url = ""
-        is_real_pdf = _consult_asset_is_real_pdf(session_id, asset)
+        is_real_pdf = (
+            False
+            if placeholder_quarantined
+            else _consult_asset_is_real_pdf(session_id, asset)
+        )
         blocked_reader = asset.get("status") in {"needs_user_input", "failed"} and not is_real_pdf
         return jsonify({
             "ok": True,
@@ -5512,6 +5696,10 @@ def api_consult_asset_file(session_id, asset_id):
     handle = None
     try:
         _session, asset = _consult_get_session_asset(session_id, asset_id)
+        if (asset.get("payload") or {}).get("placeholder_quarantined") is True:
+            return jsonify(
+                {"error": "该资产尚无可下载的已核验原文"}
+            ), 409
         handle, path = _open_consult_asset(
             session_id, asset.get("local_path") or ""
         )
@@ -5614,7 +5802,11 @@ def api_consult_session_search(session_id):
             "model": _consult_model_info(),
         })
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"实时搜索请求失败: {e.response.status_code} - {e.response.text[:160]}"}), 502
+        logger.warning(
+            "Consulting agent combined search upstream failure status=%s",
+            getattr(e.response, "status_code", None),
+        )
+        return jsonify({"error": "实时搜索请求失败"}), 502
     except Exception as e:
         return _consult_error_response(e)
 
@@ -5701,7 +5893,11 @@ def api_consult_session_web_search(session_id):
             "model": _consult_model_info(),
         })
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"联网搜索请求失败: {e.response.status_code} - {e.response.text[:160]}"}), 502
+        logger.warning(
+            "Consulting agent web search upstream failure status=%s",
+            getattr(e.response, "status_code", None),
+        )
+        return jsonify({"error": "联网搜索请求失败"}), 502
     except Exception as e:
         return _consult_error_response(e)
 
@@ -5725,16 +5921,6 @@ def _consult_doc_from_payload(ev: dict) -> dict | None:
     }
 
 
-def _consult_restricted_reason(reason: str) -> bool:
-    text = (reason or "").lower()
-    markers = (
-        "403", "401", "forbidden", "unauthorized", "login", "log in", "sign in",
-        "captcha", "paywall", "subscription", "permission", "access denied",
-        "验证码", "登录", "付费", "订阅", "权限", "无权访问", "访问受限",
-    )
-    return any(marker in text for marker in markers)
-
-
 def _consult_failure_diagnosis(reason: str) -> dict:
     text = (reason or "").lower()
     table = [
@@ -5752,13 +5938,14 @@ def _consult_failure_diagnosis(reason: str) -> dict:
     return {"code": "unknown", "label": "抓取失败，原因待复核", "advice": "可继续补抓、打开来源确认，或上传可访问原文"}
 
 
+def _consult_safe_exception(exc: Exception) -> tuple[str, dict]:
+    """Classify an internal fetch exception without returning its text to clients."""
+    diagnosis = _consult_failure_diagnosis(str(exc)[:1000])
+    return diagnosis["label"], diagnosis
+
+
 def _consult_stop_reason_label(reason: str) -> str:
-    mapping = {
-        "target_reached": "已达到客户目标数量",
-        "max_rounds_reached": "已完成本轮最大搜索轮次，仍有缺口",
-        "no_queries": "没有可执行搜索式",
-    }
-    return mapping.get(reason or "", reason or "")
+    return consulting_agent.capture_stop_reason_label(reason)
 
 
 def _consult_source_quality_radar(ev: dict, doc: dict, word_count: int) -> dict:
@@ -5904,9 +6091,13 @@ def _consult_archive_one(session_id: str, ev: dict, allow_browser_render: bool =
                     raise
         doc["url"] = doc.get("url") or url
     except Exception as exc:
-        reason = str(exc)[:180]
-        diagnosis = _consult_failure_diagnosis(reason)
-        if _consult_restricted_reason(reason):
+        reason, diagnosis = _consult_safe_exception(exc)
+        logger.warning(
+            "来源归档失败 (%s, %s)",
+            diagnosis["code"],
+            type(exc).__name__,
+        )
+        if diagnosis["code"] in {"blocked", "needs_user_input"}:
             doc = _consult_needs_user_doc(ev, reason)
             asset = consulting_agent.archive_source_asset(
                 session_id,
@@ -5979,8 +6170,12 @@ def _consult_archive_many(session_id: str, evidence: list[dict], allow_browser_r
             try:
                 results.append(future.result())
             except Exception as exc:
-                reason = str(exc)[:180]
-                diagnosis = _consult_failure_diagnosis(reason)
+                reason, diagnosis = _consult_safe_exception(exc)
+                logger.warning(
+                    "并发来源归档失败 (%s, %s)",
+                    diagnosis["code"],
+                    type(exc).__name__,
+                )
                 asset = consulting_agent.record_source_asset_failure(
                     session_id, ev, reason, ev.get("url"), failure_code=diagnosis["code"], diagnosis=diagnosis
                 )
@@ -6156,10 +6351,16 @@ def _run_consult_capture_job(session_id: str, job_id: str):
             counts=final_counts,
         )
     except Exception as exc:
+        reason, diagnosis = _consult_safe_exception(exc)
+        logger.warning(
+            "采集任务失败 (%s, %s)",
+            diagnosis["code"],
+            type(exc).__name__,
+        )
         consulting_agent.update_capture_job(
             job_id,
             status="failed",
-            stop_reason=str(exc)[:240],
+            stop_reason=reason,
             counts=_consult_capture_counts(session_id, target, rejected_total),
         )
 
@@ -6419,13 +6620,78 @@ def api_consult_session_revise(session_id):
         return _consult_error_response(e)
 
 
+def _agent_public_key_error_message(error: KeyError) -> str:
+    """Map expected report resource misses to fixed public literals."""
+    if error.args == ("项目不存在",):
+        return "项目不存在"
+    if error.args == ("草稿不存在",):
+        return "草稿不存在"
+    if error.args == ("草稿任务不存在",):
+        return "草稿任务不存在"
+    if error.args == ("证据不存在或不属于当前项目",):
+        return "证据不存在或不属于当前项目"
+    return "报告资源不存在"
+
+
+def _agent_public_value_error_message(error: ValueError) -> str:
+    """Return only enumerated report validation messages, never exception text."""
+    message = (
+        error.args[0]
+        if len(error.args) == 1 and isinstance(error.args[0], str)
+        else ""
+    )
+    if message == "项目标题过长":
+        return "项目标题过长"
+    if message == "研究主题过长":
+        return "研究主题过长"
+    if message == "客户需求超过 4096 字符限制":
+        return "客户需求超过 4096 字符限制"
+    if message == "无效报告类型":
+        return "无效报告类型"
+    if message == "缺少项目标题或客户需求":
+        return "缺少项目标题或客户需求"
+    if message == "无效草稿类型":
+        return "无效草稿类型"
+    if message == "草稿内容为空":
+        return "草稿内容为空"
+    if message == "报告文本超过 2 MiB 字符限制":
+        return "报告文本超过 2 MiB 字符限制"
+    if message == "报告文本单行超过 32 KiB 字符限制":
+        return "报告文本单行超过 32 KiB 字符限制"
+    if message == "evidence_ids必须是字符串数组":
+        return "evidence_ids必须是字符串数组"
+    if message == "缺少可用证据":
+        return "缺少可用证据"
+    if message == "draft_id必须是字符串":
+        return "draft_id必须是字符串"
+    if message == "草稿不属于当前项目":
+        return "草稿不属于当前项目"
+    if message == "content必须是字符串":
+        return "content必须是字符串"
+    if message == "报告仍包含禁止使用的涉密等级字眼，已阻断导出":
+        return "报告仍包含禁止使用的涉密等级字眼，已阻断导出"
+    if message.startswith("当前正文约") and "低于目标字数" in message:
+        return "当前正文低于目标字数要求，请继续生成或扩写后再导出"
+    if (
+        message.startswith("机构开源情报整编包交付预检未通过：")
+        and "证据数量为0条" in message
+    ):
+        return "机构开源情报整编包交付预检未通过：证据数量为0条"
+    if message.startswith("机构开源情报整编包交付预检未通过："):
+        return "机构开源情报整编包交付预检未通过"
+    return "请求参数无效"
+
+
 def _agent_error_response(e: Exception):
     if isinstance(e, KeyError):
-        return jsonify({"error": str(e).strip("'")}), 404
+        logger.info("Report agent resource not found error_type=%s", type(e).__name__)
+        return jsonify({"error": _agent_public_key_error_message(e)}), 404
     if isinstance(e, ValueError):
-        return jsonify({"error": str(e)}), 400
+        logger.info("Report agent request rejected error_type=%s", type(e).__name__)
+        return jsonify({"error": _agent_public_value_error_message(e)}), 400
     logger.error("Report agent error_type=%s", type(e).__name__)
     return jsonify({"error": "报告Agent处理失败"}), 500
+
 
 def _agent_selected_evidence(project_id: str, data: dict, allow_empty: bool = False) -> list[dict]:
     if "evidence_ids" not in data:

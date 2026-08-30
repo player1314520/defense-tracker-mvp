@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import ast
 import base64
+import gc
 import hashlib
 import json
 import os
 import re
+import sqlite3
+import stat
 import time
 from pathlib import Path
 
@@ -78,6 +81,307 @@ def _event():
 
 def _auth():
     return {"Authorization": f"Bearer {'x' * 48}"}
+
+
+def test_cloud_store_rejects_traversal_in_database_path(tmp_path):
+    from v9_cloud import CloudStore
+
+    with pytest.raises(ValueError, match="must not contain parent traversal"):
+        CloudStore(tmp_path / "nested" / ".." / "cloud.sqlite3")
+
+
+def test_cloud_store_rejects_symlinked_database_parent(tmp_path):
+    from v9_cloud import CloudStore
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    try:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are unavailable on this host")
+
+    with pytest.raises(ValueError, match="symbolic link or reparse point"):
+        CloudStore(linked_parent / "cloud.sqlite3")
+
+
+def test_cloud_store_rejects_symlinked_database_file(tmp_path):
+    from v9_cloud import CloudStore
+
+    target = tmp_path / "target.sqlite3"
+    target.write_bytes(b"")
+    linked_database = tmp_path / "linked.sqlite3"
+    try:
+        linked_database.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("file symlinks are unavailable on this host")
+
+    with pytest.raises(ValueError, match="symbolic link or reparse point"):
+        CloudStore(linked_database)
+
+
+def test_cloud_store_hardens_directory_and_database_permissions(tmp_path):
+    from v9_cloud import CloudStore
+
+    database_parent = tmp_path / "private-store"
+    database_path = database_parent / "cloud.sqlite3"
+    CloudStore(database_path)
+
+    assert database_parent.is_dir()
+    assert stat.S_ISREG(database_path.stat().st_mode)
+    if os.name != "nt":
+        assert stat.S_IMODE(database_parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(database_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-mode policy")
+def test_cloud_store_rejects_shared_parent_without_rechmodding_it(tmp_path):
+    from v9_cloud import CloudStore
+
+    shared_parent = tmp_path / "shared-store"
+    shared_parent.mkdir(mode=0o755)
+    shared_parent.chmod(0o755)
+
+    with pytest.raises(ValueError, match="private"):
+        CloudStore(shared_parent / "cloud.sqlite3")
+
+    assert stat.S_IMODE(shared_parent.stat().st_mode) == 0o755
+
+
+def test_cloud_store_rejects_hard_linked_database_file(tmp_path):
+    from v9_cloud import CloudStore
+
+    target = tmp_path / "target.sqlite3"
+    target.write_bytes(b"")
+    linked_database = tmp_path / "linked.sqlite3"
+    try:
+        os.link(target, linked_database)
+    except OSError:
+        pytest.skip("hard links are unavailable on this host")
+
+    with pytest.raises(ValueError, match="hard links"):
+        CloudStore(linked_database)
+
+
+def test_cloud_store_rejects_database_file_replaced_after_initialization(tmp_path):
+    from v9_cloud import CloudStore
+
+    database = tmp_path / "cloud.sqlite3"
+    store = CloudStore(database)
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement.write_bytes(b"")
+    gc.collect()
+    os.replace(replacement, database)
+
+    with pytest.raises(ValueError, match="replaced after initialization"):
+        store._connect()
+
+
+def test_cloud_app_rejects_environment_database_path_outside_fixed_volume(
+    tmp_path, monkeypatch
+):
+    from v9_cloud import create_app
+
+    injected = tmp_path / "injected" / "cloud.sqlite3"
+    monkeypatch.setenv("V9_CLOUD_DB_PATH", str(injected))
+
+    with pytest.raises(ValueError, match="fixed deployment path"):
+        create_app()
+
+    assert not injected.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "configured",
+    ["/data/v9-cloud.sqlite3", "/data/portal.sqlite3"],
+)
+def test_cloud_database_env_selects_preconstructed_allowlisted_path(
+    configured, monkeypatch
+):
+    import v9_cloud
+
+    monkeypatch.setenv("V9_CLOUD_DB_PATH", configured)
+
+    selected = v9_cloud._cloud_database_path(None, production_mode=True)
+
+    assert selected is v9_cloud._DEPLOYMENT_DATABASE_PATHS[configured]
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "/data/../data/v9-cloud.sqlite3",
+        "/data//v9-cloud.sqlite3",
+        "/data/v9-cloud.sqlite3 ",
+        "/data/v9-cloud.sqlite3/../portal.sqlite3",
+    ],
+)
+def test_cloud_database_env_rejects_nonexact_allowlist_variants(
+    configured, monkeypatch
+):
+    import v9_cloud
+
+    monkeypatch.setenv("V9_CLOUD_DB_PATH", configured)
+
+    with pytest.raises(ValueError, match="fixed deployment path"):
+        v9_cloud._cloud_database_path(None, production_mode=True)
+
+
+def test_development_database_path_preserves_the_only_legacy_database(
+    tmp_path, monkeypatch
+):
+    import v9_cloud
+
+    legacy = tmp_path / "defense-tracker-v9-cloud.sqlite3"
+    legacy.write_bytes(b"legacy database bytes")
+    monkeypatch.setattr(v9_cloud.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    assert v9_cloud._cloud_database_path(None, production_mode=False) == legacy
+
+
+def test_development_database_path_rejects_divergent_legacy_and_hardened_files(
+    tmp_path, monkeypatch
+):
+    import v9_cloud
+
+    legacy = tmp_path / "defense-tracker-v9-cloud.sqlite3"
+    hardened = tmp_path / "defense-tracker-v9-cloud" / "cloud.sqlite3"
+    hardened.parent.mkdir()
+    legacy.write_bytes(b"legacy database bytes")
+    hardened.write_bytes(b"different database bytes")
+    monkeypatch.setattr(v9_cloud.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with pytest.raises(ValueError, match="both exist"):
+        v9_cloud._cloud_database_path(None, production_mode=False)
+
+
+def test_development_database_path_rejects_identical_legacy_and_hardened_files(
+    tmp_path, monkeypatch
+):
+    import v9_cloud
+
+    legacy = tmp_path / "defense-tracker-v9-cloud.sqlite3"
+    hardened = tmp_path / "defense-tracker-v9-cloud" / "cloud.sqlite3"
+    hardened.parent.mkdir()
+    legacy.write_bytes(b"same database bytes")
+    hardened.write_bytes(legacy.read_bytes())
+    monkeypatch.setattr(v9_cloud.tempfile, "gettempdir", lambda: str(tmp_path))
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (legacy, hardened)
+    }
+
+    with pytest.raises(ValueError, match="both exist"):
+        v9_cloud._cloud_database_path(None, production_mode=False)
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (legacy, hardened)
+    } == before
+
+
+def test_development_database_path_rejects_committed_legacy_wal_divergence(
+    tmp_path, monkeypatch
+):
+    import v9_cloud
+
+    legacy = tmp_path / "defense-tracker-v9-cloud.sqlite3"
+    hardened = tmp_path / "defense-tracker-v9-cloud" / "cloud.sqlite3"
+    hardened.parent.mkdir()
+    connection = sqlite3.connect(legacy)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE continuity(value TEXT NOT NULL)")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        hardened.write_bytes(legacy.read_bytes())
+        connection.execute(
+            "INSERT INTO continuity(value) VALUES (?)",
+            ("committed-only-in-wal",),
+        )
+        connection.commit()
+
+        wal_path = Path(f"{legacy}-wal")
+        assert wal_path.stat().st_size > 0
+        assert legacy.read_bytes() == hardened.read_bytes()
+        monkeypatch.setattr(v9_cloud.tempfile, "gettempdir", lambda: str(tmp_path))
+
+        with pytest.raises(ValueError, match="both exist"):
+            v9_cloud._cloud_database_path(None, production_mode=False)
+
+        row = connection.execute("SELECT value FROM continuity").fetchone()
+        assert row == ("committed-only-in-wal",)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal", "-mj000001"])
+def test_development_database_path_rejects_orphaned_other_candidate_sidecar(
+    tmp_path, monkeypatch, suffix
+):
+    import v9_cloud
+
+    legacy = tmp_path / "defense-tracker-v9-cloud.sqlite3"
+    legacy.write_bytes(b"legacy database bytes")
+    hardened = tmp_path / "defense-tracker-v9-cloud" / "cloud.sqlite3"
+    hardened.parent.mkdir()
+    Path(f"{hardened}{suffix}").write_bytes(b"unresolved sidecar bytes")
+    monkeypatch.setattr(v9_cloud.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with pytest.raises(ValueError, match="orphaned hardened database sidecar"):
+        v9_cloud._cloud_database_path(None, production_mode=False)
+
+
+@pytest.mark.parametrize("candidate_name", ["legacy", "hardened"])
+def test_development_database_path_preserves_only_candidate_with_wal(
+    tmp_path, monkeypatch, candidate_name
+):
+    import v9_cloud
+
+    legacy = tmp_path / "defense-tracker-v9-cloud.sqlite3"
+    hardened = tmp_path / "defense-tracker-v9-cloud" / "cloud.sqlite3"
+    selected = legacy if candidate_name == "legacy" else hardened
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(selected)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE continuity(value TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO continuity(value) VALUES (?)", ("committed-in-wal",)
+        )
+        connection.commit()
+        assert Path(f"{selected}-wal").stat().st_size > 0
+        monkeypatch.setattr(v9_cloud.tempfile, "gettempdir", lambda: str(tmp_path))
+
+        assert v9_cloud._cloud_database_path(None, production_mode=False) == selected
+        assert connection.execute("SELECT value FROM continuity").fetchone() == (
+            "committed-in-wal",
+        )
+    finally:
+        connection.close()
+
+
+def test_development_database_path_survives_write_and_restart(
+    tmp_path, monkeypatch
+):
+    import v9_cloud
+
+    legacy = tmp_path / "defense-tracker-v9-cloud.sqlite3"
+    with sqlite3.connect(legacy) as connection:
+        connection.execute("CREATE TABLE continuity(value TEXT NOT NULL)")
+    monkeypatch.setattr(v9_cloud.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    selected = v9_cloud._cloud_database_path(None, production_mode=False)
+    with sqlite3.connect(selected) as connection:
+        connection.execute(
+            "INSERT INTO continuity(value) VALUES (?)", ("after-selection",)
+        )
+
+    restarted = v9_cloud._cloud_database_path(None, production_mode=False)
+    assert restarted == selected == legacy
+    with sqlite3.connect(restarted) as connection:
+        assert connection.execute("SELECT value FROM continuity").fetchall() == [
+            ("after-selection",)
+        ]
 
 
 def _feishu_payload(text: str, event_id: str) -> dict:
@@ -554,6 +858,7 @@ def test_cloud_deployment_allowlist_excludes_full_text_runtime():
     )
     assert "--require-hashes" in dockerfile
     assert "--only-binary=:all:" in dockerfile
+    assert "chmod 0700 /data" in dockerfile
     for forbidden in (
         "AI_API_KEY",
         "python-docx",
@@ -575,6 +880,19 @@ def test_cloud_deployment_allowlist_excludes_full_text_runtime():
         "FEISHU_DEDUPE_DB: /data/feishu-event-dedupe.sqlite3",
     ):
         assert required in staging
+
+
+def test_full_stack_server_pins_lxml_with_the_xxe_default_fix():
+    root = Path(__file__).resolve().parents[1]
+    input_text = (root / "deploy/requirements.server.in").read_text(
+        encoding="utf-8"
+    )
+    lock_text = (root / "deploy/requirements.server.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert re.search(r"(?m)^lxml==6\.1\.2$", input_text)
+    assert re.search(r"(?m)^lxml==6\.1\.2 \\$", lock_text)
 
 
 def test_full_stack_server_uses_a_reproducible_hash_lock():
