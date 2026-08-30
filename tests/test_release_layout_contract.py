@@ -67,6 +67,7 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
         encoding="utf-8"
     )
     launcher = (ROOT / "launcher.py").read_text(encoding="utf-8")
+    smoke_probe = (ROOT / "v9" / "desktop_smoke.py").read_text(encoding="utf-8")
     smoke_function = builder[
         builder.index("function Invoke-DesktopSmokeTest") : builder.index(
             "function Invoke-InstallerLifecycleSmokeTest"
@@ -99,8 +100,13 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert finalizer_installer_smoke_function.count("-WindowStyle Hidden") == 2
     assert "/VERYSILENT" in installer_smoke_function
     assert "/VERYSILENT" in finalizer_installer_smoke_function
-    assert "document.querySelector('main.v9-workspace')" in launcher
-    assert "payload.build_commit" in launcher
+    assert "document.querySelector('main.v9-workspace')" in smoke_probe
+    assert "payload.build_commit" in smoke_probe
+    assert "window.evaluate_js" not in launcher + smoke_probe
+    assert "window.run_js" in smoke_probe
+    assert "window.expose" not in smoke_probe
+    assert "window.state += receive_desktop_smoke_state" in smoke_probe
+    assert "window.pywebview.state.desktopSmokeEvidence" in smoke_probe
     assert "Invoke-InstallerLifecycleSmokeTest" in builder
     assert "Silent uninstall left the installed application executable behind" in builder
     assert "Invoke-DesktopSmokeTest $portableExe" in builder

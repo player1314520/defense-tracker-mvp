@@ -2,7 +2,6 @@
 防务数据追踪系统 V9 — 桌面应用启动器
 使用 PyWebView 创建原生桌面窗口（无浏览器地址栏）
 """
-import json
 import sys, os, threading, time, socket
 from pathlib import Path
 
@@ -27,7 +26,8 @@ else:
 
 os.chdir(BASE_DIR)
 
-from product_version import PRODUCT_VERSION
+from product_version import PRODUCT_VERSION, current_build_commit
+from v9.desktop_smoke import start_desktop_smoke_probe as run_desktop_smoke_probe
 
 # ── 可写运行目录（程序目录始终只读）──────────────────────────
 from state import RUNTIME_LAYOUT, ensure_runtime_layout, migrate_legacy_runtime
@@ -99,59 +99,14 @@ def _start_desktop_smoke_probe(window):
     evidence_path = _desktop_smoke_evidence_path()
     if evidence_path is None:
         return
-
-    script = """
-    (async function () {
-      const response = await fetch('/api/status', {
-        credentials: 'same-origin', cache: 'no-store'
-      });
-      let payload = {};
-      try { payload = await response.json(); } catch (_) {}
-      return {
-        schema: 1,
-        http_status: response.status,
-        pathname: window.location.pathname,
-        workspace_ready: Boolean(document.querySelector('main.v9-workspace')),
-        version: payload.version || '',
-        display_version: payload.display_version || '',
-        release_tag: payload.release_tag || '',
-        build_commit: payload.build_commit || ''
-      };
-    })()
-    """
-
-    def _probe():
-        deadline = time.time() + 45
-        while time.time() < deadline:
-            completed = threading.Event()
-            result_box = {}
-
-            def _receive(result):
-                result_box["value"] = result
-                completed.set()
-
-            try:
-                window.evaluate_js(script, callback=_receive)
-                completed.wait(3)
-                result = result_box.get("value")
-                if (
-                    isinstance(result, dict)
-                    and result.get("http_status") == 200
-                    and result.get("pathname") == "/"
-                    and result.get("workspace_ready") is True
-                ):
-                    temporary = evidence_path.with_suffix(evidence_path.suffix + ".tmp")
-                    temporary.write_text(
-                        json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n",
-                        encoding="utf-8",
-                    )
-                    os.replace(temporary, evidence_path)
-                    return
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-    threading.Thread(target=_probe, daemon=True).start()
+    run_desktop_smoke_probe(
+        window,
+        evidence_path=evidence_path,
+        expected_version=PRODUCT_VERSION.semantic_version,
+        expected_display_version=PRODUCT_VERSION.display_version,
+        expected_release_tag=PRODUCT_VERSION.release_tag,
+        expected_build_commit=current_build_commit(),
+    )
 
 # ── 加载页（Flask 就绪前显示）────────────────────────────────
 LOADING_HTML = """<!DOCTYPE html>
