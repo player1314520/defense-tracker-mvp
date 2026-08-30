@@ -286,6 +286,25 @@ function Assert-ReleasePolicyPinCardinality {
     }
 }
 
+function ConvertFrom-ReleasePolicyUtf8Json {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    try {
+        $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $text = $utf8.GetString([byte[]]$Bytes)
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xfeff) {
+            throw 'UTF-8 BOM is not allowed.'
+        }
+        return (ConvertFrom-Json -InputObject $text -ErrorAction Stop)
+    } catch {
+        throw "$Description is not valid UTF-8 JSON."
+    }
+}
+
 function Get-ReleasePublisherPolicy {
     [CmdletBinding()]
     param(
@@ -307,12 +326,7 @@ function Get-ReleasePublisherPolicy {
         throw 'Committed Publisher policy size is invalid.'
     }
     $policyBytes = [System.IO.File]::ReadAllBytes($fullPath)
-    try {
-        $document = [System.Text.Encoding]::UTF8.GetString($policyBytes) |
-            ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        throw 'Committed Publisher policy is not valid UTF-8 JSON.'
-    }
+    $document = ConvertFrom-ReleasePolicyUtf8Json $policyBytes 'Committed Publisher policy'
     Assert-ExactJsonProperties $document @(
         '$schema','schema_version','status','publisher','active_provider','providers'
     ) 'Publisher policy'
@@ -455,12 +469,8 @@ function Get-ReleasePublisherPolicy {
                 throw 'Azure Artifact Signing metadata file is missing or oversized.'
             }
             $metadataBytes = [System.IO.File]::ReadAllBytes($metadataFull)
-            try {
-                $metadata = [System.Text.Encoding]::UTF8.GetString($metadataBytes) |
-                    ConvertFrom-Json -ErrorAction Stop
-            } catch {
-                throw 'Azure Artifact Signing metadata is not valid UTF-8 JSON.'
-            }
+            $metadata = ConvertFrom-ReleasePolicyUtf8Json $metadataBytes `
+                'Azure Artifact Signing metadata'
             Assert-ExactJsonProperties $metadata @(
                 'Endpoint','CodeSigningAccountName','CertificateProfileName','CorrelationId'
             ) 'Azure Artifact Signing metadata'

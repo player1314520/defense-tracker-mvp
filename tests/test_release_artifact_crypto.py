@@ -474,21 +474,29 @@ def test_protect_rejects_reparse_point_in_plaintext_tree(tmp_path: Path):
     target.mkdir()
     (target / "outside.txt").write_text("outside", encoding="utf-8")
     link = plaintext / "linked-directory"
-    junction_command = (
-        "$ErrorActionPreference='Stop';"
-        f"New-Item -ItemType Junction -Path '{str(link).replace(chr(39), chr(39) * 2)}' "
-        f"-Target '{str(target).replace(chr(39), chr(39) * 2)}' | Out-Null"
-    )
-    junction = subprocess.run(
-        [_powershell(), "-NoProfile", "-Command", junction_command],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if junction.returncode != 0:
-        pytest.skip("directory junction creation unavailable")
+    if os.name == "nt":
+        junction_command = (
+            "$ErrorActionPreference='Stop';"
+            f"New-Item -ItemType Junction -Path "
+            f"'{str(link).replace(chr(39), chr(39) * 2)}' "
+            f"-Target '{str(target).replace(chr(39), chr(39) * 2)}' | Out-Null"
+        )
+        junction = subprocess.run(
+            [_powershell(), "-NoProfile", "-Command", junction_command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if junction.returncode != 0:
+            pytest.skip("directory junction creation unavailable")
+    else:
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlink creation unavailable: {error}")
+        assert link.is_symlink()
     envelope = tmp_path / "envelope"
 
     result = _run(
@@ -521,7 +529,10 @@ def test_protect_rejects_reparse_point_in_plaintext_tree(tmp_path: Path):
     assert result.returncode != 0
     assert "reparse point" in (result.stdout + result.stderr)
     assert not envelope.exists()
-    link.rmdir()
+    if link.is_symlink():
+        link.unlink()
+    else:
+        link.rmdir()
 
 
 def test_transport_source_never_generates_or_embeds_a_private_identity():

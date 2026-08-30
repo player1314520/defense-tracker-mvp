@@ -37,6 +37,16 @@ function Assert-ReleaseArtifactPlainValue {
     }
 }
 
+function Test-ReleaseArtifactFilesystemLink {
+    param([Parameter(Mandatory = $true)]$Item)
+    if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return $true
+    }
+    $linkType = $Item.PSObject.Properties['LinkType']
+    return $null -ne $linkType -and
+        -not [string]::IsNullOrWhiteSpace([string]$linkType.Value)
+}
+
 function Assert-ReleaseArtifactNoReparsePath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -48,7 +58,7 @@ function Assert-ReleaseArtifactNoReparsePath {
     while (-not [string]::IsNullOrWhiteSpace($cursor)) {
         if (Test-Path -LiteralPath $cursor) {
             $item = Get-Item -LiteralPath $cursor -Force
-            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            if (Test-ReleaseArtifactFilesystemLink $item) {
                 throw 'Release artifact paths must not contain a reparse point.'
             }
         } elseif (-not ($AllowMissingLeaf -and $isLeaf)) {
@@ -108,7 +118,7 @@ function Get-ReleaseArtifactSafeFiles {
     while ($pending.Count -gt 0) {
         $directory = $pending.Pop()
         foreach ($item in @(Get-ChildItem -LiteralPath $directory -Force)) {
-            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            if (Test-ReleaseArtifactFilesystemLink $item) {
                 throw 'PlaintextRoot contains a forbidden reparse point.'
             }
             if ($item.PSIsContainer) {
@@ -311,7 +321,7 @@ function Assert-ReleaseArtifactEnvelopeLayout {
     }
     $items = @(Get-ChildItem -LiteralPath $root -Force)
     foreach ($item in $items) {
-        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.PSIsContainer) {
+        if ((Test-ReleaseArtifactFilesystemLink $item) -or $item.PSIsContainer) {
             throw 'Transport envelope contains a directory, reparse point, or unsupported object.'
         }
     }

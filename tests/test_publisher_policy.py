@@ -104,6 +104,22 @@ def test_pending_policy_fails_closed_before_provider_configuration_is_used():
     assert "pending" in (result.stderr + result.stdout).lower()
 
 
+@pytest.mark.parametrize("prefix", [b"\xef\xbb\xbf", b"\xff"])
+def test_policy_parser_rejects_bom_and_invalid_utf8(tmp_path: Path, prefix: bytes):
+    policy_path = tmp_path / "invalid-policy.json"
+    policy_path.write_bytes(prefix + POLICY_PATH.read_bytes())
+    command = (
+        ". .\\scripts\\ReleaseCertificatePolicy.ps1; "
+        f"Get-ReleasePublisherPolicy -Path '{policy_path}' "
+        "-SigningProvider AzureArtifactSigning"
+    )
+
+    result = _run_powershell(command)
+
+    assert result.returncode != 0
+    assert "not valid utf-8 json" in (result.stderr + result.stdout).lower()
+
+
 def test_azure_policy_binds_exact_account_profile_and_endpoint_metadata(tmp_path: Path):
     policy = {
         "$schema": "./publisher-policy.schema.json",
