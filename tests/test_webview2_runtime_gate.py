@@ -59,6 +59,7 @@ def test_unsigned_candidate_installs_verified_runtime_before_building():
         "original_filename",
         "WebView2 Runtime was not registered",
         "[System.Version]'86.0.622.0'",
+        "'^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'",
         "[System.Version]::TryParse",
         "$parsedVersion -ge $minimumRuntimeVersion",
     ):

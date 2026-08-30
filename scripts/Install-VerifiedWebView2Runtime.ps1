@@ -17,7 +17,8 @@ function Get-WebView2RuntimeVersion {
         if (-not (Test-Path -LiteralPath $key)) { continue }
         $version = [string](Get-ItemPropertyValue -LiteralPath $key -Name 'pv' -ErrorAction SilentlyContinue)
         $parsedVersion = $null
-        if ([System.Version]::TryParse($version, [ref]$parsedVersion) -and
+        if ($version -cmatch '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' -and
+            [System.Version]::TryParse($version, [ref]$parsedVersion) -and
             $parsedVersion -ge $minimumRuntimeVersion) {
             return $parsedVersion.ToString()
         }
