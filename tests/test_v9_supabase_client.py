@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -526,6 +527,57 @@ def test_session_manager_owns_pkce_verifier_and_rejects_unregistered_callback(
             "member@example.test",
             "http://localhost:49231/api/v9/auth/callback",
         )
+
+
+def test_email_validation_is_linear_and_preserves_254_character_boundary(
+    tmp_path,
+):
+    import v9.supabase_client as supabase_client
+
+    assert "re.fullmatch" not in inspect.getsource(
+        supabase_client.SupabaseSessionManager.start_email_login
+    )
+
+    class Client:
+        def __init__(self):
+            self.emails = []
+
+        def send_magic_link(self, email, _redirect_uri, _challenge):
+            self.emails.append(email)
+
+    callback = "http://127.0.0.1:49231/api/v9/auth/callback"
+    client = Client()
+    manager = supabase_client.SupabaseSessionManager(
+        supabase_client.SupabaseSettings.load(_settings_file(tmp_path)),
+        supabase_client.SessionVault(
+            tmp_path / "linear-email-vault",
+            protector=_ReversingProtector(),
+        ),
+        client,
+    )
+    longest_valid = "a" * 241 + "@example.test"
+
+    assert len(longest_valid) == 254
+    assert manager.start_email_login(longest_valid.upper(), callback) == {
+        "sent": True
+    }
+    assert client.emails == [longest_valid]
+
+    invalid = [
+        "a" * 242 + "@example.test",
+        "missing-at.example.test",
+        "@example.test",
+        "member@localhost",
+        "member@.test",
+        "member@example.",
+        "member@@example.test",
+        "member @example.test",
+    ]
+    for email in invalid:
+        with pytest.raises(ValueError, match="valid invited email"):
+            manager.start_email_login(email, callback)
+
+    assert client.emails == [longest_valid]
 
 
 def test_pkce_login_survives_invitation_rpc_failure_with_explicit_retry_status(

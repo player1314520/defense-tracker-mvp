@@ -6164,11 +6164,29 @@ def _consult_archive_one(session_id: str, ev: dict, allow_browser_render: bool =
         diagnosis = _consult_failure_diagnosis(reason)
         consulting_agent.record_source_asset_failure(session_id, ev, reason, url, failure_code=diagnosis["code"], diagnosis=diagnosis)
         return None, None, {"evidence_id": ev.get("evidence_id"), "title": ev.get("title"), "url": url, "reason": reason, "diagnosis": diagnosis}
-    safe, reason = _is_ssrf_safe(url)
+    safe, _internal_reason = _is_ssrf_safe(url)
     if not safe:
-        diagnosis = _consult_failure_diagnosis(reason or "访问受限")
-        consulting_agent.record_source_asset_failure(session_id, ev, reason, url, failure_code=diagnosis["code"], diagnosis=diagnosis)
-        return None, None, {"evidence_id": ev.get("evidence_id"), "title": ev.get("title"), "url": url, "reason": reason, "diagnosis": diagnosis}
+        reason = "站点拒绝访问或需要授权"
+        diagnosis = {
+            "code": "blocked",
+            "label": reason,
+            "advice": "可上传已授权原文，或改用公开镜像/机构PDF页",
+        }
+        consulting_agent.record_source_asset_failure(
+            session_id,
+            ev,
+            reason,
+            url,
+            failure_code=diagnosis["code"],
+            diagnosis=diagnosis,
+        )
+        return None, None, {
+            "evidence_id": ev.get("evidence_id"),
+            "title": ev.get("title"),
+            "url": url,
+            "reason": reason,
+            "diagnosis": diagnosis,
+        }
     try:
         doc = _consult_doc_from_payload(ev)
         if doc:
@@ -7503,9 +7521,9 @@ def api_brief_import_url():
     if not url:
         return jsonify({"error": "请输入URL地址"}), 400
     # SSRF检查
-    safe, reason = _is_ssrf_safe(url)
+    safe, _reason = _is_ssrf_safe(url)
     if not safe:
-        return jsonify({"error": f"URL不安全: {reason}"}), 400
+        return jsonify({"error": "URL不安全，已拒绝访问"}), 400
     if not _ai_is_enabled():
         return jsonify({"error": "AI API Key 未配置，请先在AI标签页配置"}), 400
     try:

@@ -122,13 +122,45 @@ def require_report_text_bounds(value: str) -> str:
     return text
 
 
+def _drop_character_run_before(text: str, removable, followers: str) -> str:
+    """Drop a removable run only when the next character is in followers."""
+    output: list[str] = []
+    pending: list[str] = []
+    for char in text:
+        if removable(char):
+            pending.append(char)
+            continue
+        if char not in followers:
+            output.extend(pending)
+        pending.clear()
+        output.append(char)
+    output.extend(pending)
+    return "".join(output)
+
+
+def _drop_whitespace_after(text: str, leaders: str) -> str:
+    """Drop whitespace immediately following one of the leader characters."""
+    output: list[str] = []
+    after_leader = False
+    for char in text:
+        if after_leader and char.isspace():
+            continue
+        output.append(char)
+        after_leader = char in leaders
+    return "".join(output)
+
+
 def sanitize_report_text(value: str) -> str:
     text = require_report_text_bounds(value)
     for term in FORBIDDEN_CLASSIFICATION_TERMS:
         text = text.replace(term, "")
-    text = re.sub(r"[ \t]+([，。；：、,.!?！？])", r"\1", text)
-    text = re.sub(r"([（(])\s+", r"\1", text)
-    text = re.sub(r"\s+([）)])", r"\1", text)
+    text = _drop_character_run_before(
+        text,
+        lambda char: char in " \t",
+        "，。；：、,.!?！？",
+    )
+    text = _drop_whitespace_after(text, "（(")
+    text = _drop_character_run_before(text, str.isspace, "）)")
     return text.strip()
 
 
@@ -245,12 +277,48 @@ def _evidence_has_citable_original(evidence: dict) -> bool:
     )
     return archived or (is_fetched_original and has_body)
 
+def _parse_atx_heading(line: str) -> tuple[int, str] | None:
+    """Parse one bounded ATX heading without backtracking regular expressions."""
+    index = 0
+    indent = 0
+    length = len(line)
+    while index < length and line[index].isspace():
+        indent += 1
+        if indent > 3:
+            return None
+        index += 1
+
+    hash_start = index
+    while index < length and line[index] == "#":
+        index += 1
+    level = index - hash_start
+    if level < 1 or level > 6:
+        return None
+    if index >= length or not line[index].isspace():
+        return None
+    while index < length and line[index].isspace():
+        index += 1
+    if index >= length:
+        return None
+
+    title = line[index:].rstrip()
+    closing_start = len(title)
+    while closing_start > 0 and title[closing_start - 1] == "#":
+        closing_start -= 1
+    if closing_start == 0:
+        title = "#"
+    elif closing_start < len(title):
+        title = title[:closing_start].rstrip()
+    title = title.strip()
+    return (level, title) if title else None
+
+
 def _markdown_headings(content: str) -> list[tuple[int, str, int]]:
     headings = []
     for line_no, line in enumerate((content or "").splitlines()):
-        match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
-        if match:
-            headings.append((len(match.group(1)), match.group(2).strip(), line_no))
+        parsed = _parse_atx_heading(line)
+        if parsed:
+            headings.append((parsed[0], parsed[1], line_no))
     return headings
 
 def _institution_pack_missing_sections(headings: list[tuple[int, str, int]]) -> list[str]:
@@ -1441,11 +1509,9 @@ def estimate_reading_minutes(word_count: int) -> int:
 def _newspaper_toc(content: str) -> list:
     toc = []
     for ln in (content or "").splitlines():
-        if re.match(r"^\s*###", ln):
-            continue
-        m = re.match(r"^\s*##\s+(.+?)\s*$", ln)
-        if m and m.group(1).strip():
-            toc.append(m.group(1).strip())
+        parsed = _parse_atx_heading(ln)
+        if parsed and parsed[0] == 2:
+            toc.append(parsed[1])
     return toc
 
 
@@ -1453,12 +1519,12 @@ def _newspaper_section(content: str, keyword: str) -> str:
     """取含 keyword 的二级标题段落正文（到下一个二级标题止）。"""
     out, capturing = [], False
     for ln in (content or "").splitlines():
-        m = re.match(r"^\s*##\s+(.*)$", ln)
-        is_h2 = bool(m) and not re.match(r"^\s*###", ln)
+        parsed = _parse_atx_heading(ln)
+        is_h2 = bool(parsed) and parsed[0] == 2
         if is_h2:
             if capturing:
                 break
-            capturing = keyword in m.group(1)
+            capturing = keyword in parsed[1]
             continue
         if capturing:
             out.append(ln)
@@ -1937,10 +2003,54 @@ def _configure_defensetracker_docx(doc):
     _set_style_font(styles["Heading 3"], "楷体_GB2312", 16, bold=True, color="374151")
 
 
+def _replace_inline_links(text: str) -> str:
+    """Replace inline Markdown links with readable text in one forward scan."""
+    output: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] != "[":
+            output.append(text[index])
+            index += 1
+            continue
+
+        label_end = text.find("]", index + 1)
+        if label_end < 0:
+            output.append(text[index:])
+            break
+        if label_end + 1 >= length or text[label_end + 1] != "(":
+            output.append(text[index:label_end + 1])
+            index = label_end + 1
+            continue
+
+        url_start = label_end + 2
+        cursor = url_start
+        depth = 1
+        while cursor < length and depth:
+            if text[cursor] == "(":
+                depth += 1
+            elif text[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            output.append(text[index:])
+            break
+
+        label = text[index + 1:label_end]
+        url = text[url_start:cursor - 1]
+        if label and url:
+            output.append(f"{label}（{url}）")
+        else:
+            output.append(text[index:cursor])
+        index = cursor
+    return "".join(output)
+
+
 def _clean_inline_markdown(text: str) -> str:
     text = sanitize_report_text(text or "")
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", text)
-    text = re.sub(r"(\*\*|__|`)", "", text)
+    text = _replace_inline_links(text)
+    for marker in ("**", "__", "`"):
+        text = text.replace(marker, "")
     return sanitize_report_text(text)
 
 
@@ -1966,6 +2076,33 @@ def _parse_markdown_table(lines: list[str]) -> list[list[str]]:
     return [row + [""] * (width - len(row)) for row in rows]
 
 
+def _parse_list_item(line: str) -> tuple[str, str] | None:
+    """Parse a Markdown list marker with a bounded, forward-only scan."""
+    if not line:
+        return None
+    marker_end = 0
+    if line[0] in "-*+":
+        marker_end = 1
+    else:
+        while marker_end < len(line) and line[marker_end].isdecimal():
+            marker_end += 1
+        if (
+            marker_end == 0
+            or marker_end >= len(line)
+            or line[marker_end] not in ".)"
+        ):
+            return None
+        marker_end += 1
+    if marker_end >= len(line) or not line[marker_end].isspace():
+        return None
+    body_start = marker_end
+    while body_start < len(line) and line[body_start].isspace():
+        body_start += 1
+    if body_start >= len(line):
+        return None
+    return line[:marker_end], line[body_start:]
+
+
 def _markdown_blocks(content: str) -> list[dict]:
     lines = require_report_text_bounds(content).splitlines()
     blocks: list[dict] = []
@@ -1988,24 +2125,24 @@ def _markdown_blocks(content: str) -> list[dict]:
                 blocks.append({"type": "table", "rows": rows})
             continue
 
-        heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        heading = _parse_atx_heading(stripped)
         if heading:
             blocks.append({
                 "type": "heading",
-                "level": len(heading.group(1)),
-                "text": _clean_inline_markdown(heading.group(2)),
+                "level": heading[0],
+                "text": _clean_inline_markdown(heading[1]),
             })
             i += 1
             continue
 
-        list_item = re.match(r"^([-*+]|\d+[.)])\s+(.+)$", stripped)
+        list_item = _parse_list_item(stripped)
         if list_item:
             items = []
             while i < len(lines):
-                item_match = re.match(r"^([-*+]|\d+[.)])\s+(.+)$", lines[i].strip())
+                item_match = _parse_list_item(lines[i].strip())
                 if not item_match:
                     break
-                items.append(_clean_inline_markdown(item_match.group(2)))
+                items.append(_clean_inline_markdown(item_match[1]))
                 i += 1
             blocks.append({"type": "list", "items": items})
             continue

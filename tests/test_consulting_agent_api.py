@@ -915,6 +915,68 @@ def test_consult_archive_failure_hides_internal_exception_text(monkeypatch):
     assert private_detail not in json.dumps(captured, ensure_ascii=False)
 
 
+def test_consult_ssrf_rejection_hides_reason_in_extract_and_assets(
+    monkeypatch, tmp_path
+):
+    private_detail = "dns diagnostic marker internal-ssrf-7"
+    monkeypatch.setattr(
+        consulting_agent,
+        "CONSULTING_AGENT_DB_FILE",
+        str(tmp_path / "consult.sqlite3"),
+    )
+    monkeypatch.setattr(
+        consulting_agent,
+        "SOURCE_ARCHIVE_DIR",
+        str(tmp_path / "source_archive"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tracker,
+        "_is_ssrf_safe",
+        lambda _url: (False, private_detail),
+    )
+    monkeypatch.setattr(
+        tracker.search_adapters,
+        "extract_url",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an SSRF-rejected URL must never reach the fetcher"
+        ),
+    )
+    session = consulting_agent.create_session("搜集1份公开报告")
+    evidence = consulting_agent.upsert_evidence(
+        session["session_id"],
+        [{
+            "title": "Rejected target",
+            "source": "Public source",
+            "url": "https://example.test/rejected",
+            "channel": "web",
+            "score": 90,
+            "snippet": "待抓取正文。",
+        }],
+    )[0]
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+
+    response = client.post(
+        f"/api/consult/sessions/{session['session_id']}/extract",
+        json={"evidence_ids": [evidence["evidence_id"]]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    assets_response = client.get(
+        f"/api/consult/sessions/{session['session_id']}/assets"
+    )
+
+    assert response.status_code == 200
+    assert assets_response.status_code == 200
+    assert response.get_json()["failures"][0]["reason"] == (
+        "站点拒绝访问或需要授权"
+    )
+    assert response.get_json()["failures"][0]["diagnosis"]["code"] == "blocked"
+    assert private_detail not in response.get_data(as_text=True)
+    assert private_detail not in assets_response.get_data(as_text=True)
+
+
 @pytest.mark.parametrize(
     "error,expected_status,expected_message",
     [

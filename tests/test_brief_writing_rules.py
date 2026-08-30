@@ -1067,6 +1067,40 @@ def test_import_url_and_file_responses_hide_absolute_saved_path(
         assert str(private_path.parent) not in response.get_data(as_text=True)
 
 
+def test_import_url_ssrf_rejection_is_fixed_public_error_and_never_fetches(
+    monkeypatch,
+):
+    private_reason = (
+        "resolved 169.254.169.254 via private resolver id=internal-7"
+    )
+    monkeypatch.setattr(tracker, "_check_rate", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        tracker,
+        "_is_ssrf_safe",
+        lambda *_args: (False, private_reason),
+    )
+    monkeypatch.setattr(
+        tracker,
+        "_extract_url_content",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an SSRF-rejected URL must never reach the fetcher"
+        ),
+    )
+    client = tracker.app.test_client()
+    csrf = "import-url-ssrf-csrf"
+    client.set_cookie(tracker.CSRF_COOKIE, csrf)
+
+    response = client.post(
+        "/api/brief/import_url",
+        json={"url": "http://169.254.169.254/latest/meta-data"},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "URL不安全，已拒绝访问"}
+    assert private_reason not in response.get_data(as_text=True)
+
+
 def test_brief_api_error_does_not_echo_or_log_absolute_path(
     monkeypatch, tmp_path, caplog
 ):
