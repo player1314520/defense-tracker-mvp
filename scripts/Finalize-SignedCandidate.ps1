@@ -324,7 +324,12 @@ function Get-ArtifactSafetyFindings {
         [regex]::new('(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])','IgnoreCase'),
         [regex]::new('(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{20,}(?![A-Za-z0-9])','IgnoreCase'),
         [regex]::new('(?<![A-Za-z0-9])AKIA[A-Z0-9]{16}(?![A-Za-z0-9])','IgnoreCase'),
-        [regex]::new('(?<![A-Za-z0-9])sb_secret_[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])','IgnoreCase')
+        [regex]::new('(?<![A-Za-z0-9])sb_secret_[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])','IgnoreCase'),
+        [regex]::new(
+            '(?:api[_-]?key|app[_-]?secret|access[_-]?token|refresh[_-]?token|password|private[_-]?key)' +
+            '\s*[:=]\s*["''][^"'']{8,}["'']',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
     )
     $binarySecretRules = @(
         [regex]::new('-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),

@@ -143,10 +143,14 @@ def test_text_artifact_scanners_share_provider_families_and_thresholds(
     (artifact_root / "short-openai.txt").write_bytes(
         b"KEY=" + b"s" + b"k-" + (b"A" * 15) + b"\n"
     )
+    (artifact_root / "assigned-generic.txt").write_bytes(
+        b"api_" + b'key="' + (b"A" * 12) + b'"\n'
+    )
 
     assert _run_artifact_scanner(
         tmp_path, relative_path, next_function, artifact_root
     ) == [
+        "secret-content:assigned-generic.txt",
         "secret-content:standalone-aws.txt",
         "secret-content:standalone-github.txt",
         "secret-content:standalone-openai.txt",
