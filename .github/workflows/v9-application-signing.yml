@@ -214,7 +214,7 @@ jobs:
               try { $input.CopyTo($stream) } finally { $stream.Dispose(); $input.Dispose() }
             }
           } finally { $archive.Dispose() }
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -725,7 +725,7 @@ jobs:
         run: |
           $root=Join-Path $env:RUNNER_TEMP 'signed-application'; New-Item -ItemType Directory $root | Out-Null
           $zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $env:RUNNER_TEMP 'signed-application.zip')); try {foreach($entry in $zip.Entries){if($entry.FullName -cnotmatch '^payload/[^\\:]+$' -or $entry.FullName.EndsWith('/')){throw 'unsafe entry.'};$rel=$entry.FullName.Substring(8);if($rel -match '(^|/)\.\.?(/|$)'){throw 'unsafe segment.'};$path=[IO.Path]::GetFullPath((Join-Path $root $rel));New-Item -ItemType Directory (Split-Path $path -Parent) -Force|Out-Null;$a=$entry.Open();$b=[IO.File]::Create($path);try{$a.CopyTo($b)}finally{$b.Dispose();$a.Dispose()}}}finally{$zip.Dispose()}
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0

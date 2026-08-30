@@ -40,7 +40,7 @@ jobs:
       STAGING_ORIGIN: ${{ inputs.staging_origin }}
       PRODUCTION_ORIGIN: ${{ inputs.production_origin }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -89,7 +89,7 @@ jobs:
       STAGING_ORIGIN: ${{ inputs.staging_origin }}
       PRODUCTION_ORIGIN: ${{ inputs.production_origin }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -156,7 +156,7 @@ jobs:
       COLLECTOR_KEY_ID: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_KEY_ID }}
       COLLECTOR_PUBLIC_KEY_SHA256: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
