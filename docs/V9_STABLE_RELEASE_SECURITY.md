@@ -1,28 +1,25 @@
 # V9 稳定版证书与发布原子性边界
 
-稳定版工作流只接受受保护环境中显式配置的签名身份。以下值不得从待发布
-二进制、证书 `CN`、本机信任库或 Release 清单反推：
+稳定版只接受受保护 `main` 中 `release/publisher-policy.json` 及其精确 SHA-256；
+不得从待发布二进制、证书 `CN`、本机信任库、可变 Environment 变量或 Release
+清单反推 Publisher 信任。当前 policy 为 `pending`，因此正式签名会故意阻断。
 
-- `DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS`：完整 X.500 Subject；单值，或最多
-  4 项的 JSON 字符串数组。
-- `DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256`：与 Subject 顺序一一对应的
-  SPKI SHA-256；单值，或最多 4 项的 JSON 字符串数组。
-- `DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS`：完整 X.500 issuer；可用一个共享
-  pin，或按签名者顺序逐项配置。
-- `DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256`：根证书 DER SHA-256；可用一个
-  共享 pin，或按签名者顺序逐项配置。
-- DigiCert KeyLocker 还必须配置
-  `DEFENSE_TRACKER_DIGICERT_CERT_FILE_SHA256`，并在签名前复核公开证书文件的
-  完整 SHA-256。Azure Artifact Signing 不读取 DigiCert 文件。
+Azure Artifact Signing 绑定已提交的 Publisher、完整 Subject/issuer/root、
+endpoint/account/profile、code-signing EKU、Public Trust EKU 和 durable identity
+EKU。Azure 的短期叶证书会轮换，叶 SPKI 只记录为证据，不进入 allow decision。
+DigiCert KeyLocker 才要求有序 Subject/SPKI pin，并固定 issuer/root、canonical
+SM host、key alias 和公开 certificate-file SHA-256。任何 runtime 值与 committed
+policy 不一致，都必须在读取 API key、客户端证书或执行 SignTool 之前 fail-closed。
 
-轮换时先在受保护环境中加入新旧两个有序身份，重新通过候选与稳定版门禁，
-再删除旧身份。不得仅添加一个新 CN，也不得使用从候选资产自动提取的哈希更新
-受保护配置。
+Azure 轮换依靠持久身份与 EKU，不需要把新旧短期叶 SPKI 加入 allowlist。
+DigiCert 轮换则先提交并复核新的完整证书/身份 pin，再运行候选与稳定版门禁；
+不得仅添加新 CN，也不得从候选资产自动提取哈希回写策略。
 
 稳定版发布对本地候选、Draft、公开发布后的远端 API digest 和重新下载字节执行
 固定六资产名称、长度及 SHA-256 复核；公开后在检查 `immutable=true` 前后各复核
-一次。`v9-stable-release` concurrency 只串行化这个工作流，不会阻止具有
-`contents:write` 的其他主体并发写 Release。
+一次。工作流拆成只读 `verify-promotion` 与唯一具有 `contents:write` 的
+`publish-stable-release`，但 concurrency 仍只串行化这个工作流，不会阻止其他
+具有仓库写权限的主体并发写 Release。
 
 ## 诚实边界
 
@@ -31,7 +28,8 @@
   ruleset 和最小化 `contents:write` 确保唯一 writer，人工管理员在窗口内不得修改。
 - 公开后复验可以发现 TOCTOU 差异，但无法安全替换已经 immutable 的资产；失败时
   必须保留证据、停止宣传，并用新补丁版本处理，不能移动 Tag 或覆盖资产。
-- Subject、SPKI、issuer 和根证书 pin 证明预期证书身份，不替代 CA 吊销、可信时间戳、
-  私钥托管审批或签名服务审计；这些外部条件任一不可用时仍须阻断稳定版。
+- Provider-specific Publisher、Subject/issuer/root、EKU，以及 DigiCert SPKI/文件
+  pin 约束预期身份，但不替代 CA 吊销、可信时间戳、私钥托管审批或签名服务审计；
+  这些外部条件任一不可用时仍须阻断稳定版。
 - Authenticode 有效不等于 SmartScreen 已建立信誉，也不证明软件全部功能或生产 Portal
   已完成验收；桌面烟测和生产部署证据仍是独立门禁。

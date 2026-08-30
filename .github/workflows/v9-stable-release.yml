@@ -8,11 +8,27 @@ on:
         required: true
         type: string
       candidate_run_id:
-        description: Successful V9 signed candidate run ID
+        description: Successful V9 signed-candidate run ID
+        required: true
+        type: string
+      candidate_run_attempt:
+        description: Exact signed-candidate run attempt
+        required: true
+        type: string
+      candidate_artifact:
+        description: Exact encrypted candidate artifact name
+        required: true
+        type: string
+      candidate_artifact_digest:
+        description: Exact encrypted candidate artifact digest
         required: true
         type: string
       deployment_evidence_run_id:
-        description: Successful V9 deployment verification run ID
+        description: Successful V9 deployment-evidence run ID
+        required: true
+        type: string
+      deployment_evidence_run_attempt:
+        description: Exact V9 deployment-evidence run attempt
         required: true
         type: string
       portal_image_digest:
@@ -20,124 +36,153 @@ on:
         required: true
         type: string
       portal_image_run_id:
-        description: Successful protected-main Portal image workflow run ID
+        description: Successful protected-main Portal image run ID
+        required: true
+        type: string
+      portal_image_run_attempt:
+        description: Exact protected-main Portal image run attempt
         required: true
         type: string
 
-permissions:
-  contents: write
-  actions: read
-  id-token: write
-  attestations: write
-  artifact-metadata: write
-  packages: read
+# Verification is read-only. Publication rights exist only in the final
+# protected Environment job after a public promotion request has been emitted.
+permissions: {}
 
 concurrency:
   group: v9-stable-release
   cancel-in-progress: false
 
+env:
+  AGE_VERSION: "1.3.2"
+  AGE_ARCHIVE_SHA256: "f48d8f8f9ebe903ab5027ed067652f2cc1db94bc206976430133b905dcd8e8c7"
+
 jobs:
-  publish-stable-release:
-    name: Reverify, attest and publish immutable release
+  verify-promotion:
+    name: Read-only verification and promotion request
     if: github.ref == 'refs/heads/main'
-    environment: v9-production-release
-    # Stable publication is isolated from the candidate builder and requires a
-    # separately managed one-job runner registered with --ephemeral.
-    runs-on: [self-hosted, Windows, X64, defense-v9-stable-ephemeral]
-    timeout-minutes: 45
+    environment:
+      name: v9-production-evidence
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ inputs.candidate_run_id }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    outputs:
+      promotion_artifact_name: ${{ steps.promotion.outputs.promotion_artifact_name }}
+      promotion_request_sha256: ${{ steps.promotion.outputs.promotion_request_sha256 }}
+      promotion_artifact_digest: ${{ steps.promotion_upload.outputs.artifact-digest }}
     env:
-      GH_TOKEN: ${{ github.token }}
       RELEASE_SHA: ${{ inputs.release_sha }}
       CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+      CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
+      CANDIDATE_ARTIFACT_DIGEST: ${{ inputs.candidate_artifact_digest }}
       DEPLOYMENT_EVIDENCE_RUN_ID: ${{ inputs.deployment_evidence_run_id }}
+      DEPLOYMENT_EVIDENCE_RUN_ATTEMPT: ${{ inputs.deployment_evidence_run_attempt }}
       PORTAL_IMAGE_DIGEST: ${{ inputs.portal_image_digest }}
       PORTAL_IMAGE_RUN_ID: ${{ inputs.portal_image_run_id }}
-      DEFENSE_TRACKER_PUBLISHER: ${{ vars.DEFENSE_TRACKER_PUBLISHER }}
-      DEFENSE_TRACKER_SIGNTOOL: ${{ vars.DEFENSE_TRACKER_SIGNTOOL }}
-      DEFENSE_TRACKER_SIGNTOOL_SHA256: ${{ vars.DEFENSE_TRACKER_SIGNTOOL_SHA256 }}
-      DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS }}
-      DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256 }}
-      DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS }}
-      DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256: ${{ vars.DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256 }}
-      DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE: ${{ vars.DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE }}
+      PORTAL_IMAGE_RUN_ATTEMPT: ${{ inputs.portal_image_run_attempt }}
       DEPLOYMENT_COLLECTOR_KEY_ID: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_KEY_ID }}
       DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256: ${{ vars.DEFENSE_TRACKER_DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 }}
       DEPLOYMENT_STAGING_ORIGIN: ${{ vars.DEFENSE_TRACKER_STAGING_ORIGIN }}
       DEPLOYMENT_PRODUCTION_ORIGIN: ${{ vars.DEFENSE_TRACKER_PRODUCTION_ORIGIN }}
     steps:
+      - name: Verify exact source workflows and artifact digest without checkout
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if($env:RELEASE_SHA-cnotmatch'^[0-9a-f]{40}$'-or$env:PORTAL_IMAGE_DIGEST-cnotmatch'^sha256:[0-9a-f]{64}$'){throw 'Stable input is malformed.'}
+          foreach($value in @($env:CANDIDATE_RUN_ID,$env:CANDIDATE_RUN_ATTEMPT,$env:DEPLOYMENT_EVIDENCE_RUN_ID,$env:DEPLOYMENT_EVIDENCE_RUN_ATTEMPT,$env:PORTAL_IMAGE_RUN_ID,$env:PORTAL_IMAGE_RUN_ATTEMPT)){
+            if($value-cnotmatch'^[1-9][0-9]{0,18}$'){throw 'A production run ID or attempt is malformed.'}
+          }
+          $candidate=gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CANDIDATE_RUN_ID"|ConvertFrom-Json
+          if($candidate.conclusion-cne'success'-or$candidate.head_sha-cne$env:RELEASE_SHA-or$candidate.head_branch-cne'main'-or$candidate.path-cne'.github/workflows/v9-signed-candidate.yml'-or$candidate.event-cne'workflow_dispatch'-or[string]$candidate.run_attempt-cne$env:CANDIDATE_RUN_ATTEMPT){throw 'Candidate run is not trusted.'}
+          $artifacts=gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CANDIDATE_RUN_ID/artifacts?per_page=100"|ConvertFrom-Json
+          $match=@($artifacts.artifacts|Where-Object{$_.name-ceq$env:CANDIDATE_ARTIFACT-and-not$_.expired})
+          $candidateStarted=[DateTimeOffset]::Parse([string]$candidate.run_started_at)
+          if($match.Count -ne 1 -or
+              ([string]$match[0].digest) -cne $env:CANDIDATE_ARTIFACT_DIGEST -or
+              [DateTimeOffset]::Parse([string]$match[0].created_at) -lt $candidateStarted -or
+              [DateTimeOffset]::Parse([string]$match[0].updated_at) -lt [DateTimeOffset]::Parse([string]$match[0].created_at)){
+            throw 'Candidate artifact identity or current-attempt timestamp evidence mismatch.'
+          }
+          # The artifact API has no run_attempt field. Bind the exact attempt through the run API,
+          # then require the uniquely named artifact to be created/updated during that attempt.
+          foreach($spec in @(
+            @{id=$env:DEPLOYMENT_EVIDENCE_RUN_ID;attempt=$env:DEPLOYMENT_EVIDENCE_RUN_ATTEMPT;path='.github/workflows/v9-deployment-evidence.yml';artifact="v9-deployment-evidence-$env:RELEASE_SHA"},
+            @{id=$env:PORTAL_IMAGE_RUN_ID;attempt=$env:PORTAL_IMAGE_RUN_ATTEMPT;path='.github/workflows/v9-portal-image.yml';artifact="v9-portal-image-$env:RELEASE_SHA-$env:PORTAL_IMAGE_RUN_ID"}
+          )){
+            $run=gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$($spec.id)"|ConvertFrom-Json
+            if($run.conclusion -cne 'success' -or $run.head_sha -cne $env:RELEASE_SHA -or
+                $run.head_branch -cne 'main' -or $run.path -cne $spec.path -or
+                $run.event -cne 'workflow_dispatch' -or
+                ([string]$run.run_attempt) -cne ([string]$spec.attempt)){
+              throw 'A production evidence workflow or run attempt is not trusted.'
+            }
+            $runArtifacts=gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$($spec.id)/artifacts?per_page=100"|ConvertFrom-Json
+            $artifact=@($runArtifacts.artifacts|Where-Object{$_.name-ceq$spec.artifact-and-not$_.expired})
+            $started=[DateTimeOffset]::Parse([string]$run.run_started_at)
+            if($artifact.Count -ne 1 -or
+                ([string]$artifact[0].workflow_run.id) -cne ([string]$spec.id) -or
+                ([string]$artifact[0].workflow_run.head_sha) -cne $env:RELEASE_SHA -or
+                [DateTimeOffset]::Parse([string]$artifact[0].created_at) -lt $started -or
+                [DateTimeOffset]::Parse([string]$artifact[0].updated_at) -lt [DateTimeOffset]::Parse([string]$artifact[0].created_at)){
+              throw 'Production evidence artifact is not bound to the exact current run attempt.'
+            }
+          }
+          $main=gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/heads/main"|ConvertFrom-Json;if($main.object.sha-cne$env:RELEASE_SHA-or$env:GITHUB_SHA-cne$env:RELEASE_SHA){throw 'Release is no longer exact protected main.'}
+      - name: Download encrypted candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}\candidate-envelope
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Bootstrap pinned age without checkout
+        shell: pwsh
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'age';New-Item -ItemType Directory $root|Out-Null;$archive=Join-Path $root 'age.zip';Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/FiloSottile/age/releases/download/v$env:AGE_VERSION/age-v$env:AGE_VERSION-windows-amd64.zip" -OutFile $archive;if((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()-cne$env:AGE_ARCHIVE_SHA256){throw 'age digest mismatch.'};[IO.Compression.ZipFile]::ExtractToDirectory($archive,(Join-Path $root 'expanded'));$age=@(Get-ChildItem (Join-Path $root 'expanded') -Filter age.exe -File -Recurse);if($age.Count-ne1-or(&$age[0].FullName --version)-cne"v$env:AGE_VERSION"){throw 'age identity mismatch.'};"AGE_EXE=$($age[0].FullName)"|Add-Content $env:GITHUB_ENV -Encoding utf8
+      - name: Decrypt candidate and remove one-use identity
+        shell: pwsh
+        env:
+          CANDIDATE_AGE_IDENTITY: ${{ secrets.RELEASE_ARTIFACT_AGE_IDENTITY }}
+        run: |
+          $envelope=Join-Path $env:RUNNER_TEMP 'candidate-envelope';$entries=@(Get-ChildItem $envelope -Force);$cipher=@($entries|Where-Object{-not$_.PSIsContainer-and$_.Name-like'*.age'});if($entries.Count-ne3-or$cipher.Count-ne1){throw 'Candidate envelope is not exact.'};$receipt=Get-Content (Join-Path $envelope 'candidate-transport-receipt.json') -Raw|ConvertFrom-Json;if($receipt.ciphertext_sha256-cne(Get-FileHash $cipher[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'Candidate ciphertext mismatch.'};$id=Join-Path $env:RUNNER_TEMP ("age-"+[guid]::NewGuid().ToString('N')+'.txt');$archive=Join-Path $env:RUNNER_TEMP 'candidate.zip';try{[IO.File]::WriteAllText($id,$env:CANDIDATE_AGE_IDENTITY.Trim()+"`n",[Text.UTF8Encoding]::new($false));&$env:AGE_EXE --decrypt --identity $id --output $archive $cipher[0].FullName;if($LASTEXITCODE-ne0){throw 'Candidate decryption failed.'}}finally{if(Test-Path $id){Remove-Item $id -Force}};if($receipt.plaintext_archive_sha256-cne(Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'Candidate archive mismatch.'}
+      - name: Safely expand candidate after identity removal
+        shell: pwsh
+        run: |
+          $output=Join-Path $env:RUNNER_TEMP 'candidate';New-Item -ItemType Directory $output|Out-Null;$zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $env:RUNNER_TEMP 'candidate.zip'));try{foreach($entry in $zip.Entries){if($entry.FullName-cnotmatch'^payload/[^\\:]+$'-or$entry.FullName.EndsWith('/')){throw 'unsafe candidate ZIP.'};$relative=$entry.FullName.Substring(8);if($relative-match'(^|/)\.\.?(/|$)'){throw 'unsafe candidate segment.'};$path=[IO.Path]::GetFullPath((Join-Path $output $relative));New-Item -ItemType Directory (Split-Path $path -Parent)-Force|Out-Null;$a=$entry.Open();$b=[IO.File]::Create($path);try{$a.CopyTo($b)}finally{$b.Dispose();$a.Dispose()}}}finally{$zip.Dispose()}
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
           clean: true
-      - name: Require exact current main, protected checks and trusted source workflows
-        shell: powershell
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ($env:DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE -cne 'ephemeral') {
-            throw "The production release environment has not declared an ephemeral runner."
-          }
-          if ($env:RELEASE_SHA -notmatch '^[0-9a-f]{40}$') { throw "Invalid release SHA." }
-          if ($env:PORTAL_IMAGE_DIGEST -notmatch '^sha256:[0-9a-f]{64}$') { throw "Invalid image digest." }
-          if ($env:PORTAL_IMAGE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid Portal image run ID." }
-          if ($env:CANDIDATE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid candidate run ID." }
-          if ($env:DEPLOYMENT_EVIDENCE_RUN_ID -notmatch '^[1-9][0-9]{0,19}$') { throw "Invalid evidence run ID." }
-          if ($env:DEPLOYMENT_COLLECTOR_KEY_ID -notmatch '^deployment-collector-[0-9a-f]{16}$') { throw "Invalid deployment collector key ID." }
-          if ($env:DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 -notmatch '^[0-9a-f]{64}$') { throw "Invalid deployment collector public-key digest." }
-          $originPattern = '^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::443)?$'
-          if ($env:DEPLOYMENT_STAGING_ORIGIN -cnotmatch $originPattern) { throw "Invalid protected staging origin." }
-          if ($env:DEPLOYMENT_PRODUCTION_ORIGIN -cnotmatch $originPattern) { throw "Invalid protected production origin." }
-          if ($env:DEPLOYMENT_STAGING_ORIGIN -ceq $env:DEPLOYMENT_PRODUCTION_ORIGIN) { throw "Protected deployment origins must differ." }
-          if ($env:GITHUB_REF -cne 'refs/heads/main' -or $env:GITHUB_SHA -cne $env:RELEASE_SHA) {
-            throw "Stable workflow must be dispatched from the exact protected main commit."
-          }
-          if ((git rev-parse HEAD) -ne $env:RELEASE_SHA) { throw "Checkout mismatch." }
-          git fetch --no-tags origin main
-          if ((git rev-parse refs/remotes/origin/main) -ne $env:RELEASE_SHA) { throw "Release is not current main." }
-          python scripts/verify_release_checks.py `
-            --repository $env:GITHUB_REPOSITORY `
-            --sha $env:RELEASE_SHA
-          if ($LASTEXITCODE -ne 0) { throw "Required protected checks are not green." }
-          $candidate = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CANDIDATE_RUN_ID" | ConvertFrom-Json
-          if ($candidate.conclusion -ne 'success' -or
-              $candidate.head_sha -ne $env:RELEASE_SHA -or
-              $candidate.head_branch -ne 'main' -or
-              $candidate.path -ne '.github/workflows/v9-signed-candidate.yml' -or
-              $candidate.event -ne 'workflow_dispatch') {
-            throw "Candidate run is not the trusted workflow for this commit."
-          }
-          $evidence = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:DEPLOYMENT_EVIDENCE_RUN_ID" | ConvertFrom-Json
-          if ($evidence.conclusion -ne 'success' -or
-              $evidence.head_sha -ne $env:RELEASE_SHA -or
-              $evidence.head_branch -ne 'main' -or
-              $evidence.path -ne '.github/workflows/v9-deployment-evidence.yml' -or
-              $evidence.event -ne 'workflow_dispatch') {
-            throw "Deployment evidence run is not trusted for this commit."
-          }
-          $portalImage = gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:PORTAL_IMAGE_RUN_ID" | ConvertFrom-Json
-          if ($portalImage.conclusion -ne 'success' -or
-              $portalImage.head_sha -ne $env:RELEASE_SHA -or
-              $portalImage.head_branch -ne 'main' -or
-              $portalImage.path -ne '.github/workflows/v9-portal-image.yml' -or
-              $portalImage.event -ne 'workflow_dispatch') {
-            throw "Portal image run is not trusted for this commit."
-          }
-      - name: Download exact signed candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          name: DefenseTracker-v9.0.0-${{ inputs.release_sha }}
-          path: candidate
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.candidate_run_id }}
-          github-token: ${{ github.token }}
+          python-version: "3.11.9"
+          architecture: x64
+      - name: Install hash-locked promotion verification dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements.bootstrap.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Hash-locked promotion dependencies failed to install.' }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Promotion dependency consistency check failed.' }
+      - name: Bootstrap hash-pinned credentialless verification tools
+        shell: pwsh
+        run: .\scripts\Initialize-GitHubHostedReleaseTools.ps1 -Mode VerificationOnly
       - name: Download exact live deployment evidence
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: v9-deployment-evidence-${{ inputs.release_sha }}
-          path: deployment-evidence
+          path: ${{ runner.temp }}\deployment-evidence
           repository: ${{ github.repository }}
           run-id: ${{ inputs.deployment_evidence_run_id }}
           github-token: ${{ github.token }}
@@ -145,36 +190,33 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: v9-portal-image-${{ inputs.release_sha }}-${{ inputs.portal_image_run_id }}
-          path: portal-image-receipt
+          path: ${{ runner.temp }}\portal-image
           repository: ${{ github.repository }}
           run-id: ${{ inputs.portal_image_run_id }}
           github-token: ${{ github.token }}
-      - name: Verify Portal image receipt and OCI provenance
-        shell: powershell
+      - name: Reverify candidate, Authenticode policy, deployment, and Portal evidence
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $receiptFiles = @(Get-ChildItem portal-image-receipt -Recurse -Force)
-          if ($receiptFiles.Count -ne 1 -or $receiptFiles[0].PSIsContainer -or
-              $receiptFiles[0].LinkType -or $receiptFiles[0].Name -cne 'portal-image.json') {
-            throw "Portal image workflow did not publish the one fixed receipt."
-          }
-          $receipt = Get-Content -LiteralPath $receiptFiles[0].FullName -Raw | ConvertFrom-Json
-          $expectedKeys = @('attestation_url', 'base_image', 'generated_at_utc', 'image_digest', 'image_reference', 'release_commit', 'schema', 'workflow_run_id')
-          $actualKeys = @($receipt.PSObject.Properties.Name | Sort-Object)
-          if ((Compare-Object $expectedKeys $actualKeys).Count -ne 0) {
-            throw "Portal image receipt schema differs from the fixed contract."
-          }
-          $owner = $env:GITHUB_REPOSITORY_OWNER.ToLowerInvariant()
-          $expectedReference = "ghcr.io/$owner/defense-tracker-portal@$env:PORTAL_IMAGE_DIGEST"
-          if ($receipt.schema -ne 1 -or
-              $receipt.release_commit -cne $env:RELEASE_SHA -or
-              $receipt.image_digest -cne $env:PORTAL_IMAGE_DIGEST -or
-              $receipt.image_reference -cne $expectedReference -or
-              [string]$receipt.workflow_run_id -cne $env:PORTAL_IMAGE_RUN_ID -or
-              $receipt.attestation_url -cnotmatch '^https://github\.com/[^/]+/[^/]+/attestations/[0-9]+$') {
-            throw "Portal image receipt does not bind the approved run, commit and digest."
-          }
-          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-portal-image.yml"
+          $candidate=Join-Path $env:RUNNER_TEMP 'candidate'
+          python scripts\verify_release_checks.py --repository $env:GITHUB_REPOSITORY --sha $env:RELEASE_SHA
+          python scripts\verify_release_assets.py $candidate --expected-commit $env:RELEASE_SHA
+          python scripts\verify_deployment_evidence.py (Join-Path $env:RUNNER_TEMP 'deployment-evidence') --expected-commit $env:RELEASE_SHA --expected-image-digest $env:PORTAL_IMAGE_DIGEST --expected-candidate-run-id $env:CANDIDATE_RUN_ID --expected-collector-key-id $env:DEPLOYMENT_COLLECTOR_KEY_ID --expected-collector-public-key-sha256 $env:DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 --expected-staging-origin $env:DEPLOYMENT_STAGING_ORIGIN --expected-production-origin $env:DEPLOYMENT_PRODUCTION_ORIGIN
+          $policy=Get-Content .\release\publisher-policy.json -Raw|ConvertFrom-Json
+          .\scripts\Verify-ReleaseAuthenticode.ps1 -AssetRoot $candidate -PolicyPath .\release\publisher-policy.json -SigningProvider $policy.active_provider -SignToolPath $env:DEFENSE_TRACKER_SIGNTOOL -ExpectedSignToolSha256 $env:DEFENSE_TRACKER_SIGNTOOL_SHA256
+          $portal=Get-Content (Join-Path $env:RUNNER_TEMP 'portal-image\portal-image.json') -Raw|ConvertFrom-Json
+          $expectedPortalKeys=@('attestation_url','base_image','generated_at_utc','image_digest','image_reference','release_commit','schema','workflow_run_id')
+          if((Compare-Object $expectedPortalKeys @($portal.PSObject.Properties.Name|Sort-Object)).Count-ne0){throw 'Portal image receipt schema mismatch.'}
+          $expectedReference="ghcr.io/$($env:GITHUB_REPOSITORY_OWNER.ToLowerInvariant())/defense-tracker-portal@$env:PORTAL_IMAGE_DIGEST"
+          if($portal.schema-ne1-or$portal.release_commit-cne$env:RELEASE_SHA-or$portal.image_digest-cne$env:PORTAL_IMAGE_DIGEST-or$portal.image_reference-cne$expectedReference-or[string]$portal.workflow_run_id-cne$env:PORTAL_IMAGE_RUN_ID-or$portal.attestation_url-cnotmatch'^https://github\.com/[^/]+/[^/]+/attestations/[0-9]+$'){throw 'Portal image receipt mismatch.'}
+      - name: Verify Portal OCI provenance from the exact protected-main workflow
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $portal=Get-Content (Join-Path $env:RUNNER_TEMP 'portal-image\portal-image.json') -Raw|ConvertFrom-Json
+          $expectedReference="ghcr.io/$($env:GITHUB_REPOSITORY_OWNER.ToLowerInvariant())/defense-tracker-portal@$env:PORTAL_IMAGE_DIGEST"
+          if($portal.image_reference-cne$expectedReference-or$portal.image_digest-cne$env:PORTAL_IMAGE_DIGEST-or$portal.attestation_url-cnotmatch'^https://github\.com/[^/]+/[^/]+/attestations/[0-9]+$'){throw 'Portal image receipt changed before provenance verification.'}
+          $signerWorkflow="$env:GITHUB_REPOSITORY/.github/workflows/v9-portal-image.yml"
           gh attestation verify "oci://$expectedReference" `
             --repo $env:GITHUB_REPOSITORY `
             --bundle-from-oci `
@@ -182,244 +224,229 @@ jobs:
             --source-ref refs/heads/main `
             --source-digest $env:RELEASE_SHA `
             --deny-self-hosted-runners
-          if ($LASTEXITCODE -ne 0) { throw "Portal image provenance verification failed." }
-      - name: Reverify hashes, signatures, timestamp and deployment gates
-        shell: powershell
+          if($LASTEXITCODE-ne0){throw 'Portal image provenance verification failed.'}
+      - name: Verify deployment evidence provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = "Stop"
-          python scripts\verify_release_assets.py candidate `
-            --expected-commit $env:RELEASE_SHA
-          python scripts\verify_deployment_evidence.py deployment-evidence `
-            --expected-commit $env:RELEASE_SHA `
-            --expected-image-digest $env:PORTAL_IMAGE_DIGEST `
-            --expected-candidate-run-id $env:CANDIDATE_RUN_ID `
-            --expected-collector-key-id $env:DEPLOYMENT_COLLECTOR_KEY_ID `
-            --expected-collector-public-key-sha256 $env:DEPLOYMENT_COLLECTOR_PUBLIC_KEY_SHA256 `
-            --expected-staging-origin $env:DEPLOYMENT_STAGING_ORIGIN `
-            --expected-production-origin $env:DEPLOYMENT_PRODUCTION_ORIGIN
-          .\scripts\Verify-ReleaseAuthenticode.ps1 `
-            -AssetRoot candidate `
-            -PublisherName $env:DEFENSE_TRACKER_PUBLISHER `
-            -SignToolPath $env:DEFENSE_TRACKER_SIGNTOOL `
-            -ExpectedSignToolSha256 $env:DEFENSE_TRACKER_SIGNTOOL_SHA256 `
-            -ExpectedSignerSubjects $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SUBJECTS `
-            -ExpectedSignerSpkiSha256 $env:DEFENSE_TRACKER_EXPECTED_SIGNER_SPKI_SHA256 `
-            -ExpectedSignerIssuers $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ISSUERS `
-            -ExpectedSignerRootSha256 $env:DEFENSE_TRACKER_EXPECTED_SIGNER_ROOT_SHA256
-      - name: Verify deployment evidence provenance is bound to its workflow, ref and SHA
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
           $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-deployment-evidence.yml"
-          Get-ChildItem deployment-evidence -File | ForEach-Object {
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'deployment-evidence') -File | ForEach-Object {
             gh attestation verify $_.FullName `
               --repo $env:GITHUB_REPOSITORY `
               --signer-workflow $signerWorkflow `
               --source-ref refs/heads/main `
-              --source-digest $env:RELEASE_SHA
-            if ($LASTEXITCODE -ne 0) {
-              throw "Deployment evidence provenance verification failed: $($_.Name)"
-            }
+              --source-digest $env:RELEASE_SHA `
+              --deny-self-hosted-runners
+            if($LASTEXITCODE-ne0){throw "Deployment evidence provenance verification failed: $($_.Name)"}
           }
-      - name: Verify candidate provenance is bound to exact workflow, ref and SHA
-        shell: powershell
+      - name: Generate public promotion request from verified bytes
+        id: promotion
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-signed-candidate.yml"
-          Get-ChildItem candidate -File | ForEach-Object {
-            gh attestation verify $_.FullName `
-              --repo $env:GITHUB_REPOSITORY `
-              --signer-workflow $signerWorkflow `
-              --source-ref refs/heads/main `
-              --source-digest $env:RELEASE_SHA
-            if ($LASTEXITCODE -ne 0) {
-              throw "Candidate provenance verification failed: $($_.Name)"
-            }
-          }
-      - name: Confirm immutable releases are already enabled
-        shell: powershell
+          $candidate=Join-Path $env:RUNNER_TEMP 'candidate';$expected=@('DefenseTracker-Setup-v9.0.0-windows-x64.exe','DefenseTracker-v9.0.0-windows-x64-portable.zip','DefenseTracker-v9.0.0.spdx.json','SHA256SUMS.txt','THIRD_PARTY_NOTICES.md','release-manifest.json')|Sort-Object;$files=@(Get-ChildItem $candidate -File|Sort-Object Name);if($files.Count-ne6-or(Compare-Object $expected @($files.Name)).Count-ne0){throw 'Candidate does not contain the fixed six assets.'};$assets=@($files|ForEach-Object{[ordered]@{bytes=[int64]$_.Length;name=$_.Name;sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}});$request=[ordered]@{assets=$assets;candidate_artifact=$env:CANDIDATE_ARTIFACT;candidate_artifact_digest=$env:CANDIDATE_ARTIFACT_DIGEST;candidate_run_attempt=[int64]$env:CANDIDATE_RUN_ATTEMPT;candidate_run_id=[int64]$env:CANDIDATE_RUN_ID;deployment_evidence_run_attempt=[int64]$env:DEPLOYMENT_EVIDENCE_RUN_ATTEMPT;deployment_evidence_run_id=[int64]$env:DEPLOYMENT_EVIDENCE_RUN_ID;kind='defense-tracker-stable-promotion-request';portal_image_digest=$env:PORTAL_IMAGE_DIGEST;portal_image_run_attempt=[int64]$env:PORTAL_IMAGE_RUN_ATTEMPT;portal_image_run_id=[int64]$env:PORTAL_IMAGE_RUN_ID;release_sha=$env:RELEASE_SHA;schema=1;verified_at_utc=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')};$dir=Join-Path $env:RUNNER_TEMP 'promotion-request';New-Item -ItemType Directory $dir|Out-Null;$path=Join-Path $dir 'promotion-request.json';[IO.File]::WriteAllText($path,($request|ConvertTo-Json -Depth 6 -Compress)+"`n",[Text.UTF8Encoding]::new($false));"promotion_artifact_name=DefenseTracker-v9.0.0-promotion-$env:RELEASE_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"|Add-Content $env:GITHUB_OUTPUT -Encoding utf8;"promotion_request_sha256=$((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant())"|Add-Content $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Upload public promotion request
+        id: promotion_upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.promotion.outputs.promotion_artifact_name }}
+          path: ${{ runner.temp }}\promotion-request\promotion-request.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+          include-hidden-files: false
+
+  publish-stable-release:
+    name: Publish only the previously verified promotion
+    needs: verify-promotion
+    environment:
+      name: v9-production-release
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+      CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
+      CANDIDATE_ARTIFACT_DIGEST: ${{ inputs.candidate_artifact_digest }}
+      DEPLOYMENT_EVIDENCE_RUN_ID: ${{ inputs.deployment_evidence_run_id }}
+      DEPLOYMENT_EVIDENCE_RUN_ATTEMPT: ${{ inputs.deployment_evidence_run_attempt }}
+      PORTAL_IMAGE_DIGEST: ${{ inputs.portal_image_digest }}
+      PORTAL_IMAGE_RUN_ID: ${{ inputs.portal_image_run_id }}
+      PORTAL_IMAGE_RUN_ATTEMPT: ${{ inputs.portal_image_run_attempt }}
+      PROMOTION_ARTIFACT: ${{ needs.verify-promotion.outputs.promotion_artifact_name }}
+      PROMOTION_REQUEST_SHA256: ${{ needs.verify-promotion.outputs.promotion_request_sha256 }}
+      PROMOTION_ARTIFACT_DIGEST: ${{ needs.verify-promotion.outputs.promotion_artifact_digest }}
+    steps:
+      - name: Download exact encrypted candidate again
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}\candidate-envelope
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download exact public promotion request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.verify-promotion.outputs.promotion_artifact_name }}
+          path: ${{ runner.temp }}\promotion-request
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Bootstrap pinned age without repository code
+        shell: pwsh
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'age';New-Item -ItemType Directory $root|Out-Null;$archive=Join-Path $root 'age.zip';Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/FiloSottile/age/releases/download/v$env:AGE_VERSION/age-v$env:AGE_VERSION-windows-amd64.zip" -OutFile $archive;if((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()-cne$env:AGE_ARCHIVE_SHA256){throw 'age digest mismatch.'};[IO.Compression.ZipFile]::ExtractToDirectory($archive,(Join-Path $root 'expanded'));$age=@(Get-ChildItem (Join-Path $root 'expanded') -Filter age.exe -File -Recurse);if($age.Count-ne1){throw 'age missing.'};"AGE_EXE=$($age[0].FullName)"|Add-Content $env:GITHUB_ENV -Encoding utf8
+      - name: Decrypt approved candidate and remove one-use identity
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+          CANDIDATE_AGE_IDENTITY: ${{ secrets.RELEASE_ARTIFACT_AGE_IDENTITY }}
         run: |
-          $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) { throw "Admin-read token is missing." }
-          $setting = gh api `
-            -H 'Accept: application/vnd.github+json' `
-            -H 'X-GitHub-Api-Version: 2026-03-10' `
-            "/repos/$env:GITHUB_REPOSITORY/immutable-releases" | ConvertFrom-Json
-          if ($setting.enabled -ne $true) { throw "Immutable releases are not enabled." }
-      - name: Generate SLSA provenance for all six fixed assets
+          $cipher=@(Get-ChildItem (Join-Path $env:RUNNER_TEMP 'candidate-envelope') -Filter *.age -File);if($cipher.Count-ne1){throw 'cipher mismatch.'};$id=Join-Path $env:RUNNER_TEMP ("age-"+[guid]::NewGuid().ToString('N')+'.txt');$archive=Join-Path $env:RUNNER_TEMP 'candidate.zip';try{[IO.File]::WriteAllText($id,$env:CANDIDATE_AGE_IDENTITY.Trim()+"`n",[Text.UTF8Encoding]::new($false));&$env:AGE_EXE --decrypt --identity $id --output $archive $cipher[0].FullName;if($LASTEXITCODE-ne0){throw 'decryption failed.'}}finally{if(Test-Path $id){Remove-Item $id -Force}}
+      - name: Expand and match every asset to promotion request
+        shell: pwsh
+        run: |
+          $promotionArtifacts=gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=100"|ConvertFrom-Json
+          $promotionMatch=@($promotionArtifacts.artifacts|Where-Object{$_.name-ceq$env:PROMOTION_ARTIFACT-and-not$_.expired})
+          if($promotionMatch.Count-ne1-or[string]$promotionMatch[0].digest-cne$env:PROMOTION_ARTIFACT_DIGEST){throw 'Promotion artifact identity mismatch.'}
+          $requestPath=Join-Path $env:RUNNER_TEMP 'promotion-request\promotion-request.json'
+          if((Get-FileHash $requestPath -Algorithm SHA256).Hash.ToLowerInvariant()-cne$env:PROMOTION_REQUEST_SHA256){throw 'Promotion request digest mismatch.'}
+          $request=Get-Content $requestPath -Raw|ConvertFrom-Json
+          $expectedRequestKeys=@('assets','candidate_artifact','candidate_artifact_digest','candidate_run_attempt','candidate_run_id','deployment_evidence_run_attempt','deployment_evidence_run_id','kind','portal_image_digest','portal_image_run_attempt','portal_image_run_id','release_sha','schema','verified_at_utc')|Sort-Object
+          if((Compare-Object $expectedRequestKeys @($request.PSObject.Properties.Name|Sort-Object)).Count-ne0){throw 'Promotion request schema has unexpected or missing fields.'}
+          if($request.schema-ne1-or$request.kind-cne'defense-tracker-stable-promotion-request'-or$request.release_sha-cne$env:RELEASE_SHA-or[string]$request.candidate_run_id-cne$env:CANDIDATE_RUN_ID-or[string]$request.candidate_run_attempt-cne$env:CANDIDATE_RUN_ATTEMPT-or$request.candidate_artifact-cne$env:CANDIDATE_ARTIFACT-or$request.candidate_artifact_digest-cne$env:CANDIDATE_ARTIFACT_DIGEST-or[string]$request.deployment_evidence_run_id-cne$env:DEPLOYMENT_EVIDENCE_RUN_ID-or[string]$request.deployment_evidence_run_attempt-cne$env:DEPLOYMENT_EVIDENCE_RUN_ATTEMPT-or$request.portal_image_digest-cne$env:PORTAL_IMAGE_DIGEST-or[string]$request.portal_image_run_id-cne$env:PORTAL_IMAGE_RUN_ID-or[string]$request.portal_image_run_attempt-cne$env:PORTAL_IMAGE_RUN_ATTEMPT-or[string]$request.verified_at_utc-cnotmatch'^20[0-9]{2}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$'){throw 'Promotion request identity mismatch.'}
+          $expectedNames=@('DefenseTracker-Setup-v9.0.0-windows-x64.exe','DefenseTracker-v9.0.0-windows-x64-portable.zip','DefenseTracker-v9.0.0.spdx.json','SHA256SUMS.txt','THIRD_PARTY_NOTICES.md','release-manifest.json')|Sort-Object
+          $requestNames=@($request.assets|ForEach-Object{[string]$_.name}|Sort-Object)
+          if($request.assets.Count-ne6-or(Compare-Object $expectedNames $requestNames).Count-ne0-or(@($requestNames|Select-Object -Unique).Count-ne6)){throw 'Promotion request does not contain the exact six unique canonical assets.'}
+          foreach($asset in @($request.assets)){
+            if((Compare-Object @('bytes','name','sha256') @($asset.PSObject.Properties.Name|Sort-Object)).Count-ne0-or[int64]$asset.bytes-lt1-or[string]$asset.sha256-cnotmatch'^[0-9a-f]{64}$'){throw 'Promotion request asset schema is malformed.'}
+          }
+          $out=Join-Path $env:RUNNER_TEMP 'candidate';New-Item -ItemType Directory $out|Out-Null
+          $zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $env:RUNNER_TEMP 'candidate.zip'));try{foreach($entry in $zip.Entries){if($entry.FullName-cnotmatch'^payload/[^\\:]+$'-or$entry.FullName.EndsWith('/')){throw 'unsafe ZIP.'};$relative=$entry.FullName.Substring(8);if($relative-match'(^|/)\.\.?(/|$)'){throw 'unsafe segment.'};$path=[IO.Path]::GetFullPath((Join-Path $out $relative));New-Item -ItemType Directory (Split-Path $path -Parent)-Force|Out-Null;$a=$entry.Open();$b=[IO.File]::Create($path);try{$a.CopyTo($b)}finally{$b.Dispose();$a.Dispose()}}}finally{$zip.Dispose()}
+          $files=@(Get-ChildItem $out -File);if($files.Count-ne6){throw 'Asset count mismatch.'};foreach($expected in $request.assets){$path=Join-Path $out $expected.name;if(-not(Test-Path $path -PathType Leaf)-or(Get-Item $path).Length-ne[int64]$expected.bytes-or(Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()-cne$expected.sha256){throw "Promoted asset mismatch: $($expected.name)"}}
+      - name: Confirm immutable releases immediately before publication
+        shell: pwsh
+        env:
+          ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+        run: |
+          if([string]::IsNullOrWhiteSpace($env:ADMIN_READ_TOKEN)){throw 'Admin-read token missing.'};$setting=Invoke-RestMethod -Headers @{Authorization="Bearer $env:ADMIN_READ_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2026-03-10'} -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/immutable-releases";if($setting.enabled-ne$true){throw 'Immutable releases are not enabled.'}
+      - name: Generate provenance for the six approved assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: candidate/*
-      - name: Attach SPDX SBOM attestation to the portable application
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: candidate/DefenseTracker-v9.0.0-windows-x64-portable.zip
-          sbom-path: candidate/DefenseTracker-v9.0.0.spdx.json
-      - name: Verify newly generated stable attestations before release creation
-        shell: powershell
+          subject-path: ${{ runner.temp }}\candidate\*
+      - name: Verify newly generated stable attestations
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
           $signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-stable-release.yml"
-          Get-ChildItem candidate -File | ForEach-Object {
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'candidate') -File | ForEach-Object {
             gh attestation verify $_.FullName `
               --repo $env:GITHUB_REPOSITORY `
               --signer-workflow $signerWorkflow `
               --source-ref refs/heads/main `
-              --source-digest $env:RELEASE_SHA
-            if ($LASTEXITCODE -ne 0) { throw "Attestation verification failed: $($_.Name)" }
+              --source-digest $env:RELEASE_SHA `
+              --deny-self-hosted-runners
+            if($LASTEXITCODE-ne0){throw "Stable attestation verification failed: $($_.Name)"}
           }
-      - name: Create complete draft, verify it, then publish once
-        shell: powershell
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: Publish once and verify immutable remote bytes
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $tag = python -c "from product_version import PRODUCT_VERSION; print(PRODUCT_VERSION.release_tag)"
-          if ($tag -ne 'v9.0.0') { throw "Unexpected release tag." }
-          git fetch --no-tags origin main
-          if ($LASTEXITCODE -ne 0 -or (git rev-parse refs/remotes/origin/main) -cne $env:RELEASE_SHA) {
-            throw "Protected main moved before release creation."
+          $ErrorActionPreference='Stop'
+          $tag='v9.0.0'
+          function Resolve-RemoteTagCommit([string]$TagName) {
+            $object=(gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$TagName"|ConvertFrom-Json).object
+            if($LASTEXITCODE-ne0){throw 'Unable to resolve remote release tag.'}
+            $depth=0
+            while($object.type-ceq'tag'){
+              if(++$depth-gt8-or$object.sha-cnotmatch'^[0-9a-f]{40}$'){throw 'Annotated tag chain is invalid.'}
+              $object=(gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($object.sha)"|ConvertFrom-Json).object
+              if($LASTEXITCODE-ne0){throw 'Unable to resolve annotated release tag.'}
+            }
+            if($object.type-cne'commit'-or$object.sha-cnotmatch'^[0-9a-f]{40}$'){throw 'Release tag does not resolve to a commit.'}
+            return [string]$object.sha
           }
-          python scripts/verify_release_checks.py `
-            --repository $env:GITHUB_REPOSITORY `
-            --sha $env:RELEASE_SHA
-          if ($LASTEXITCODE -ne 0) { throw "Protected checks changed before release creation." }
-          $existingTag = git ls-remote --tags origin "refs/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw "Unable to verify the remote release tag namespace." }
-          if (-not [string]::IsNullOrWhiteSpace($existingTag)) {
-            throw "Release tag already exists; immutable tags are never reused or moved."
+          $main=gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/heads/main"|ConvertFrom-Json
+          if($main.object.sha-cne$env:RELEASE_SHA){throw 'Protected main moved.'}
+          $sourceArtifacts=gh api "/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CANDIDATE_RUN_ID/artifacts?per_page=100"|ConvertFrom-Json
+          $sourceMatch=@($sourceArtifacts.artifacts|Where-Object{$_.name-ceq$env:CANDIDATE_ARTIFACT-and-not$_.expired})
+          if($sourceMatch.Count-ne1-or[string]$sourceMatch[0].digest-cne$env:CANDIDATE_ARTIFACT_DIGEST){throw 'Candidate source artifact digest changed before publication.'}
+          $candidateRoot=Join-Path $env:RUNNER_TEMP 'candidate'
+          $assets=@(Get-ChildItem $candidateRoot -File|Sort-Object Name)
+          function Assert-RemoteAssets([object]$Release,[bool]$RequireComplete,[string]$Label) {
+            $expectedNames=@($assets.Name|Sort-Object)
+            $remote=@($Release.assets)
+            $remoteNames=@($remote|ForEach-Object{[string]$_.name}|Sort-Object)
+            if(@($remoteNames|Select-Object -Unique).Count-ne$remoteNames.Count){throw "$Label has duplicate asset names."}
+            if(@($remoteNames|Where-Object{$expectedNames -cnotcontains $_}).Count-ne0){throw "$Label contains an unapproved asset."}
+            foreach($item in $remote){
+              $local=Get-Item (Join-Path $candidateRoot $item.name)
+              $digest='sha256:'+(Get-FileHash $local.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              if($item.digest-cne$digest-or[int64]$item.size-ne$local.Length){throw "$Label remote mismatch: $($item.name)"}
+            }
+            if($RequireComplete-and(Compare-Object $expectedNames $remoteNames).Count-ne0){throw "$Label asset set is incomplete."}
           }
-          gh release view $tag 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) { throw "Release or draft already exists; assets are never replaced." }
-          $manifest = Get-Content candidate\release-manifest.json -Raw | ConvertFrom-Json
-          $notes = @(
-            "# DefenseTracker $tag",
-            "",
-            "Release commit: ``$env:RELEASE_SHA``",
-            "Baseline commit: ``$($manifest.release.baseline_commit)``",
-            "Portal image: ``$env:PORTAL_IMAGE_DIGEST``",
-            "Publisher: $($manifest.signature.publisher)",
-            "",
-            "This release contains the signed Windows installer, portable application, SHA-256 list, schema-2 manifest, SPDX 2.3 SBOM and third-party notices. Full desktop features remain local; the web Portal is the authenticated collaboration surface."
+          $notes=Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $draftMarkers=@(
+            'DefenseTracker-Stable-Workflow: .github/workflows/v9-stable-release.yml',
+            "DefenseTracker-Release-SHA: $env:RELEASE_SHA",
+            "DefenseTracker-Candidate: $env:CANDIDATE_RUN_ID/$env:CANDIDATE_RUN_ATTEMPT/$env:CANDIDATE_ARTIFACT_DIGEST",
+            "DefenseTracker-Deployment-Evidence: $env:DEPLOYMENT_EVIDENCE_RUN_ID/$env:DEPLOYMENT_EVIDENCE_RUN_ATTEMPT",
+            "DefenseTracker-Portal-Image: $env:PORTAL_IMAGE_RUN_ID/$env:PORTAL_IMAGE_RUN_ATTEMPT/$env:PORTAL_IMAGE_DIGEST"
           )
-          $notes | Set-Content -LiteralPath release-notes.md -Encoding UTF8
-          $expectedAssetNames = @(
-            "DefenseTracker-Setup-v9.0.0-windows-x64.exe",
-            "DefenseTracker-v9.0.0-windows-x64-portable.zip",
-            "DefenseTracker-v9.0.0.spdx.json",
-            "SHA256SUMS.txt",
-            "THIRD_PARTY_NOTICES.md",
-            "release-manifest.json"
-          ) | Sort-Object
-          $candidateEntries = @(Get-ChildItem -LiteralPath candidate -Force)
-          if ($candidateEntries.Count -ne 6 -or
-              @($candidateEntries | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0 -or
-              (Compare-Object $expectedAssetNames @($candidateEntries.Name | Sort-Object)).Count -ne 0) {
-            throw "Candidate does not contain exactly the six fixed regular release assets."
+          @("# DefenseTracker $tag","","Release commit: ``$env:RELEASE_SHA``","",'Signed Windows installer and portable application; authenticated Portal remains a separate production surface.',"",$draftMarkers)|Set-Content $notes -Encoding utf8
+          $apiHeaders=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          $releaseResponse=Invoke-WebRequest -SkipHttpErrorCheck -Headers $apiHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          if([int]$releaseResponse.StatusCode-eq200){
+            $release=$releaseResponse.Content|ConvertFrom-Json
+          }elseif([int]$releaseResponse.StatusCode-eq404){
+            $tagResponse=Invoke-WebRequest -SkipHttpErrorCheck -Headers $apiHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag"
+            if([int]$tagResponse.StatusCode-ne404){throw 'A release tag exists without the exact resumable draft.'}
+            &gh release create $tag --repo $env:GITHUB_REPOSITORY --draft --target $env:RELEASE_SHA --title "DefenseTracker $tag" --notes-file $notes
+            if($LASTEXITCODE-ne0){throw 'Draft creation failed.'}
+            $release=gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"|ConvertFrom-Json
+          }else{
+            throw "Unable to determine existing release state: HTTP $([int]$releaseResponse.StatusCode)."
           }
-          $expectedAssets = @{}
-          foreach ($name in $expectedAssetNames) {
-            $path = Join-Path candidate $name
-            $item = Get-Item -LiteralPath $path
-            $expectedAssets[$name] = [ordered]@{
-              digest = 'sha256:' + (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-              bytes = [int64]$item.Length
+          if($release.draft-eq$true){
+            $draftBodyLines=@([string]$release.body -split "`r?`n")
+            if($release.tag_name-cne$tag-or$release.target_commitish-cne$env:RELEASE_SHA-or$release.author.login-cne'github-actions[bot]'){throw 'Existing release is not the exact resumable workflow draft.'}
+            foreach($marker in $draftMarkers){if($draftBodyLines -cnotcontains $marker){throw 'Existing draft lacks the exact workflow ownership and input binding.'}}
+            Assert-RemoteAssets $release $false 'Draft'
+            $remoteNames=@($release.assets|ForEach-Object{[string]$_.name})
+            $missing=@($assets|Where-Object{$remoteNames -cnotcontains $_.Name})
+            if($missing.Count-ne0){
+              $uploadArgs=@('release','upload',$tag,'--repo',$env:GITHUB_REPOSITORY)+@($missing.FullName)
+              &gh @uploadArgs
+              if($LASTEXITCODE-ne0){throw 'Uploading missing draft assets failed.'}
             }
-          }
-          function Assert-RemoteReleaseAssets {
-            param([Parameter(Mandatory = $true)]$Release,[Parameter(Mandatory = $true)][string]$Phase)
-            $remoteNames = @($Release.assets | ForEach-Object { [string]$_.name } | Sort-Object)
-            if ($Release.assets.Count -ne 6 -or
-                (Compare-Object $expectedAssetNames $remoteNames).Count -ne 0) {
-              throw "$Phase release asset names differ from the fixed six-file contract."
+            $release=gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"|ConvertFrom-Json
+            $draftBodyLines=@([string]$release.body -split "`r?`n")
+            if($release.draft-ne$true-or$release.tag_name-cne$tag-or$release.target_commitish-cne$env:RELEASE_SHA-or$release.author.login-cne'github-actions[bot]'){throw 'Draft state or identity changed during recovery.'}
+            foreach($marker in $draftMarkers){if($draftBodyLines -cnotcontains $marker){throw 'Draft binding changed during recovery.'}}
+            Assert-RemoteAssets $release $true 'Draft'
+            $draftTagResponse=Invoke-WebRequest -SkipHttpErrorCheck -Headers $apiHeaders -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag"
+            if([int]$draftTagResponse.StatusCode-eq200){
+              $draftTagCommit=Resolve-RemoteTagCommit $tag
+              if($draftTagCommit-cne$env:RELEASE_SHA){throw 'Draft tag differs from approved release commit.'}
+            }elseif([int]$draftTagResponse.StatusCode-ne404){
+              throw "Unable to determine draft tag state: HTTP $([int]$draftTagResponse.StatusCode)."
             }
-            foreach ($asset in $Release.assets) {
-              $expected = $expectedAssets[[string]$asset.name]
-              if ($null -eq $expected -or $asset.state -cne 'uploaded' -or
-                  [string]$asset.digest -cne [string]$expected.digest -or
-                  [int64]$asset.size -ne [int64]$expected.bytes) {
-                throw "$Phase release asset digest/size mismatch: $($asset.name)"
-              }
-            }
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+            if($LASTEXITCODE-ne0){throw 'Publication failed.'}
+            $published=gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"|ConvertFrom-Json
+          }elseif($release.draft-eq$false){
+            $published=$release
+          }else{
+            throw 'Release draft state is malformed.'
           }
-          function Assert-DownloadedReleaseAssets {
-            param([Parameter(Mandatory = $true)][string]$ReleaseTag,[Parameter(Mandatory = $true)][string]$Phase)
-            $downloadParent = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
-            $downloadRoot = Join-Path $downloadParent ("defensetracker-release-download-$Phase-" + [guid]::NewGuid().ToString('N'))
-            try {
-              New-Item -ItemType Directory -Path $downloadRoot | Out-Null
-              gh release download $ReleaseTag --dir $downloadRoot
-              if ($LASTEXITCODE -ne 0) { throw "$Phase release asset download failed." }
-              $downloaded = @(Get-ChildItem -LiteralPath $downloadRoot -Force)
-              if ($downloaded.Count -ne 6 -or
-                  @($downloaded | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0 -or
-                  (Compare-Object $expectedAssetNames @($downloaded.Name | Sort-Object)).Count -ne 0) {
-                throw "$Phase downloaded release names differ from the fixed six-file contract."
-              }
-              foreach ($name in $expectedAssetNames) {
-                $path = Join-Path $downloadRoot $name
-                $actualDigest = 'sha256:' + (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-                $actualBytes = [int64](Get-Item -LiteralPath $path).Length
-                if ($actualDigest -cne [string]$expectedAssets[$name].digest -or
-                    $actualBytes -ne [int64]$expectedAssets[$name].bytes) {
-                  throw "$Phase downloaded release bytes differ: $name"
-                }
-              }
-            } finally {
-              if (Test-Path -LiteralPath $downloadRoot -PathType Container) {
-                $resolved = [System.IO.Path]::GetFullPath($downloadRoot)
-                if (-not $resolved.StartsWith($downloadParent) -or
-                    [System.IO.Path]::GetFileName($resolved) -cnotmatch '^defensetracker-release-download-[a-z-]+-[0-9a-f]{32}$') {
-                  throw 'Refusing to remove an unexpected release verification directory.'
-                }
-                Get-ChildItem -LiteralPath $resolved -Force -Recurse | Select-Object FullName,Length | Out-Null
-                Remove-Item -LiteralPath $resolved -Recurse -Force
-              }
-            }
-          }
-          $assets = @($expectedAssetNames | ForEach-Object { (Get-Item -LiteralPath (Join-Path candidate $_)).FullName })
-          & gh release create $tag --draft --target $env:RELEASE_SHA `
-            --title "DefenseTracker $tag" --notes-file release-notes.md @assets
-          if ($LASTEXITCODE -ne 0) { throw "Draft release creation failed." }
-          $draft = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if ($draft.draft -ne $true -or $draft.target_commitish -cne $env:RELEASE_SHA) {
-            throw "Draft release is incomplete or targets the wrong commit."
-          }
-          Assert-RemoteReleaseAssets $draft 'draft'
-          Assert-DownloadedReleaseAssets $tag 'draft'
-          $prematureTag = git ls-remote --tags origin "refs/tags/$tag"
-          if ($LASTEXITCODE -ne 0) { throw "Unable to reverify the remote release tag namespace." }
-          if (-not [string]::IsNullOrWhiteSpace($prematureTag)) {
-            throw "A release tag appeared before immutable publication; refusing to continue."
-          }
-          $draftBeforePublish = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if ($draftBeforePublish.draft -ne $true -or
-              $draftBeforePublish.target_commitish -cne $env:RELEASE_SHA) {
-            throw "Draft release changed before publication."
-          }
-          Assert-RemoteReleaseAssets $draftBeforePublish 'draft-before-publish'
-          Assert-DownloadedReleaseAssets $tag 'draft-before-publish'
-          gh release edit $tag --draft=false --latest
-          if ($LASTEXITCODE -ne 0) { throw "Draft publication failed." }
-          $publishedBeforeImmutableCheck = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if ($publishedBeforeImmutableCheck.draft -ne $false -or
-              $publishedBeforeImmutableCheck.target_commitish -cne $env:RELEASE_SHA) {
-            throw "Published release differs from the approved commit."
-          }
-          Assert-RemoteReleaseAssets $publishedBeforeImmutableCheck 'published-before-immutable-check'
-          Assert-DownloadedReleaseAssets $tag 'published-before-immutable-check'
-          if ($publishedBeforeImmutableCheck.immutable -ne $true) {
-            throw "Published release did not become immutable."
-          }
-          $publishedAfterImmutableCheck = gh api "/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" | ConvertFrom-Json
-          if ($publishedAfterImmutableCheck.draft -ne $false -or
-              $publishedAfterImmutableCheck.immutable -ne $true -or
-              $publishedAfterImmutableCheck.target_commitish -cne $env:RELEASE_SHA) {
-            throw "Published release changed while confirming immutability."
-          }
-          Assert-RemoteReleaseAssets $publishedAfterImmutableCheck 'published-after-immutable-check'
-          Assert-DownloadedReleaseAssets $tag 'published-after-immutable-check'
-          git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag"
-          if ((git rev-list -n 1 $tag) -ne $env:RELEASE_SHA) { throw "Published tag does not point to the release commit." }
+          if($published.draft-ne$false-or$published.immutable-ne$true-or$published.tag_name-cne$tag){throw 'Published release is not immutable and complete.'}
+          Assert-RemoteAssets $published $true 'Published'
+          $publishedTagCommit=Resolve-RemoteTagCommit $tag
+          if($publishedTagCommit-cne$env:RELEASE_SHA){throw 'Published tag differs from approved release commit.'}

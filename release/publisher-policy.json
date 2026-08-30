@@ -1,0 +1,35 @@
+{
+  "$schema": "./publisher-policy.schema.json",
+  "schema_version": 1,
+  "status": "pending",
+  "publisher": null,
+  "active_provider": null,
+  "providers": {
+    "AzureArtifactSigning": {
+      "status": "pending",
+      "endpoint": null,
+      "account_name": null,
+      "certificate_profile_name": null,
+      "expected_subjects": [],
+      "expected_issuers": [],
+      "expected_root_sha256": [],
+      "durable_identity_eku": null,
+      "public_trust_eku": "1.3.6.1.4.1.311.97.1.0",
+      "code_signing_eku": "1.3.6.1.5.5.7.3.3",
+      "forbidden_test_eku": "1.3.6.1.4.1.311.10.3.13",
+      "leaf_spki_policy": "record-only"
+    },
+    "DigiCertKeyLocker": {
+      "status": "pending",
+      "sm_host": null,
+      "key_alias": null,
+      "certificate_file_sha256": null,
+      "expected_subjects": [],
+      "expected_spki_sha256": [],
+      "expected_issuers": [],
+      "expected_root_sha256": [],
+      "code_signing_eku": "1.3.6.1.5.5.7.3.3",
+      "leaf_spki_policy": "required-pin"
+    }
+  }
+}

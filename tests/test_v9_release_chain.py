@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import struct
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,13 +20,15 @@ from scripts.finalize_release_assets import finalize as finalize_release_assets
 from scripts.generate_component_inventory import generate as generate_component_inventory
 from scripts.generate_windows_version_info import render_version_info
 from scripts.installer_review import (
-    APPROVAL_KIND,
-    INSTALLER_REVIEW_SCOPE,
-    canonical_json_bytes,
     generate_installer_review_request,
     write_canonical_json,
 )
 from scripts.package_release_assets import package_assets
+from scripts.signing_exchange import (
+    canonical_json_bytes as signing_exchange_canonical_bytes,
+    create_request as create_signing_request,
+    write_canonical_json as write_signing_exchange_json,
+)
 from scripts.verify_deployment_evidence import (
     CORE_PAYLOAD_FILES,
     PAYLOAD_FILES,
@@ -38,7 +41,10 @@ from scripts.verify_deployment_evidence import (
     seal_origin_isolation as _seal_origin_isolation,
     verify as _verify_deployment_evidence,
 )
-from scripts.verify_release_assets import verify as verify_release_assets
+from scripts.verify_release_assets import (
+    verify as verify_release_assets,
+    verify_portable_archive_inventory,
+)
 from scripts.verify_release_checks import (
     EXPECTED_CODEQL_EVENT,
     EXPECTED_CODEQL_WORKFLOW_PATH,
@@ -152,6 +158,95 @@ def _mock_authenticode_sign(unsigned: bytes) -> bytes:
         "<II", signed, security_directory, certificate_offset, len(certificate)
     )
     return bytes(signed)
+
+
+def _write_signing_exchange(
+    *,
+    root: Path,
+    subject_kind: str,
+    bundle_root: Path,
+    target_path: str,
+    signed_path: Path,
+    policy_sha256: str,
+    request_workflow_ref: str,
+    request_run_id: int,
+    request_job: str,
+    receipt_workflow_ref: str,
+    receipt_run_id: int,
+    receipt_job: str,
+    created_at_utc: str,
+    timestamp_verified_at_utc: str,
+    completed_at_utc: str,
+    materials: dict[str, str],
+) -> tuple[Path, Path]:
+    request = create_signing_request(
+        subject_kind=subject_kind,
+        bundle_root=bundle_root,
+        target_path=target_path,
+        release_commit=COMMIT,
+        source_tree=TREE,
+        version=PRODUCT_VERSION.semantic_version,
+        publisher="Example Legal Publisher",
+        repository="player1314520/defense-tracker-mvp",
+        workflow_ref=request_workflow_ref,
+        run_id=request_run_id,
+        run_attempt=1,
+        job=request_job,
+        materials=materials,
+        created_at_utc=created_at_utc,
+    )
+    request_path = root / f"{subject_kind}-signing-request.json"
+    write_signing_exchange_json(request_path, request)
+    request_sha256 = hashlib.sha256(
+        signing_exchange_canonical_bytes(request)
+    ).hexdigest()
+    target = request["target"]
+    assert isinstance(target, dict)
+    signed_bytes = signed_path.read_bytes()
+    receipt = {
+        "schema": 2,
+        "kind": "defense-tracker-authenticode-signing-receipt",
+        "subject_kind": subject_kind,
+        "request_sha256": request_sha256,
+        "release_commit": COMMIT,
+        "target_path": target_path,
+        "unsigned_sha256": target["sha256"],
+        "signed_sha256": hashlib.sha256(signed_bytes).hexdigest(),
+        "signed_bytes": len(signed_bytes),
+        "signature": {
+            "provider": "AzureArtifactSigning",
+            "publisher": "Example Legal Publisher",
+            "signer_subject": "CN=Example Legal Publisher, O=Example Organization",
+            "signer_spki_sha256": _digest(f"{subject_kind}-rotating-leaf"),
+            "signer_issuer_subject": "CN=Example Public Trust CA, O=Example Trust",
+            "signer_root_sha256": _digest("example-public-trust-root"),
+            "timestamp_url": "https://timestamp.example.invalid",
+            "timestamp_certificate_subject": "CN=Example TSA, O=Example Trust",
+            "timestamp_verified_at_utc": timestamp_verified_at_utc,
+            "publisher_policy": {
+                "sha256": policy_sha256,
+                "leaf_spki_policy": "record-only",
+                "durable_identity_eku": "1.3.6.1.4.1.311.97.1.9.9",
+                "azure_endpoint": "https://eus.codesigning.azure.net/",
+                "azure_account_name": "example-account",
+                "azure_certificate_profile_name": "example-profile",
+                "azure_metadata_sha256": _digest(f"{subject_kind}-azure-metadata"),
+                "digicert_sm_host": None,
+                "digicert_key_alias": None,
+            },
+        },
+        "provenance": {
+            "repository": "player1314520/defense-tracker-mvp",
+            "workflow_ref": receipt_workflow_ref,
+            "run_id": receipt_run_id,
+            "run_attempt": 1,
+            "job": receipt_job,
+        },
+        "completed_at_utc": completed_at_utc,
+    }
+    receipt_path = root / f"{subject_kind}-signing-receipt.json"
+    write_signing_exchange_json(receipt_path, receipt)
+    return request_path, receipt_path
 
 
 def test_authenticode_neutral_digest_accepts_only_signature_mutations(tmp_path):
@@ -527,7 +622,7 @@ def test_windows_version_info_contains_required_release_fields():
         assert value in rendered
 
 
-def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
+def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path, monkeypatch):
     app = tmp_path / "app"
     app.mkdir()
     unsigned_executable = _minimal_unsigned_pe64()
@@ -613,7 +708,9 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
     manifest = json.loads((output / "release-manifest.json").read_text())
     assert manifest["schema"] == 2
     assert manifest["release"]["baseline_commit"] == PRODUCT_VERSION.release_baseline
-    assert set(manifest["build"]["toolchain"]) == tool_names
+    assert set(manifest["build"]["toolchain"]) == {
+        "python", "signtool", "iscc", "seven_zip", "defender"
+    }
     assert manifest["build"]["source_date_epoch_utc"].endswith("Z")
     assert manifest["build"]["started_at_utc"] == args.build_started_utc
     assert manifest["build"]["finished_at_utc"] == args.build_finished_utc
@@ -622,47 +719,17 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
     with pytest.raises(ValueError, match="compliance review is incomplete"):
         verify_release_assets(output, expected_commit=COMMIT)
 
-    reviewer_private_key = Ed25519PrivateKey.generate()
-    reviewer_public_key = reviewer_private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-    reviewer_registry = tmp_path / "compliance-reviewers.json"
-    reviewer_registry.write_text(
-        json.dumps(
-            {
-                "schema": 1,
-                "status": "active",
-                "reviewers": [
-                    {
-                        "key_id": "example-reviewer-2026",
-                        "organization": "Example Independent Reviewer",
-                        "public_key_base64": base64.b64encode(
-                            reviewer_public_key
-                        ).decode("ascii"),
-                        "public_key_sha256": hashlib.sha256(
-                            reviewer_public_key
-                        ).hexdigest(),
-                        "allowed_publishers": ["Example Legal Publisher"],
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
     inventory_payload = json.loads(component_inventory.read_text(encoding="utf-8"))
     compliance_evidence = tmp_path / "compliance-evidence.json"
     compliance_evidence.write_text(
         json.dumps(
             {
-                "schema": 1,
+                "schema": 2,
                 "release_commit": COMMIT,
                 "source_tree": TREE,
                 "publisher": "Example Legal Publisher",
                 "reviewed_at_utc": "2026-08-27T23:59:59Z",
                 "review_reference": "legal-review:V9-2026-001",
-                "reviewer_key_id": "example-reviewer-2026",
-                "reviewer_organization": "Example Independent Reviewer",
                 "license_review": "approved",
                 "sbom_scope": "final-shipped-bytes",
                 "stable_release_eligible": True,
@@ -700,16 +767,64 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
         ),
         encoding="utf-8",
     )
-    compliance_signature = tmp_path / "compliance-evidence.sig"
-    compliance_signature.write_text(
-        base64.b64encode(
-            reviewer_private_key.sign(compliance_evidence.read_bytes())
-        ).decode("ascii")
+    publisher_policy = tmp_path / "publisher-policy.json"
+    publisher_policy.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "status": "approved",
+                "publisher": "Example Legal Publisher",
+                "active_provider": "AzureArtifactSigning",
+            },
+            sort_keys=True,
+        )
         + "\n",
-        encoding="ascii",
+        encoding="utf-8",
+        newline="\n",
     )
+    policy_sha256 = hashlib.sha256(publisher_policy.read_bytes()).hexdigest()
     (app / "DefenseTracker.exe").write_bytes(
         _mock_authenticode_sign(unsigned_executable)
+    )
+    application_signing_bundle = tmp_path / "application-signing-bundle"
+    application_target = (
+        application_signing_bundle
+        / "payload"
+        / "DefenseTracker"
+        / "DefenseTracker.exe"
+    )
+    application_target.parent.mkdir(parents=True)
+    application_target.write_bytes(unsigned_executable)
+    application_request_path, application_receipt_path = _write_signing_exchange(
+        root=tmp_path,
+        subject_kind="application",
+        bundle_root=application_signing_bundle,
+        target_path="payload/DefenseTracker/DefenseTracker.exe",
+        signed_path=app / "DefenseTracker.exe",
+        policy_sha256=policy_sha256,
+        request_workflow_ref=(
+            "player1314520/defense-tracker-mvp/.github/workflows/"
+            "v9-release-preparation.yml@refs/heads/main"
+        ),
+        request_run_id=111111,
+        request_job="prepare-unsigned-application",
+        receipt_workflow_ref=(
+            "player1314520/defense-tracker-mvp/.github/workflows/"
+            "v9-application-signing.yml@refs/heads/main"
+        ),
+        receipt_run_id=222222,
+        receipt_job="sign-application",
+        created_at_utc="2026-08-27T23:59:58Z",
+        timestamp_verified_at_utc="2026-08-28T00:00:00Z",
+        completed_at_utc="2026-08-28T00:00:00Z",
+        materials={
+            "build-lock": "d" * 64,
+            "component-inventory": hashlib.sha256(
+                component_inventory.read_bytes()
+            ).hexdigest(),
+            "installed-packages": hashlib.sha256(packages.read_bytes()).hexdigest(),
+            "runtime-lock": "c" * 64,
+        },
     )
     installer_payload = tmp_path / "installer-payload"
     (installer_payload / "_internal").mkdir(parents=True)
@@ -769,68 +884,49 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
         version=PRODUCT_VERSION.semantic_version,
         publisher="Example Legal Publisher",
     )
-    installer_reviewer_private_key = Ed25519PrivateKey.generate()
-    installer_reviewer_public_key = (
-        installer_reviewer_private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-    )
-    installer_reviewer_registry = tmp_path / "installer-reviewers.json"
+    installer_request_path = tmp_path / "installer-review-request.json"
     write_canonical_json(
-        installer_reviewer_registry,
-        {
-            "schema": 1,
-            "status": "active",
-            "scope": INSTALLER_REVIEW_SCOPE,
-            "reviewers": [
-                {
-                    "key_id": "installer-reviewer-2026",
-                    "organization": "Example Independent Installer Reviewer",
-                    "public_key_base64": base64.b64encode(
-                        installer_reviewer_public_key
-                    ).decode("ascii"),
-                    "public_key_sha256": hashlib.sha256(
-                        installer_reviewer_public_key
-                    ).hexdigest(),
-                    "allowed_publishers": ["Example Legal Publisher"],
-                    "scope": INSTALLER_REVIEW_SCOPE,
-                }
-            ],
-        },
-    )
-    installer_request_bytes = canonical_json_bytes(installer_request)
-    installer_review_evidence = tmp_path / "installer-review-evidence.json"
-    write_canonical_json(
-        installer_review_evidence,
-        {
-            "schema": 1,
-            "kind": APPROVAL_KIND,
-            "request_sha256": hashlib.sha256(installer_request_bytes).hexdigest(),
-            "request_base64": base64.b64encode(installer_request_bytes).decode(
-                "ascii"
-            ),
-            "decision": "approved",
-            "scope": INSTALLER_REVIEW_SCOPE,
-            "reviewer_key_id": "installer-reviewer-2026",
-            "reviewer_organization": "Example Independent Installer Reviewer",
-            "review_reference": "installer-review:V9-2026-001",
-            "reviewed_at_utc": "2026-08-27T23:59:59Z",
-        },
-    )
-    installer_review_signature = tmp_path / "installer-review-evidence.sig"
-    installer_review_signature.write_text(
-        base64.b64encode(
-            installer_reviewer_private_key.sign(
-                installer_review_evidence.read_bytes()
-            )
-        ).decode("ascii")
-        + "\n",
-        encoding="ascii",
+        installer_request_path,
+        installer_request,
     )
     signed_installer = tmp_path / "signed-installer.exe"
     signed_installer.write_bytes(_mock_authenticode_sign(unsigned_installer_bytes))
+    installer_signing_bundle = tmp_path / "installer-signing-bundle"
+    installer_target = (
+        installer_signing_bundle
+        / "payload"
+        / "DefenseTracker-Setup-v9.0.0-windows-x64.exe"
+    )
+    installer_target.parent.mkdir(parents=True)
+    installer_target.write_bytes(unsigned_installer_bytes)
+    installer_signing_request_path, installer_receipt_path = _write_signing_exchange(
+        root=tmp_path,
+        subject_kind="installer",
+        bundle_root=installer_signing_bundle,
+        target_path="payload/DefenseTracker-Setup-v9.0.0-windows-x64.exe",
+        signed_path=signed_installer,
+        policy_sha256=policy_sha256,
+        request_workflow_ref=(
+            "player1314520/defense-tracker-mvp/.github/workflows/"
+            "v9-application-signing.yml@refs/heads/main"
+        ),
+        request_run_id=222222,
+        request_job="prepare-unsigned-installer",
+        receipt_workflow_ref=(
+            "player1314520/defense-tracker-mvp/.github/workflows/"
+            "v9-signed-candidate.yml@refs/heads/main"
+        ),
+        receipt_run_id=333333,
+        receipt_job="sign-installer",
+        created_at_utc="2026-08-28T00:00:01Z",
+        timestamp_verified_at_utc="2026-08-28T00:00:02Z",
+        completed_at_utc="2026-08-28T00:00:02Z",
+        materials={"installer-review-request": hashlib.sha256(
+            installer_request_path.read_bytes()
+        ).hexdigest()},
+    )
     approved_output = tmp_path / "approved-assets"
+    monkeypatch.chdir(tmp_path)
     approved_args = argparse.Namespace(
         **{
             **vars(args),
@@ -840,18 +936,21 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
             "compliance_evidence_sha256": hashlib.sha256(
                 compliance_evidence.read_bytes()
             ).hexdigest(),
-            "compliance_signature": compliance_signature,
-            "compliance_reviewer_registry": reviewer_registry,
             "component_inventory": component_inventory,
-            "application_signer_subject": "CN=Example Legal Publisher",
-            "application_timestamp_subject": "CN=Example Timestamp",
-            "installer_review_evidence": installer_review_evidence,
-            "installer_review_signature": installer_review_signature,
-            "installer_reviewer_registry": installer_reviewer_registry,
-            "installer_review_evidence_sha256": hashlib.sha256(
-                installer_review_evidence.read_bytes()
-            ).hexdigest(),
-            "unsigned_installer": installer,
+            "publisher_policy": publisher_policy.relative_to(tmp_path).as_posix(),
+            "application_signing_request": application_request_path.relative_to(
+                tmp_path
+            ).as_posix(),
+            "application_signing_receipt": application_receipt_path.relative_to(
+                tmp_path
+            ).as_posix(),
+            "installer_signing_request": installer_signing_request_path.relative_to(
+                tmp_path
+            ).as_posix(),
+            "installer_signing_receipt": installer_receipt_path.relative_to(
+                tmp_path
+            ).as_posix(),
+            "installer_review_request": installer_request_path,
             "installer_payload_root": installer_payload,
             "signed_application_inventory": signed_application_inventory,
             "iss": iss,
@@ -874,18 +973,72 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
             (app / "DefenseTracker.exe").read_bytes()
         ).hexdigest(),
     )
-    verify_release_assets(
-        approved_output,
-        expected_commit=COMMIT,
-        reviewer_registry=reviewer_registry,
-        installer_reviewer_registry=installer_reviewer_registry,
-    )
+    verify_release_assets(approved_output, expected_commit=COMMIT)
+    extra_entry_output = tmp_path / "extra-entry-assets"
+    shutil.copytree(approved_output, extra_entry_output)
+    (extra_entry_output / "unexpected").mkdir()
+    with pytest.raises(ValueError, match="non-file or reparse"):
+        verify_release_assets(extra_entry_output, expected_commit=COMMIT)
+    duplicate_sums_output = tmp_path / "duplicate-sums-assets"
+    shutil.copytree(approved_output, duplicate_sums_output)
+    sums_path = duplicate_sums_output / "SHA256SUMS.txt"
+    first_sum = sums_path.read_text(encoding="utf-8").splitlines()[0]
+    with sums_path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(first_sum + "\n")
+    with pytest.raises(ValueError, match="Malformed SHA256SUMS"):
+        verify_release_assets(duplicate_sums_output, expected_commit=COMMIT)
     approved_manifest = json.loads(
         (approved_output / "release-manifest.json").read_text()
     )
     assert approved_manifest["compliance"]["evidence_sha256"] == hashlib.sha256(
         compliance_evidence.read_bytes()
     ).hexdigest()
+    assert approved_manifest["compliance"]["evidence_schema"] == 2
+    assert approved_manifest["installer_review"]["schema"] == 2
+    assert "signature_base64" not in approved_manifest["compliance"]
+    assert "reviewer_key_id" not in approved_manifest["installer_review"]
+    tampered_receipt_output = tmp_path / "tampered-receipt-assets"
+    shutil.copytree(approved_output, tampered_receipt_output)
+    tampered_manifest_path = tampered_receipt_output / "release-manifest.json"
+    tampered_manifest = json.loads(tampered_manifest_path.read_text(encoding="utf-8"))
+    tampered_manifest["signatures"]["application"]["signed_sha256"] = "f" * 64
+    tampered_manifest_path.write_text(
+        json.dumps(tampered_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    with pytest.raises(ValueError, match="signed identity differs from receipt"):
+        verify_release_assets(tampered_receipt_output, expected_commit=COMMIT)
+    tampered_policy_output = tmp_path / "tampered-policy-assets"
+    shutil.copytree(approved_output, tampered_policy_output)
+    tampered_policy_manifest_path = tampered_policy_output / "release-manifest.json"
+    tampered_policy_manifest = json.loads(
+        tampered_policy_manifest_path.read_text(encoding="utf-8")
+    )
+    installer_record = tampered_policy_manifest["signatures"]["installer"]
+    installer_exchange = installer_record["exchange"]
+    installer_receipt = json.loads(
+        base64.b64decode(installer_exchange["receipt_base64"], validate=True)
+    )
+    installer_receipt["signature"]["publisher_policy"]["azure_endpoint"] = (
+        "https://other.codesigning.azure.net/"
+    )
+    altered_receipt_bytes = signing_exchange_canonical_bytes(installer_receipt)
+    installer_exchange["receipt_base64"] = base64.b64encode(
+        altered_receipt_bytes
+    ).decode("ascii")
+    installer_exchange["receipt_sha256"] = hashlib.sha256(
+        altered_receipt_bytes
+    ).hexdigest()
+    installer_exchange["signature"] = installer_receipt["signature"]
+    installer_record.update(installer_receipt["signature"])
+    tampered_policy_manifest_path.write_text(
+        json.dumps(tampered_policy_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    with pytest.raises(ValueError, match="Azure durable Publisher identity differs"):
+        verify_release_assets(tampered_policy_output, expected_commit=COMMIT)
     approved_sbom = json.loads(
         (approved_output / "DefenseTracker-v9.0.0.spdx.json").read_text()
     )
@@ -910,72 +1063,83 @@ def test_release_packager_emits_exact_six_assets_and_schema_2(tmp_path):
     invalid_payload["packages"][0]["license_declared"] = "Definitely approved"
     invalid_evidence = tmp_path / "invalid-compliance-evidence.json"
     invalid_evidence.write_text(json.dumps(invalid_payload), encoding="utf-8")
-    invalid_signature = tmp_path / "invalid-compliance-evidence.sig"
-    invalid_signature.write_text(
-        base64.b64encode(reviewer_private_key.sign(invalid_evidence.read_bytes())).decode(
-            "ascii"
-        ),
-        encoding="ascii",
-    )
     invalid_args = argparse.Namespace(
         **{
-            **vars(args),
+            **vars(approved_args),
             "output_dir": tmp_path / "invalid-assets",
             "compliance_evidence": invalid_evidence,
             "compliance_evidence_sha256": hashlib.sha256(
                 invalid_evidence.read_bytes()
             ).hexdigest(),
-            "compliance_signature": invalid_signature,
-            "compliance_reviewer_registry": reviewer_registry,
-            "component_inventory": component_inventory,
         }
     )
     with pytest.raises(ValueError, match="package license is invalid"):
         package_assets(invalid_args)
 
 
+@pytest.mark.parametrize(
+    "unsafe_path",
+    ("..\\escape.exe", "C:/escape.exe", "//server/share.exe", "bad\x00name.exe"),
+)
+def test_portable_inventory_rejects_windows_unsafe_paths(tmp_path, unsafe_path):
+    manifest = {
+        "version": {"semantic_version": PRODUCT_VERSION.semantic_version},
+        "portable_contents": [
+            {"path": unsafe_path, "bytes": 1, "sha256": "a" * 64}
+        ],
+    }
+    with pytest.raises(ValueError, match="unsafe path"):
+        verify_portable_archive_inventory(tmp_path, manifest)
+
+
+def test_portable_inventory_rejects_casefold_duplicate_paths(tmp_path):
+    manifest = {
+        "version": {"semantic_version": PRODUCT_VERSION.semantic_version},
+        "portable_contents": [
+            {"path": "Readme.txt", "bytes": 1, "sha256": "a" * 64},
+            {"path": "README.TXT", "bytes": 1, "sha256": "b" * 64},
+        ],
+    }
+    with pytest.raises(ValueError, match="duplicate path"):
+        verify_portable_archive_inventory(tmp_path, manifest)
+
+
 def test_release_workflows_are_manual_exact_sha_and_fail_closed():
+    preparation = (ROOT / ".github/workflows/v9-release-preparation.yml").read_text()
+    application = (ROOT / ".github/workflows/v9-application-signing.yml").read_text()
     candidate = (ROOT / ".github/workflows/v9-signed-candidate.yml").read_text()
     release = (ROOT / ".github/workflows/v9-stable-release.yml").read_text()
     deployment = (ROOT / ".github/workflows/v9-deployment-evidence.yml").read_text()
-    assert "workflow_dispatch" in candidate and "workflow_dispatch" in release
-    assert "-RequireSignedInstaller" in candidate
-    assert "-CandidateOnly" in candidate
-    assert "dist/candidates/v9.0.0/" in candidate
+    for workflow in (preparation, application, candidate, release):
+        assert "workflow_dispatch" in workflow
+        assert "permissions: {}" in workflow[: workflow.index("jobs:")]
+    assert "Prepare-UnsignedApplicationBundle.ps1" in preparation
+    assert "v9-trusted-signing" in application
+    assert "v9-installer-signing-review" in candidate
+    assert "v9-candidate-processing" in application + candidate + release
+    assert "RELEASE_ARTIFACT_AGE_IDENTITY" in application + candidate + release
+    assert "candidate-transport-request.json" in preparation + application + candidate
+    assert "dist/candidates/v9.0.0/" not in candidate
     assert "dist/releases/v9.0.0/" not in candidate
-    assert "v9-trusted-signing" in candidate
     assert "v9-deployment-evidence.yml" in release
     assert "if: github.ref == 'refs/heads/main'" in release
     assert "ref: ${{ github.sha }}" in release
     assert "ref: ${{ inputs.release_sha }}" not in release
     assert "portal_image_run_id:" in release
+    assert "portal_image_run_attempt:" in release
+    assert "deployment_evidence_run_attempt:" in release
     assert "immutable-releases" in release
     assert "actions/attest@" in release
-    assert "defense-v9-candidate-ephemeral" in candidate
-    assert "defense-v9-stable-ephemeral" in release
-    assert "DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE" in candidate
-    assert "DEFENSE_TRACKER_COMPLIANCE_EVIDENCE" in candidate
-    assert "DEFENSE_TRACKER_COMPLIANCE_SIGNATURE" in candidate
-    assert "DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256" in candidate
-    assert "DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE" in release
-    assert candidate.index("Attest candidate build provenance") < candidate.index(
-        "Retain candidate"
-    )
-    assert release.index("Verify candidate provenance") < release.index(
-        "Generate SLSA provenance"
-    )
-    for source_binding in (
-        "--signer-workflow",
-        "--source-ref refs/heads/main",
-        "--source-digest $env:RELEASE_SHA",
-    ):
-        assert source_binding in release
-    assert "$candidate.head_branch -ne 'main'" in release
+    assert candidate.count("runs-on: windows-2022") == 2
+    assert "runs-on: windows-2022" in release
+    assert "Verify-ApplicationSigningPreparation.ps1" in application
+    assert "Verify-ReleaseAuthenticode.ps1" in release
+    assert "publisher-policy.json" in application + candidate + release
+    assert "promotion-request.json" in release
     assert release.index("verify_release_assets.py") < release.index("gh release create")
     assert release.index("immutable-releases") < release.index("gh release create")
-    assert release.index("git ls-remote --tags origin") < release.index("gh release create")
-    assert release.count("git ls-remote --tags origin") >= 2
-    for workflow in (candidate, release, deployment):
+    assert release.index("git/ref/tags/$tag") < release.index("gh release create")
+    for workflow in (preparation, application, candidate, release, deployment):
         lines = workflow.splitlines()
         run_blocks: list[str] = []
         for index, line in enumerate(lines):
@@ -991,10 +1155,10 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
             run_blocks.append("\n".join(block))
         assert run_blocks
         assert all("${{ inputs." not in block for block in run_blocks)
-    assert "^[0-9a-f]{40}$" in candidate
+    assert 'fullmatch(r"^[0-9a-f]{40}$"' in candidate
     assert "^[0-9a-f]{40}$" in release
     assert "^[0-9a-f]{40}$" in deployment
-    assert "^[1-9][0-9]{0,19}$" in release
+    assert "^[1-9][0-9]{0,18}$" in release
     assert "^[1-9][0-9]{0,19}$" in deployment
     assert "STAGING_ORIGIN: ${{ inputs.staging_origin }}" in deployment
     assert "PRODUCTION_ORIGIN: ${{ inputs.production_origin }}" in deployment
@@ -1033,13 +1197,15 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
     assert "DEFENSE_TRACKER_STAGING_ORIGIN" in release
     assert "DEFENSE_TRACKER_PRODUCTION_ORIGIN" in release
     assert "PORTAL_IMAGE_RUN_ID" in release
+    assert "PORTAL_IMAGE_RUN_ATTEMPT" in release
+    assert "DEPLOYMENT_EVIDENCE_RUN_ATTEMPT" in release
     assert "--expected-collector-key-id" in release
     assert "--expected-collector-public-key-sha256" in release
     assert "--expected-staging-origin $env:DEPLOYMENT_STAGING_ORIGIN" in release
     assert "--expected-production-origin $env:DEPLOYMENT_PRODUCTION_ORIGIN" in release
-    assert "$portalImage.path -ne '.github/workflows/v9-portal-image.yml'" in release
+    assert "path='.github/workflows/v9-portal-image.yml'" in release
     assert "v9-portal-image-${{ inputs.release_sha }}-${{ inputs.portal_image_run_id }}" in release
-    assert "Portal image receipt does not bind the approved run, commit and digest" in release
+    assert "Portal image receipt mismatch." in release
     assert 'gh attestation verify "oci://$expectedReference"' in release
     assert ".github/workflows/v9-portal-image.yml" in release
     assert "--bundle-from-oci" in release
@@ -1049,7 +1215,7 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
         '$signerWorkflow = "$env:GITHUB_REPOSITORY/.github/workflows/v9-deployment-evidence.yml"'
         in release
     )
-    assert release.count("gh attestation verify $_.FullName") >= 3
+    assert release.count("gh attestation verify $_.FullName") >= 2
     assert "--expected-staging-origin \"${STAGING_ORIGIN}\"" in deployment
     assert "--expected-production-origin \"${PRODUCTION_ORIGIN}\"" in deployment
     for evidence_file in PAYLOAD_FILES | {"deployment-evidence.json"}:
@@ -1071,11 +1237,22 @@ def test_ci_pins_actionlint_and_validates_all_workflows():
     assert '"$tool_dir/actionlint" -no-color -shellcheck= -pyflakes=' in workflow
 
 
-def test_compliance_reviewer_registry_is_fail_closed_until_legal_activation():
-    registry = json.loads(
-        (ROOT / "release" / "compliance-reviewers.json").read_text(encoding="utf-8")
+def test_release_manifest_uses_canonical_signing_exchanges_not_approval_contexts():
+    packager = (ROOT / "scripts" / "package_release_assets.py").read_text(
+        encoding="utf-8"
     )
-    assert registry == {"schema": 1, "status": "inactive", "reviewers": []}
+    verifier = (ROOT / "scripts" / "verify_release_assets.py").read_text(
+        encoding="utf-8"
+    )
+    assert "--application-signing-request" in packager
+    assert "--application-signing-receipt" in packager
+    assert "--installer-signing-request" in packager
+    assert "--installer-signing-receipt" in packager
+    for source in (packager, verifier):
+        assert "--compliance-approval-context" not in source
+        assert "--installer-review-approval-context" not in source
+        assert "--compliance-reviewer-registry" not in source
+        assert "--installer-reviewer-registry" not in source
 
 
 def test_hash_locks_and_installers_require_hashes():

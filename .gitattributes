@@ -1,3 +1,4 @@
 *.sh text eol=lf
+release/candidate-transport-recipient.txt text eol=lf
 THIRD_PARTY_LICENSES/** -text
 THIRD_PARTY_LICENSES/DOMPurify-3.2.6/LICENSE whitespace=-blank-at-eof

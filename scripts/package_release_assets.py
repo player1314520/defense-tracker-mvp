@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import argparse
 import base64
-import binascii
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -16,8 +16,6 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from packaging.licenses import InvalidLicenseExpression, canonicalize_license_expression
 
 
@@ -28,8 +26,17 @@ if str(PROJECT_ROOT) not in sys.path:
 from product_version import PRODUCT_VERSION  # noqa: E402
 from scripts.authenticode_digest import inspect_authenticode_image  # noqa: E402
 from scripts.installer_review import (  # noqa: E402
-    verify_installer_after_sign,
-    verify_installer_before_sign,
+    _read_json_object as read_installer_review_json,
+    _validate_request as validate_installer_review_request,
+    build_payload_inventory,
+    canonical_json_bytes as installer_review_canonical_bytes,
+)
+from scripts.signing_exchange import (  # noqa: E402
+    _safe_relative_path as safe_relative_path,
+    _validate_receipt as validate_signing_receipt,
+    _validate_request as validate_signing_request,
+    load_canonical_json as load_signing_exchange_json,
+    resolve_path_within,
 )
 
 
@@ -37,6 +44,10 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PACKAGE_RE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s]+)$")
 REVIEW_REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\-]{2,127}$")
+EXPECTED_REPOSITORY = "player1314520/defense-tracker-mvp"
+SIGNED_CANDIDATE_WORKFLOW_REF = (
+    f"{EXPECTED_REPOSITORY}/.github/workflows/v9-signed-candidate.yml@refs/heads/main"
+)
 
 
 def parse_utc(value: str, *, field: str) -> datetime:
@@ -57,6 +68,133 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def resolve_signing_exchange_paths(
+    raw_paths: dict[str, object],
+    *,
+    cli_root: Path,
+) -> dict[str, Path]:
+    """Resolve CLI exchange members only after strict relative-path validation."""
+
+    resolved: dict[str, Path] = {}
+    casefold_paths: set[str] = set()
+    for name, value in raw_paths.items():
+        normalized = safe_relative_path(
+            value,
+            label=f"--{name.replace('_', '-')}",
+        )
+        folded = normalized.casefold()
+        if folded in casefold_paths:
+            raise ValueError(
+                "Signing exchange CLI paths must be case-insensitively unique"
+            )
+        casefold_paths.add(folded)
+        exchange_path = resolve_path_within(
+            cli_root,
+            normalized,
+            label=f"--{name.replace('_', '-')}",
+            kind="file",
+        )
+        resolved[name] = exchange_path
+    return resolved
+
+
+def _positive_github_id(value: object, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive integer")
+    try:
+        parsed = int(str(value), 10)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer") from exc
+    if parsed < 1 or parsed > 9_223_372_036_854_775_807:
+        raise ValueError(f"{field} must be a positive integer")
+    return parsed
+
+
+def _github_release_binding(args: argparse.Namespace) -> tuple[str, str, int, int]:
+    repository = str(
+        getattr(args, "github_repository", None)
+        or os.environ.get("GITHUB_REPOSITORY", "")
+    )
+    workflow_ref = str(
+        getattr(args, "github_workflow_ref", None)
+        or os.environ.get("GITHUB_WORKFLOW_REF", "")
+    )
+    run_id = _positive_github_id(
+        getattr(args, "github_run_id", None) or os.environ.get("GITHUB_RUN_ID", ""),
+        field="GITHUB_RUN_ID",
+    )
+    run_attempt = _positive_github_id(
+        getattr(args, "github_run_attempt", None)
+        or os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        field="GITHUB_RUN_ATTEMPT",
+    )
+    if repository != EXPECTED_REPOSITORY:
+        raise ValueError("GITHUB_REPOSITORY is not the public release repository")
+    if workflow_ref != SIGNED_CANDIDATE_WORKFLOW_REF:
+        raise ValueError("GITHUB_WORKFLOW_REF is not the protected candidate workflow")
+    return repository, workflow_ref, run_id, run_attempt
+
+
+def load_signing_exchange_evidence(
+    request_path: Path,
+    receipt_path: Path,
+    *,
+    subject_kind: str,
+    commit: str,
+    publisher: str,
+    provider: str,
+) -> dict[str, object]:
+    request_value, request_bytes = load_signing_exchange_json(
+        request_path, label=f"{subject_kind} signing request"
+    )
+    receipt_value, receipt_bytes = load_signing_exchange_json(
+        receipt_path, label=f"{subject_kind} signing receipt"
+    )
+    request = validate_signing_request(request_value)
+    receipt = validate_signing_receipt(receipt_value)
+    request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+    release = request["release"]
+    target = request["target"]
+    signature = receipt["signature"]
+    assert isinstance(release, dict)
+    assert isinstance(target, dict)
+    assert isinstance(signature, dict)
+    expected = {
+        "subject_kind": subject_kind,
+        "request_sha256": request_sha256,
+        "release_commit": commit,
+        "target_path": target["path"],
+        "unsigned_sha256": target["sha256"],
+    }
+    if (
+        request["subject_kind"] != subject_kind
+        or release["commit"] != commit
+        or release["publisher"] != publisher
+        or signature["provider"] != provider
+        or signature["publisher"] != publisher
+        or any(receipt[field] != value for field, value in expected.items())
+    ):
+        raise ValueError(f"{subject_kind} signing exchange identity is inconsistent")
+    if request_path.read_bytes() != request_bytes or receipt_path.read_bytes() != receipt_bytes:
+        raise ValueError(f"{subject_kind} signing exchange changed during packaging")
+    return {
+        "request_schema": request["schema"],
+        "request_sha256": request_sha256,
+        "request_base64": base64.b64encode(request_bytes).decode("ascii"),
+        "request_provenance": request["provenance"],
+        "receipt_schema": receipt["schema"],
+        "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+        "receipt_base64": base64.b64encode(receipt_bytes).decode("ascii"),
+        "receipt_provenance": receipt["provenance"],
+        "completed_at_utc": receipt["completed_at_utc"],
+        "signature": signature,
+        "unsigned_sha256": receipt["unsigned_sha256"],
+        "signed_sha256": receipt["signed_sha256"],
+        "signed_bytes": receipt["signed_bytes"],
+        "target": target,
+    }
 
 
 def file_entry(path: Path, *, relative_to: Path | None = None) -> dict[str, object]:
@@ -117,8 +255,6 @@ def parse_packages(path: Path) -> list[tuple[str, str]]:
 def load_toolchain_evidence(path: Path, *, signing_provider: str) -> dict[str, object]:
     evidence = json.loads(path.read_text(encoding="utf-8-sig"))
     required = {"python", "signtool", "iscc", "seven_zip", "defender"}
-    if signing_provider == "AzureArtifactSigning":
-        required.update({"azure_dlib", "azure_metadata"})
     missing = required.difference(evidence)
     if missing:
         raise ValueError(f"Signed toolchain evidence is incomplete: {sorted(missing)}")
@@ -144,8 +280,8 @@ def load_toolchain_evidence(path: Path, *, signing_provider: str) -> dict[str, o
 def load_compliance_evidence(
     path: Path,
     *,
-    signature_path: Path,
-    reviewer_registry: Path,
+    application_signing_request_path: Path,
+    expected_application_signing_request_sha256: str,
     component_inventory_file: Path,
     application_root: Path,
     expected_sha256: str,
@@ -157,6 +293,10 @@ def load_compliance_evidence(
     runtime_lock_sha256: str,
     build_lock_sha256: str,
     verified_at_utc: str,
+    expected_repository: str,
+    expected_workflow_ref: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
 ) -> tuple[
     dict[str, dict[str, str]],
     dict[str, dict[str, object]],
@@ -168,6 +308,8 @@ def load_compliance_evidence(
     if actual_sha256 != expected_sha256:
         raise ValueError("Compliance evidence SHA-256 does not match the trusted value")
     evidence_bytes = path.read_bytes()
+    if hashlib.sha256(evidence_bytes).hexdigest() != actual_sha256:
+        raise ValueError("Compliance evidence changed while it was verified")
     evidence = json.loads(evidence_bytes.decode("utf-8-sig"))
     required_keys = {
         "schema",
@@ -183,70 +325,56 @@ def load_compliance_evidence(
         "build_lock_sha256",
         "packages_inventory_sha256",
         "third_party_notices_sha256",
-        "reviewer_key_id",
-        "reviewer_organization",
         "component_inventory_sha256",
         "components",
         "packages",
     }
     if not isinstance(evidence, dict) or set(evidence) != required_keys:
         raise ValueError("Compliance evidence keys differ from the schema")
-    registry = json.loads(reviewer_registry.read_text(encoding="utf-8-sig"))
+    request_value, request_bytes = load_signing_exchange_json(
+        application_signing_request_path,
+        label="application signing request",
+    )
+    request = validate_signing_request(request_value)
+    request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+    request_release = request["release"]
+    request_provenance = request["provenance"]
+    if not isinstance(request_release, dict) or not isinstance(request_provenance, dict):
+        raise ValueError("Application signing request identity is malformed")
     if (
-        not isinstance(registry, dict)
-        or set(registry) != {"schema", "status", "reviewers"}
-        or registry.get("schema") != 1
-        or registry.get("status") != "active"
-        or not isinstance(registry.get("reviewers"), list)
+        SHA256_RE.fullmatch(expected_application_signing_request_sha256) is None
+        or request_sha256 != expected_application_signing_request_sha256
+        or request.get("subject_kind") != "application"
+        or request_release.get("commit") != commit
+        or request_release.get("source_tree") != source_tree
+        or request_release.get("version") != PRODUCT_VERSION.semantic_version
+        or request_release.get("publisher") != publisher
+        or request_provenance.get("repository") != expected_repository
+        or request_provenance.get("workflow_ref") != expected_workflow_ref
+        or request_provenance.get("run_id") != expected_run_id
+        or request_provenance.get("run_attempt") != expected_run_attempt
+        or request_provenance.get("job") != "prepare-unsigned-application"
     ):
-        raise ValueError("Compliance reviewer registry is inactive or malformed")
-    reviewer_key_id = str(evidence.get("reviewer_key_id", ""))
-    reviewer_entries = [
-        item
-        for item in registry["reviewers"]
-        if isinstance(item, dict) and item.get("key_id") == reviewer_key_id
-    ]
-    if len(reviewer_entries) != 1:
-        raise ValueError("Compliance reviewer key is not registered")
-    reviewer = reviewer_entries[0]
-    reviewer_keys = {
-        "key_id",
-        "organization",
-        "public_key_base64",
-        "public_key_sha256",
-        "allowed_publishers",
+        raise ValueError("Application signing request differs from the dispatch contract")
+    request_materials = {
+        str(item["name"]): str(item["sha256"])
+        for item in request["materials"]
+        if isinstance(item, dict)
     }
-    if set(reviewer) != reviewer_keys or not isinstance(
-        reviewer.get("allowed_publishers"), list
+    required_request_materials = {
+        "runtime-lock": runtime_lock_sha256,
+        "build-lock": build_lock_sha256,
+        "installed-packages": sha256_file(packages_file),
+        "component-inventory": sha256_file(component_inventory_file),
+    }
+    if any(
+        request_materials.get(name) != digest
+        for name, digest in required_request_materials.items()
     ):
-        raise ValueError("Compliance reviewer registration is malformed")
-    try:
-        public_key_bytes = base64.b64decode(
-            str(reviewer["public_key_base64"]), validate=True
-        )
-        signature = base64.b64decode(
-            signature_path.read_text(encoding="ascii").strip(), validate=True
-        )
-    except (OSError, UnicodeError, binascii.Error) as exc:
-        raise ValueError("Compliance signature material is invalid") from exc
-    if (
-        len(public_key_bytes) != 32
-        or len(signature) != 64
-        or hashlib.sha256(public_key_bytes).hexdigest()
-        != reviewer.get("public_key_sha256")
-        or evidence.get("reviewer_organization") != reviewer.get("organization")
-        or publisher not in reviewer["allowed_publishers"]
-    ):
-        raise ValueError("Compliance reviewer identity does not match the registry")
-    try:
-        Ed25519PublicKey.from_public_bytes(public_key_bytes).verify(
-            signature, evidence_bytes
-        )
-    except (ValueError, InvalidSignature) as exc:
-        raise ValueError("Compliance evidence signature is invalid") from exc
+        raise ValueError("Application signing request materials differ from reviewed inputs")
 
     if (
-        evidence.get("schema") != 1
+        evidence.get("schema") != 2
         or evidence.get("release_commit") != commit
         or evidence.get("source_tree") != source_tree
         or evidence.get("publisher") != publisher
@@ -263,8 +391,12 @@ def load_compliance_evidence(
         raise ValueError("Compliance evidence does not bind the exact release inputs")
     reviewed = parse_utc(str(evidence.get("reviewed_at_utc", "")), field="reviewed_at_utc")
     verified = parse_utc(verified_at_utc, field="verified_at_utc")
-    if reviewed > verified:
-        raise ValueError("Compliance review timestamp is after build verification")
+    requested = parse_utc(
+        str(request.get("created_at_utc", "")),
+        field="application_signing_request.created_at_utc",
+    )
+    if not requested <= reviewed <= verified:
+        raise ValueError("Build request, compliance review and verification timestamps are not ordered")
     review_reference = str(evidence.get("review_reference", ""))
     if REVIEW_REFERENCE_RE.fullmatch(review_reference) is None:
         raise ValueError("Compliance review reference is invalid")
@@ -329,6 +461,7 @@ def load_compliance_evidence(
     ):
         raise ValueError("Unsigned component inventory is malformed")
     inventory_by_path: dict[str, dict[str, object]] = {}
+    inventory_casefold_paths: set[str] = set()
     for item in inventory["files"]:
         relative = item.get("path") if isinstance(item, dict) else None
         expected_keys = {"path", "bytes", "sha256"}
@@ -351,6 +484,11 @@ def load_compliance_evidence(
             or relative in inventory_by_path
         ):
             raise ValueError("Unsigned component inventory entry is malformed")
+        relative = safe_relative_path(relative, label="component inventory path")
+        folded_relative = relative.casefold()
+        if folded_relative in inventory_casefold_paths:
+            raise ValueError("Unsigned component inventory contains case-insensitive duplicates")
+        inventory_casefold_paths.add(folded_relative)
         inventory_by_path[relative] = item
     component_rows = evidence.get("components")
     if not isinstance(component_rows, list):
@@ -361,21 +499,18 @@ def load_compliance_evidence(
         "copyright_text",
     }
     reviewed_components: dict[str, dict[str, object]] = {}
+    reviewed_casefold_paths: set[str] = set()
     for row in component_rows:
         if not isinstance(row, dict):
             raise ValueError("Compliance component entry differs from the schema")
         relative_value = row.get("path")
         if not isinstance(relative_value, str):
             raise ValueError("Compliance component entry differs from the schema")
-        relative = relative_value
-        pure = PurePosixPath(relative)
-        if (
-            pure.is_absolute()
-            or ".." in pure.parts
-            or "\\" in relative
-            or relative in reviewed_components
-        ):
+        relative = safe_relative_path(relative_value, label="compliance component path")
+        folded_relative = relative.casefold()
+        if relative in reviewed_components or folded_relative in reviewed_casefold_paths:
             raise ValueError("Compliance component path is invalid")
+        reviewed_casefold_paths.add(folded_relative)
         expected_item = inventory_by_path.get(relative)
         if (
             expected_item is None
@@ -452,31 +587,29 @@ def load_compliance_evidence(
         "sbom_scope": "final-shipped-bytes",
         "license_review": "approved",
         "stable_release_eligible": True,
-        "evidence_schema": 1,
+        "evidence_schema": 2,
         "evidence_sha256": actual_sha256,
         "reviewed_at_utc": evidence["reviewed_at_utc"],
         "review_reference": review_reference,
-        "reviewer_key_id": reviewer_key_id,
-        "reviewer_public_key_sha256": reviewer["public_key_sha256"],
-        "reviewer_organization": evidence["reviewer_organization"],
-        "reviewer_registry_sha256": sha256_file(reviewer_registry),
-        "signature_sha256": hashlib.sha256(signature).hexdigest(),
         "component_inventory_sha256": evidence["component_inventory_sha256"],
         "evidence_base64": base64.b64encode(evidence_bytes).decode("ascii"),
-        "signature_base64": base64.b64encode(signature).decode("ascii"),
+        "application_signing_request_schema": 2,
+        "application_signing_request_sha256": request_sha256,
+        "application_signing_request_base64": base64.b64encode(request_bytes).decode(
+            "ascii"
+        ),
+        "application_signing_request_repository": request_provenance["repository"],
+        "application_signing_request_workflow_ref": request_provenance["workflow_ref"],
+        "application_signing_request_run_id": request_provenance["run_id"],
+        "application_signing_request_run_attempt": request_provenance["run_attempt"],
+        "application_signing_request_job": request_provenance["job"],
     }
     return reviewed_packages, reviewed_components, compliance
 
 
 def load_installer_compliance(
     *,
-    evidence_path: Path,
-    signature_path: Path,
-    reviewer_registry: Path,
-    expected_evidence_sha256: str,
-    application_reviewer_key_id: str,
-    application_reviewer_public_key_sha256: str,
-    unsigned_installer: Path,
+    request_path: Path,
     signed_installer: Path,
     extracted_payload_root: Path,
     signed_application_inventory: Path,
@@ -493,94 +626,82 @@ def load_installer_compliance(
     source_tree: str,
     publisher: str,
 ) -> dict[str, object]:
-    """Verify and embed the independent installer review boundary."""
+    """Verify the immutable installer review request without an approval loop."""
 
-    review = verify_installer_before_sign(
-        evidence_path=evidence_path,
-        signature_path=signature_path,
-        reviewer_registry=reviewer_registry,
-        expected_evidence_sha256=expected_evidence_sha256,
-        application_reviewer_key_id=application_reviewer_key_id,
-        unsigned_installer=unsigned_installer,
-        extracted_payload_root=extracted_payload_root,
-        signed_application_inventory=signed_application_inventory,
-        iss_path=iss_path,
-        iscc_path=iscc_path,
-        iscc_version=iscc_version,
-        seven_zip_path=seven_zip_path,
-        seven_zip_version=seven_zip_version,
-        bootstrap_license_declared=bootstrap_license_declared,
-        bootstrap_license_concluded=bootstrap_license_concluded,
-        bootstrap_copyright_text=bootstrap_copyright_text,
-        bootstrap_license_text_path=bootstrap_license_text_path,
-        expected_commit=commit,
-        expected_source_tree=source_tree,
-        expected_version=PRODUCT_VERSION.semantic_version,
-        expected_publisher=publisher,
+    request, request_bytes = read_installer_review_json(
+        request_path, "installer review request", canonical=True
     )
-    post_sign = verify_installer_after_sign(
-        review,
-        signed_installer=signed_installer,
-        extracted_payload_root=extracted_payload_root,
-    )
-    if review.pre_sign_binding is None:  # pragma: no cover - dataclass invariant
-        raise ValueError("Installer review lacks a pre-sign binding")
-    installer_registry = json.loads(reviewer_registry.read_text(encoding="utf-8-sig"))
-    installer_reviewers = installer_registry.get("reviewers", [])
-    installer_reviewer_entries = [
-        item
-        for item in installer_reviewers
-        if isinstance(item, dict) and item.get("key_id") == review.reviewer_key_id
-    ] if isinstance(installer_reviewers, list) else []
+    request = validate_installer_review_request(request)
+    request_sha256 = hashlib.sha256(request_bytes).hexdigest()
     if (
-        len(installer_reviewer_entries) != 1
-        or installer_reviewer_entries[0].get("public_key_sha256")
-        == application_reviewer_public_key_sha256
+        request["release_commit"] != commit
+        or request["source_tree"] != source_tree
+        or request["version"] != PRODUCT_VERSION.semantic_version
+        or request["publisher"] != publisher
     ):
-        raise ValueError("Application and installer reviews require distinct keys")
-    try:
-        signature = base64.b64decode(
-            signature_path.read_text(encoding="ascii").strip(), validate=True
-        )
-    except (OSError, UnicodeError, binascii.Error) as exc:
-        raise ValueError("Installer review signature material is invalid") from exc
-    if hashlib.sha256(signature).hexdigest() != review.signature_sha256:
-        raise ValueError("Installer review signature hash changed after verification")
-    request = review.request
+        raise ValueError("Installer review request does not bind the exact release")
+    recipe = request["recipe"]
     unsigned = request["unsigned_installer"]
     payload = request["payload_inventory"]
     bootstrap = request["bootstrap_license"]
+    assert isinstance(recipe, dict)
     assert isinstance(unsigned, dict)
     assert isinstance(payload, dict)
     assert isinstance(bootstrap, dict)
+    expected_recipe = {
+        "iss_sha256": sha256_file(iss_path),
+        "iscc_sha256": sha256_file(iscc_path),
+        "iscc_version": iscc_version,
+        "seven_zip_sha256": sha256_file(seven_zip_path),
+        "seven_zip_version": seven_zip_version,
+        "signed_application_inventory_sha256": sha256_file(
+            signed_application_inventory
+        ),
+    }
+    if recipe != expected_recipe:
+        raise ValueError("Installer build recipe differs from its immutable review request")
+    license_text = bootstrap_license_text_path.read_text(encoding="utf-8")
+    if (
+        bootstrap["license_declared"] != bootstrap_license_declared
+        or bootstrap["license_concluded"] != bootstrap_license_concluded
+        or bootstrap["copyright_text"] != bootstrap_copyright_text
+        or bootstrap["license_text"] != license_text
+        or bootstrap["license_text_sha256"]
+        != hashlib.sha256(license_text.encode("utf-8")).hexdigest()
+    ):
+        raise ValueError("Installer bootstrap license differs from reviewed bytes")
+    actual_payload = build_payload_inventory(extracted_payload_root)
+    if (
+        actual_payload != payload
+        or hashlib.sha256(installer_review_canonical_bytes(actual_payload)).hexdigest()
+        != request["payload_inventory_sha256"]
+    ):
+        raise ValueError("Signed installer payload differs from reviewed inventory")
+    signed_identity = inspect_authenticode_image(
+        signed_installer,
+        require_state="signed",
+        expected_unsigned_size=int(unsigned["bytes"]),
+        expected_normalized_sha256=str(unsigned["normalized_sha256"]),
+    )
     payload_files = payload.get("files")
     if not isinstance(payload_files, list):  # pragma: no cover - validated upstream
         raise ValueError("Installer payload inventory is malformed")
-    evidence_bytes = evidence_path.read_bytes()
+    if request_path.read_bytes() != request_bytes:
+        raise ValueError("Installer review request changed during verification")
     return {
-        "schema": 1,
+        "schema": 2,
         "scope": "installer-release-review",
         "stable_release_eligible": True,
-        "evidence_sha256": review.evidence_sha256,
-        "signature_sha256": review.signature_sha256,
-        "reviewer_registry_sha256": review.reviewer_registry_sha256,
-        "reviewer_key_id": review.reviewer_key_id,
-        "reviewer_organization": review.reviewer_organization,
-        "review_reference": review.review_reference,
-        "reviewed_at_utc": review.reviewed_at_utc,
-        "request_sha256": review.request_sha256,
+        "request_sha256": request_sha256,
         "payload_inventory_sha256": request["payload_inventory_sha256"],
         "payload_file_count": len(payload_files),
         "unsigned_installer_sha256": unsigned["sha256"],
         "unsigned_installer_bytes": unsigned["bytes"],
         "authenticode_normalized_sha256": unsigned["normalized_sha256"],
-        "signed_installer_sha256": post_sign.installer_sha256,
-        "signed_installer_bytes": post_sign.installer_bytes,
+        "signed_installer_sha256": signed_identity.file_sha256,
+        "signed_installer_bytes": signed_identity.bytes,
         "bootstrap_license": bootstrap,
-        "pre_sign_binding": review.pre_sign_binding.as_dict(),
-        "post_sign_binding": post_sign.as_dict(),
-        "evidence_base64": base64.b64encode(evidence_bytes).decode("ascii"),
-        "signature_base64": base64.b64encode(signature).decode("ascii"),
+        "request_base64": base64.b64encode(request_bytes).decode("ascii"),
     }
 
 
@@ -765,7 +886,12 @@ def write_spdx(
             "copyright_text": f"Copyright (c) 2026 {publisher}",
         }
     for relative, evidence in sorted(effective_component_licenses.items()):
-        source = application_root.joinpath(*PurePosixPath(relative).parts)
+        source = resolve_path_within(
+            application_root,
+            relative,
+            label="SBOM component path",
+            kind="file",
+        )
         file_id = "SPDXRef-File-" + hashlib.sha256(relative.encode()).hexdigest()[:24]
         files.append(
             {
@@ -835,6 +961,75 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
     toolchain_evidence = load_toolchain_evidence(
         toolchain_evidence_file, signing_provider=args.signing_provider
     )
+    raw_exchange_paths = {
+        "application_request": getattr(args, "application_signing_request", None),
+        "application_receipt": getattr(args, "application_signing_receipt", None),
+        "installer_request": getattr(args, "installer_signing_request", None),
+        "installer_receipt": getattr(args, "installer_signing_receipt", None),
+        "publisher_policy": getattr(args, "publisher_policy", None),
+    }
+    supplied_exchange_count = sum(value is not None for value in raw_exchange_paths.values())
+    if supplied_exchange_count not in {0, len(raw_exchange_paths)}:
+        raise ValueError("Signing exchange inputs must be supplied as one complete set")
+    exchange_paths: dict[str, Path] = {}
+    application_exchange: dict[str, object] | None = None
+    installer_exchange: dict[str, object] | None = None
+    application_signature: dict[str, object] | None = None
+    installer_signature: dict[str, object] | None = None
+    publisher_policy_sha256: str | None = None
+    if supplied_exchange_count:
+        exchange_paths = resolve_signing_exchange_paths(
+            raw_exchange_paths,
+            cli_root=Path.cwd(),
+        )
+        for exchange_path in exchange_paths.values():
+            if not exchange_path.is_file():
+                raise FileNotFoundError(exchange_path)
+        application_exchange = load_signing_exchange_evidence(
+            exchange_paths["application_request"],
+            exchange_paths["application_receipt"],
+            subject_kind="application",
+            commit=args.commit,
+            publisher=args.publisher,
+            provider=args.signing_provider,
+        )
+        installer_exchange = load_signing_exchange_evidence(
+            exchange_paths["installer_request"],
+            exchange_paths["installer_receipt"],
+            subject_kind="installer",
+            commit=args.commit,
+            publisher=args.publisher,
+            provider=args.signing_provider,
+        )
+        publisher_policy_sha256 = sha256_file(exchange_paths["publisher_policy"])
+        publisher_policy = json.loads(
+            exchange_paths["publisher_policy"].read_text(encoding="utf-8-sig")
+        )
+        if (
+            not isinstance(publisher_policy, dict)
+            or publisher_policy.get("status") != "approved"
+            or publisher_policy.get("publisher") != args.publisher
+            or publisher_policy.get("active_provider") != args.signing_provider
+        ):
+            raise ValueError("Committed Publisher policy is not approved for this release")
+        application_signature = application_exchange["signature"]
+        installer_signature = installer_exchange["signature"]
+        assert isinstance(application_signature, dict)
+        assert isinstance(installer_signature, dict)
+        for signature in (application_signature, installer_signature):
+            policy_evidence = signature["publisher_policy"]
+            assert isinstance(policy_evidence, dict)
+            if policy_evidence["sha256"] != publisher_policy_sha256:
+                raise ValueError("Signing receipt Publisher policy digest differs")
+        if args.signing_provider == "DigiCertKeyLocker":
+            for field in (
+                "signer_subject",
+                "signer_spki_sha256",
+                "signer_issuer_subject",
+                "signer_root_sha256",
+            ):
+                if application_signature[field] != installer_signature[field]:
+                    raise ValueError("DigiCert signer identity differs across stages")
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(output_dir.iterdir()):
         raise ValueError("Release asset output directory must be empty")
@@ -865,27 +1060,27 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
         "stable_release_eligible": False,
     }
     if compliance_evidence_arg is not None:
+        if application_exchange is None or installer_exchange is None:
+            raise ValueError("Stable compliance packaging requires both signing exchanges")
         compliance_evidence_path = Path(compliance_evidence_arg).resolve()
-        signature_arg = getattr(args, "compliance_signature", None)
-        registry_arg = getattr(args, "compliance_reviewer_registry", None)
         inventory_arg = getattr(args, "component_inventory", None)
-        if signature_arg is None or registry_arg is None or inventory_arg is None:
-            raise ValueError("Signed compliance evidence inputs are incomplete")
-        signature_path = Path(signature_arg).resolve()
-        registry_path = Path(registry_arg).resolve()
+        if inventory_arg is None:
+            raise ValueError("Compliance component inventory is incomplete")
         component_inventory_path = Path(inventory_arg).resolve()
         for required_compliance_file in (
             compliance_evidence_path,
-            signature_path,
-            registry_path,
             component_inventory_path,
         ):
             if not required_compliance_file.is_file():
                 raise FileNotFoundError(required_compliance_file)
+        request_provenance = application_exchange["request_provenance"]
+        assert isinstance(request_provenance, dict)
         package_licenses, component_licenses, compliance = load_compliance_evidence(
             compliance_evidence_path,
-            signature_path=signature_path,
-            reviewer_registry=registry_path,
+            application_signing_request_path=exchange_paths["application_request"],
+            expected_application_signing_request_sha256=str(
+                application_exchange["request_sha256"]
+            ),
             component_inventory_file=component_inventory_path,
             application_root=application_root,
             expected_sha256=compliance_evidence_sha256,
@@ -897,23 +1092,21 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
             runtime_lock_sha256=args.runtime_lock_sha256,
             build_lock_sha256=args.build_lock_sha256,
             verified_at_utc=verified_raw,
+            expected_repository=str(request_provenance["repository"]),
+            expected_workflow_ref=str(request_provenance["workflow_ref"]),
+            expected_run_id=int(request_provenance["run_id"]),
+            expected_run_attempt=int(request_provenance["run_attempt"]),
         )
     elif compliance_evidence_sha256:
         raise ValueError("Compliance evidence path is missing")
-    installer_review_evidence_arg = getattr(args, "installer_review_evidence", None)
+    installer_review_request_arg = getattr(args, "installer_review_request", None)
     installer_review: dict[str, object] = {
         "scope": "installer-release-review",
         "stable_release_eligible": False,
     }
     if compliance.get("stable_release_eligible") is True:
         installer_inputs = {
-            "evidence_path": installer_review_evidence_arg,
-            "signature_path": getattr(args, "installer_review_signature", None),
-            "reviewer_registry": getattr(args, "installer_reviewer_registry", None),
-            "expected_evidence_sha256": getattr(
-                args, "installer_review_evidence_sha256", None
-            ),
-            "unsigned_installer": getattr(args, "unsigned_installer", None),
+            "request_path": installer_review_request_arg,
             "extracted_payload_root": getattr(args, "installer_payload_root", None),
             "signed_application_inventory": getattr(
                 args, "signed_application_inventory", None
@@ -939,10 +1132,7 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
         if any(value is None or value == "" for value in installer_inputs.values()):
             raise ValueError("Independent installer review inputs are incomplete")
         path_fields = {
-            "evidence_path",
-            "signature_path",
-            "reviewer_registry",
-            "unsigned_installer",
+            "request_path",
             "extracted_payload_root",
             "signed_application_inventory",
             "iss_path",
@@ -954,20 +1144,24 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
             installer_inputs[field] = Path(installer_inputs[field]).resolve()
         installer_review = load_installer_compliance(
             **installer_inputs,
-            application_reviewer_key_id=str(compliance["reviewer_key_id"]),
-            application_reviewer_public_key_sha256=str(
-                compliance["reviewer_public_key_sha256"]
-            ),
             signed_installer=installer,
             commit=args.commit,
             source_tree=args.source_tree,
             publisher=args.publisher,
         )
-    elif installer_review_evidence_arg is not None:
+    elif installer_review_request_arg is not None:
         raise ValueError("Installer review cannot replace application compliance review")
 
     signatures: dict[str, object] = {}
     if compliance.get("stable_release_eligible") is True:
+        if (
+            application_exchange is None
+            or installer_exchange is None
+            or application_signature is None
+            or installer_signature is None
+            or publisher_policy_sha256 is None
+        ):
+            raise ValueError("Stable signatures require canonical exchange evidence")
         reviewed_executable = component_licenses.get("DefenseTracker.exe")
         if not isinstance(reviewed_executable, dict):
             raise ValueError("Application review does not bind DefenseTracker.exe")
@@ -979,20 +1173,21 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
                 reviewed_executable["authenticode_neutral_sha256"]
             ),
         )
-        application_signer_subject = str(
-            getattr(args, "application_signer_subject", "") or ""
-        ).strip()
-        application_timestamp_subject = str(
-            getattr(args, "application_timestamp_subject", "") or ""
-        ).strip()
-        if not application_signer_subject or not application_timestamp_subject:
-            raise ValueError("Application Authenticode evidence is incomplete")
+        if (
+            application_exchange.get("signed_sha256")
+            != application_identity.file_sha256
+            or application_exchange.get("signed_bytes") != application_identity.bytes
+        ):
+            raise ValueError("Application receipt differs from packaged signed bytes")
+        if (
+            installer_exchange.get("signed_sha256")
+            != installer_review["signed_installer_sha256"]
+            or installer_exchange.get("signed_bytes")
+            != installer_review["signed_installer_bytes"]
+        ):
+            raise ValueError("Installer receipt differs from packaged signed bytes")
         signatures["application"] = {
-            "provider": args.signing_provider,
-            "publisher": args.publisher,
-            "signer_subject": application_signer_subject,
-            "timestamp_url": args.timestamp_url,
-            "timestamp_certificate_subject": application_timestamp_subject,
+            **application_signature,
             "authenticode": "Valid",
             "trusted_timestamp": True,
             "unsigned_sha256": reviewed_executable["sha256"],
@@ -1001,13 +1196,10 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
             "signed_bytes": application_identity.bytes,
             "authenticode_normalized_sha256": application_identity.normalized_sha256,
             "verified_at_utc": verified_raw,
+            "exchange": application_exchange,
         }
         signatures["installer"] = {
-            "provider": args.signing_provider,
-            "publisher": args.publisher,
-            "signer_subject": args.signer_subject,
-            "timestamp_url": args.timestamp_url,
-            "timestamp_certificate_subject": args.timestamp_subject,
+            **installer_signature,
             "authenticode": "Valid",
             "trusted_timestamp": True,
             "unsigned_sha256": installer_review["unsigned_installer_sha256"],
@@ -1018,7 +1210,41 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
                 "authenticode_normalized_sha256"
             ],
             "verified_at_utc": verified_raw,
+            "exchange": installer_exchange,
         }
+    legacy_signer_subject = str(getattr(args, "signer_subject", "") or "")
+    legacy_timestamp_url = str(getattr(args, "timestamp_url", "") or "")
+    legacy_timestamp_subject = str(getattr(args, "timestamp_subject", "") or "")
+    top_signature = (
+        {
+            "provider": installer_signature["provider"],
+            "publisher": installer_signature["publisher"],
+            "signer_subject": installer_signature["signer_subject"],
+            "timestamp_url": installer_signature["timestamp_url"],
+            "timestamp_certificate_subject": installer_signature[
+                "timestamp_certificate_subject"
+            ],
+            "timestamp_verified_at_utc": installer_signature[
+                "timestamp_verified_at_utc"
+            ],
+            "publisher_policy_sha256": publisher_policy_sha256,
+            "authenticode": "Valid",
+            "trusted_timestamp": True,
+            "verified_at_utc": verified_raw,
+        }
+        if installer_signature is not None
+        else {
+            "provider": args.signing_provider,
+            "publisher": args.publisher,
+            "signer_subject": legacy_signer_subject,
+            "timestamp_url": legacy_timestamp_url,
+            "timestamp_certificate_subject": legacy_timestamp_subject,
+            "publisher_policy_sha256": None,
+            "authenticode": "unverified",
+            "trusted_timestamp": False,
+            "verified_at_utc": verified_raw,
+        }
+    )
     build_manifest = {
         "schema": 2,
         "kind": "desktop-build",
@@ -1041,16 +1267,7 @@ def package_assets(args: argparse.Namespace) -> dict[str, object]:
             "build_lock_sha256": args.build_lock_sha256,
             "toolchain": toolchain_evidence,
         },
-        "signature": {
-            "provider": args.signing_provider,
-            "publisher": args.publisher,
-            "signer_subject": args.signer_subject,
-            "timestamp_url": args.timestamp_url,
-            "timestamp_certificate_subject": args.timestamp_subject,
-            "authenticode": "Valid",
-            "trusted_timestamp": True,
-            "verified_at_utc": verified_raw,
-        },
+        "signature": top_signature,
         "signatures": signatures,
         "compliance": compliance,
         "installer_review": installer_review,
@@ -1138,25 +1355,24 @@ def main() -> int:
     parser.add_argument("--verified-at-utc", required=True)
     parser.add_argument("--publisher", required=True)
     parser.add_argument("--signing-provider", required=True)
-    parser.add_argument("--signer-subject", required=True)
-    parser.add_argument("--timestamp-url", required=True)
-    parser.add_argument("--timestamp-subject", required=True)
     parser.add_argument("--python-version", required=True)
     parser.add_argument("--runtime-lock-sha256", required=True)
     parser.add_argument("--build-lock-sha256", required=True)
     parser.add_argument("--toolchain-evidence", type=Path, required=True)
+    # Signing-exchange paths are portable paths relative to the invocation CWD.
+    # argparse must not turn untrusted text into a host path before validation.
+    parser.add_argument("--publisher-policy")
+    parser.add_argument("--application-signing-request")
+    parser.add_argument("--application-signing-receipt")
+    parser.add_argument("--installer-signing-request")
+    parser.add_argument("--installer-signing-receipt")
+    parser.add_argument("--signer-subject")
+    parser.add_argument("--timestamp-url")
+    parser.add_argument("--timestamp-subject")
     parser.add_argument("--compliance-evidence", type=Path)
     parser.add_argument("--compliance-evidence-sha256")
-    parser.add_argument("--compliance-signature", type=Path)
-    parser.add_argument("--compliance-reviewer-registry", type=Path)
     parser.add_argument("--component-inventory", type=Path)
-    parser.add_argument("--application-signer-subject")
-    parser.add_argument("--application-timestamp-subject")
-    parser.add_argument("--installer-review-evidence", type=Path)
-    parser.add_argument("--installer-review-signature", type=Path)
-    parser.add_argument("--installer-reviewer-registry", type=Path)
-    parser.add_argument("--installer-review-evidence-sha256")
-    parser.add_argument("--unsigned-installer", type=Path)
+    parser.add_argument("--installer-review-request", type=Path)
     parser.add_argument("--installer-payload-root", type=Path)
     parser.add_argument("--signed-application-inventory", type=Path)
     parser.add_argument("--iss", type=Path)

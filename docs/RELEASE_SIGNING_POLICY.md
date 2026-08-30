@@ -24,19 +24,25 @@ asset; it is signed inside the complete portable package.
 Exactly one of these trusted paths may sign a stable release:
 
 1. **Microsoft Artifact Signing (Public Trust)** through GitHub Actions OIDC,
-   SignTool integration, and provider metadata. Verification binds the
-   signature to the expected Publisher and trusted chain; it must not pin a
-   rotating leaf-certificate thumbprint.
+   SignTool integration, and provider metadata. The committed policy binds the
+   endpoint, account, profile, Publisher, Subject, issuer, root, code-signing
+   EKU, Public Trust EKU, and durable identity EKU. Short-lived leaf SPKI is
+   recorded as evidence only; it is not an allow decision.
 2. **DigiCert KeyLocker** as the documented fallback, using its protected
-   remote-key workflow and the same expected-Publisher and trust-chain checks.
+   remote-key workflow. The committed policy additionally pins the canonical
+   SM host, key alias, public certificate-file SHA-256, Subject, leaf SPKI,
+   issuer, and root.
 
 Every executable signature must include a verifiable RFC 3161 trusted
 timestamp. Self-signed, test, locally generated, expired, untrusted-chain, or
 unexpected-Publisher certificates are prohibited for stable assets.
 
-The expected Publisher must be the separately verified organization legal
-name. The repository currently contains no authoritative Publisher value and
-must not invent one.
+The only authoritative trust source is `release/publisher-policy.json` from the
+exact protected-main commit plus its SHA-256. Environment variables select a
+provisioned runtime provider but cannot define or expand trust. The expected
+Publisher must be the separately verified organization legal name. The current
+committed policy is deliberately `pending`, with a null Publisher and active
+provider, so every stable signing path fails closed instead of inventing one.
 
 ## Source and build binding
 
@@ -46,49 +52,51 @@ Before signing:
   SHA and the checkout must be clean;
 - all required CI checks and public-tree/history scans must pass for that exact
   SHA;
-- the protected application-signing environment must supply SHA-256-pinned
-  compliance evidence and a valid Ed25519 signature from a reviewer whose
-  public key and allowed Publisher are registered in the reviewed source tree;
-- that signed decision must bind the exact commit, source tree, Publisher,
-  dependency locks, installed package inventory, third-party notices, and the
-  path, size, SHA-256, SPDX license, and copyright statement of every unsigned
-  onedir component; absence or mismatch stops before the first signature;
+- an exact SHA-256-pinned public compliance-evidence document must come from a
+  separate evidence commit, so it cannot create a self-referential source-tree
+  hash;
+- the unsigned bytes and canonical signing request must already exist in a
+  prior credentialless job/run. Request SHA, encrypted-artifact digest, run
+  ID/attempt, source tree, Publisher-policy SHA, dependency locks, installed
+  package inventory, third-party notices, and every component's path, size,
+  SHA-256, SPDX license, and copyright are checked before the first signature;
 - the build uses a fresh isolated, fixed Windows toolchain with hash-locked
   dependencies and no secrets or user material in its inputs;
 - the source tree is rechecked after build to detect mutation or time-of-check
   to time-of-use drift; and
-- candidate artifacts remain private until all staging and production gates
-  succeed.
+- plaintext candidate artifacts remain confidential. Public Actions retention
+  contains only `age` ciphertext and sanitized requests/receipts.
 
-The Windows candidate is deliberately split across two protected ephemeral
-environments. Stage A signs the reviewed onedir executable, builds but does not
-sign the installer, extracts its complete payload, and retains an attested
-review bundle. A second reviewer must approve that exact request with a
-different Ed25519 key. Stage B downloads only that exact run-bound bundle,
-revalidates every file and the independent approval, signs a copy of the
-installer, and proves that only Authenticode checksum/security-directory/
-certificate-table bytes changed. It then re-extracts and compares the complete
-payload before smoke, malware, portable, SBOM, and final six-asset checks. No
-single-stage path may produce a signed installer or stable assets.
+The chain uses separate credentialless and signer-only jobs on fresh
+GitHub-hosted `windows-2022` VMs. `v9-release-preparation.yml` creates the
+unsigned application request and encrypted bundle. `v9-application-signing.yml`
+verifies that prior request; `v9-trusted-signing` signs one application PE, then
+a credentialless job builds the unsigned installer and emits its request.
+`v9-signed-candidate.yml` verifies that second request;
+`v9-installer-signing-review` signs one installer PE, then a credentialless
+finalizer revalidates both request/receipt pairs, full payloads, smoke, malware,
+portable, SBOM, and six-asset gates. No signer job builds, executes, scans, or
+packages the candidate.
 
-That two-stage design is not currently sufficient to authorize credential use.
-The candidate workflow therefore starts with a tokenless GitHub-hosted gate
-that emits a machine-readable `SIGNING_ISOLATION_NOT_PROVISIONED` blocker and
-exits non-zero. Every source-verification or signing job depends on that failed
-gate, so neither a signing environment, OIDC login, secret, nor self-hosted
-runner can be reached by a manual dispatch. The blocker may be replaced only by
-a separately reviewed change after all of these roles exist:
+Environment approval allows a job to start; it cannot prove that the approver
+inspected bytes created after approval. Requests therefore predate signer jobs,
+and the Environment URL points to their exact prior run. Signing receipts prove
+post-signing bytes and provenance, not who clicked Approve. The approvals may
+currently be performed by the one maintainer. This is an explicitly disclosed
+`single-maintainer-audited` model, not independent human review. A second
+maintainer should be added later and `prevent self-review` enabled without
+changing the binary evidence contract.
 
-1. a credentialless builder/scanner and approval controller that emits the
-   approved artifact hashes;
-2. a minimal signing runner that accepts only those approved bytes, verifies
-   their hashes, signs them, and never executes a candidate; and
-3. a credentialless or least-privileged, restricted-egress, single-use VM that
-   performs post-signature smoke tests, followed by controller-signed runner
-   deregistration and VM-destruction receipts.
-
-Those roles must not share a runner image, long-lived workspace, credential, or
-controller identity. Missing teardown receipts fail the candidate run closed.
+Every signing and stable-publication job uses a new GitHub-hosted VM. Signer-only
+jobs do not checkout, setup Python, run repository code, compile installers,
+execute candidates, or run Defender. They download only fixed-hash `age`,
+SignTool, and the required Azure client. Azure uses GitHub OIDC; DigiCert checks
+the committed SM host, key alias, certificate hash, and identity pins before
+credential use, then removes temporary files unconditionally. Python, Inno
+Setup, 7-Zip, Defender, and their evidence belong only to credentialless jobs.
+The final Release job receives no signing identity, although it has the
+protected candidate-decryption identity needed to republish previously approved
+bytes.
 
 ## Required verification evidence
 
@@ -97,11 +105,12 @@ The schema-2 release manifest records:
 - semantic and Windows file versions, release tag, final release commit, and
   original baseline commit;
 - every asset's name, size, and SHA-256;
-- signature provider, expected Publisher, certificate chain result, RFC 3161
-  timestamp, and verification time;
-- separate application and installer review identities, signed evidence,
-  reviewer-registry hashes, Authenticode-neutral digests, and pre/post installer
-  payload bindings;
+- signature provider, expected Publisher, certificate chain result, timestamp
+  service URL, timestamper certificate Subject, trusted-timestamp verification
+  result, and `timestamp_verified_at_utc` observation time;
+- separate application and installer signing-request/receipt hashes, their
+  cross-run workflow provenance, Publisher-policy SHA, Authenticode-neutral
+  digests, and complete payload bindings;
 - PE architecture and VersionInfo verification;
 - privacy/secret, QR/account-material, malware, archive, and SBOM results; and
 - verifiable GitHub build and SBOM attestation references.
@@ -120,33 +129,38 @@ to the exact accepted commit. After publication:
 
 If trusted signing, staging, production, checksum, signature, SBOM, build/SBOM
 attestation, immutable-release enforcement, or post-download verification is
-unavailable or fails, the workflow stops before a public stable tag/Release is
-created.
+unavailable or fails, the stable Windows release is blocked and the workflow
+stops before a public stable tag/Release is created.
 
 ## Current blocking state
 
-No repository document proves that Microsoft Artifact Signing Public Trust is
-approved, that DigiCert KeyLocker is provisioned, or that the final legal
-Publisher is verified. The tracked `release/compliance-reviewers.json` and
-`release/installer-reviewers.json` registries are also deliberately `inactive`
-and contain no reviewer key. Activating either requires a dedicated
-governance/legal-review change that records the verified reviewer organization,
-Ed25519 public-key fingerprint, and allowed Publisher. The two active reviews
-must use distinct public keys; an environment-variable edit cannot activate a
-reviewer or bypass that separation. Until those conditions are satisfied, the
-stable Windows release is blocked, and signed candidates are also blocked. A
-self-signed substitute is not allowed. The explicit isolation blocker described
-above is also active; a failed candidate run produces no releasable artifact,
-and the stable workflow accepts only a successful run of this exact candidate
-workflow before attempting its exact artifact download.
+The committed Publisher policy is `pending`; no repository document proves that
+Microsoft Artifact Signing Public Trust is approved, that DigiCert KeyLocker is
+provisioned, or that the final legal Publisher is verified. The full
+component-license evidence also has not yet been approved for one exact release
+build. Those are real external/legal inputs. Until a real provider, approved
+policy, matching identity pins, and complete public compliance evidence exist,
+the first signer job, signed candidate, and stable Release fail closed. A
+self-signed substitute is not allowed.
 
 ## Honest boundaries
 
 - Authenticode proves the publisher identity asserted by a trusted certificate
   and the integrity of signed bytes; it does not prove software safety.
-- RFC 3161 timestamps preserve signature timing evidence but do not make a
-  compromised build trustworthy.
+- SignTool verifies the RFC 3161 timestamp and timestamper certificate. The
+  manifest records verification time, not the token's actual issuance instant;
+  either form of evidence cannot make a compromised build trustworthy.
 - GitHub attestations describe build provenance; they do not replace source
   review, malware scanning, deployment acceptance, or key protection.
+- Environment approval proves only that a protected job was allowed to start;
+  offline request/receipt files cannot prove who clicked Approve or what the
+  reviewer inspected. The GitHub audit trail remains necessary.
+- Repository readers can download retained Actions artifacts. `age` protects
+  candidate plaintext, while names, requests, receipts, hashes, and run metadata
+  remain visible. Confidentiality depends on protecting and rotating
+  `RELEASE_ARTIFACT_AGE_IDENTITY`.
+- One maintainer performing both approvals is auditable but is not separation of
+  duties. Repository rules should move to two-person review when another trusted
+  maintainer exists.
 - A new publisher can still trigger Microsoft SmartScreen warnings until
   reputation develops.

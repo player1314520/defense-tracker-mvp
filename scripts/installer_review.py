@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Offline trust gate for an independently reviewed Windows installer.
+"""Bind a protected GitHub Environment approval to a Windows installer.
 
-The build job may generate an installer review request, but it cannot approve
-that request.  Approval is an exact-byte Ed25519 signature made by a key in the
-independent installer-review registry.  The same reviewed, unsigned installer
-is then bound to its signed form with an Authenticode-neutral PE digest and a
-complete inventory of the extracted payload.
+The preparation job generates an exact canonical installer review request.  A
+separate job may consume it only after GitHub admits that job to the protected
+``v9-installer-signing-review`` Environment.  The resulting approval context
+binds the request to the repository, workflow, release commit and exact Actions
+run/attempt.  The same reviewed, unsigned installer is then bound to its signed
+form with an Authenticode-neutral PE digest and a complete inventory of the
+extracted payload.
 
 Security boundary:
 
 * this module does not validate the Authenticode certificate chain, Publisher,
   or timestamp; the Windows signing gate must do that separately;
-* distinct reviewer key IDs cannot prove that distinct natural people control
-  the keys; organizational key custody remains a process control;
+* this context records the single-maintainer Environment review model; it does
+  not identify the human approver and must be paired with GitHub's deployment
+  protection and audit logs;
 * a static extractor inventory cannot prove installer runtime behavior, so the
   reviewed ``.iss`` file and lifecycle smoke tests remain mandatory.
 """
@@ -20,20 +23,15 @@ Security boundary:
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import hashlib
 import json
 import os
 import re
 import unicodedata
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Literal
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from packaging.licenses import InvalidLicenseExpression, canonicalize_license_expression
 
 try:  # Direct script execution and namespace-package imports both matter here.
@@ -47,10 +45,17 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by PowerShell entryp
         inspect_authenticode_image,
     )
 
+try:  # Direct script execution and namespace-package imports both matter here.
+    from scripts.github_environment_approval import load_approval_context
+except ModuleNotFoundError:  # pragma: no cover - exercised by PowerShell entrypoint
+    from github_environment_approval import load_approval_context  # type: ignore[no-redef]
+
 
 INSTALLER_REVIEW_SCOPE = "installer-release-review"
 REQUEST_KIND = "defensetracker-installer-review-request"
-APPROVAL_KIND = "defensetracker-installer-review-approval"
+APPROVAL_SUBJECT_KIND = "installer-review-request"
+APPROVAL_ENVIRONMENT = "v9-installer-signing-review"
+APPROVAL_JOB = "finalize-signed-candidate"
 PE_DIGEST_ALGORITHM = "sha256-authenticode-neutral-pe-v1"
 
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -58,9 +63,6 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SEMVER_RE = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
 )
-KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$")
-REVIEW_REFERENCE_RE = re.compile(r"^installer-review:[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
-UTC_SECONDS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 _REQUEST_KEYS = {
     "schema",
@@ -101,30 +103,10 @@ _BOOTSTRAP_LICENSE_KEYS = {
 }
 _INVENTORY_KEYS = {"schema", "files"}
 _INVENTORY_FILE_KEYS = {"path", "bytes", "sha256"}
-_APPROVAL_KEYS = {
-    "schema",
-    "kind",
-    "request_sha256",
-    "request_base64",
-    "decision",
-    "scope",
-    "reviewer_key_id",
-    "reviewer_organization",
-    "review_reference",
-    "reviewed_at_utc",
-}
-_REGISTRY_KEYS = {"schema", "status", "scope", "reviewers"}
-_REVIEWER_KEYS = {
-    "key_id",
-    "organization",
-    "public_key_base64",
-    "public_key_sha256",
-    "allowed_publishers",
-    "scope",
-}
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _MAX_PAYLOAD_FILES = 200_000
 _MAX_FILE_BYTES = 64 * 1024 * 1024 * 1024
+_MAX_POSITIVE_ID = 9_223_372_036_854_775_807
 
 
 @dataclass(frozen=True)
@@ -156,17 +138,17 @@ class InstallerBinding:
 
 @dataclass(frozen=True)
 class InstallerReview:
-    """A verified independent approval and its exact canonical request."""
+    """A protected-Environment approval and its exact canonical request."""
 
     request_bytes: bytes
     request_sha256: str
-    evidence_sha256: str
-    signature_sha256: str
-    reviewer_registry_sha256: str
-    reviewer_key_id: str
-    reviewer_organization: str
-    review_reference: str
-    reviewed_at_utc: str
+    approval_context_sha256: str
+    approval_environment: str
+    approval_repository: str
+    approval_workflow_ref: str
+    approval_run_id: int
+    approval_run_attempt: int
+    review_model: str
     pre_sign_binding: InstallerBinding | None = None
 
     @property
@@ -288,6 +270,17 @@ def _require_safe_text(value: object, label: str, *, maximum: int = 200) -> str:
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _require_positive_id(value: object, label: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > _MAX_POSITIVE_ID
+    ):
+        raise ValueError(f"{label} must be a positive 64-bit integer")
     return value
 
 
@@ -541,7 +534,7 @@ def generate_installer_review_request(
     version: str,
     publisher: str,
 ) -> dict[str, object]:
-    """Create the canonical request that an independent reviewer will inspect."""
+    """Create the canonical request admitted through the protected Environment."""
 
     identity = inspect_authenticode_image(unsigned_installer, require_state="unsigned")
     inventory = build_payload_inventory(extracted_payload_root)
@@ -588,167 +581,33 @@ def write_canonical_json(path: Path, value: object) -> None:
         raise ValueError("Canonical JSON output could not be written") from exc
 
 
-def _load_signature(path: Path) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("Installer review signature must be a regular file")
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        raise ValueError("Installer review signature could not be read") from exc
-    if payload.endswith(b"\r\n"):
-        payload = payload[:-2]
-    elif payload.endswith(b"\n"):
-        payload = payload[:-1]
-    if not payload or b"\r" in payload or b"\n" in payload or b" " in payload or b"\t" in payload:
-        raise ValueError("Installer review signature encoding is invalid")
-    try:
-        signature = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("Installer review signature encoding is invalid") from exc
-    if len(signature) != 64:
-        raise ValueError("Installer review signature length is invalid")
-    return signature
-
-
-def _load_active_reviewer(
-    registry_path: Path,
-    *,
-    reviewer_key_id: str,
-    publisher: str,
-    application_reviewer_key_id: str,
-) -> tuple[dict[str, object], str]:
-    registry, registry_bytes = _read_json_object(
-        registry_path, "installer reviewer registry", canonical=False
-    )
-    _require_exact_keys(registry, _REGISTRY_KEYS, "installer reviewer registry")
-    if (
-        registry.get("schema") != 1
-        or registry.get("status") != "active"
-        or registry.get("scope") != INSTALLER_REVIEW_SCOPE
-        or not isinstance(registry.get("reviewers"), list)
-    ):
-        raise ValueError("Installer reviewer registry is inactive or malformed")
-    _require_safe_text(application_reviewer_key_id, "application reviewer key ID")
-    if reviewer_key_id == application_reviewer_key_id:
-        raise ValueError("Application and installer reviews must use different key IDs")
-
-    matches: list[dict[str, object]] = []
-    seen_key_ids: set[str] = set()
-    seen_public_keys: set[str] = set()
-    for item in registry["reviewers"]:
-        if not isinstance(item, dict):
-            raise ValueError("Installer reviewer registration must be an object")
-        _require_exact_keys(item, _REVIEWER_KEYS, "installer reviewer registration")
-        key_id = item.get("key_id")
-        if not isinstance(key_id, str) or KEY_ID_RE.fullmatch(key_id) is None:
-            raise ValueError("Installer reviewer key ID is invalid")
-        if key_id in seen_key_ids:
-            raise ValueError("Installer reviewer registry contains a duplicate key ID")
-        seen_key_ids.add(key_id)
-        _require_safe_text(item.get("organization"), "reviewer organization")
-        if item.get("scope") != INSTALLER_REVIEW_SCOPE:
-            raise ValueError("Installer reviewer has the wrong scope")
-        public_key_sha256 = _require_sha256(
-            item.get("public_key_sha256"), "reviewer public-key SHA-256"
-        )
-        if public_key_sha256 in seen_public_keys:
-            raise ValueError("Installer reviewer registry reuses a public key")
-        seen_public_keys.add(public_key_sha256)
-        publishers = item.get("allowed_publishers")
-        if (
-            not isinstance(publishers, list)
-            or not publishers
-            or len(publishers) > 100
-            or any(not isinstance(value, str) for value in publishers)
-        ):
-            raise ValueError("Installer reviewer Publisher allowlist is invalid")
-        checked_publishers = [
-            _require_safe_text(value, "allowed Publisher") for value in publishers
-        ]
-        if len(set(checked_publishers)) != len(checked_publishers):
-            raise ValueError("Installer reviewer Publisher allowlist has duplicates")
-        if key_id == reviewer_key_id:
-            matches.append(item)
-    if len(matches) != 1:
-        raise ValueError("Installer reviewer key is not uniquely registered")
-    reviewer = matches[0]
-    if publisher not in reviewer["allowed_publishers"]:
-        raise ValueError("Installer reviewer is not authorized for this Publisher")
-    return reviewer, sha256_bytes(registry_bytes)
-
-
 def load_installer_review(
-    evidence_path: Path,
-    signature_path: Path,
-    reviewer_registry: Path,
+    request_path: Path,
+    approval_context_path: Path,
     *,
-    expected_evidence_sha256: str,
-    application_reviewer_key_id: str,
+    expected_repository: str,
+    expected_workflow_ref: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
     expected_commit: str,
     expected_source_tree: str,
     expected_version: str,
     expected_publisher: str,
 ) -> InstallerReview:
-    """Authenticate one exact approved request against the protected registry."""
+    """Bind one exact request to the protected Environment job that consumes it."""
 
-    expected_evidence_sha256 = _require_sha256(
-        expected_evidence_sha256, "expected installer review evidence SHA-256"
+    request, request_bytes = _read_json_object(
+        request_path, "installer review request", canonical=True
     )
-    evidence, evidence_bytes = _read_json_object(
-        evidence_path, "installer review evidence", canonical=True
-    )
-    actual_evidence_sha256 = sha256_bytes(evidence_bytes)
-    if actual_evidence_sha256 != expected_evidence_sha256:
-        raise ValueError("Installer review evidence SHA-256 differs from the trusted value")
-    _require_exact_keys(evidence, _APPROVAL_KEYS, "installer review evidence")
-    if (
-        evidence.get("schema") != 1
-        or evidence.get("kind") != APPROVAL_KIND
-        or evidence.get("decision") != "approved"
-        or evidence.get("scope") != INSTALLER_REVIEW_SCOPE
-    ):
-        raise ValueError("Installer review evidence is not an approval for this scope")
-    reviewer_key_id = evidence.get("reviewer_key_id")
-    if not isinstance(reviewer_key_id, str) or KEY_ID_RE.fullmatch(reviewer_key_id) is None:
-        raise ValueError("Installer reviewer key ID is invalid")
-    reviewer_organization = _require_safe_text(
-        evidence.get("reviewer_organization"), "reviewer organization"
-    )
-    review_reference = evidence.get("review_reference")
-    if (
-        not isinstance(review_reference, str)
-        or REVIEW_REFERENCE_RE.fullmatch(review_reference) is None
-    ):
-        raise ValueError("Installer review reference is invalid")
-    reviewed_at = evidence.get("reviewed_at_utc")
-    if not isinstance(reviewed_at, str) or UTC_SECONDS_RE.fullmatch(reviewed_at) is None:
-        raise ValueError("Installer review timestamp is not canonical UTC seconds")
-    try:
-        datetime.strptime(reviewed_at, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-    except ValueError as exc:
-        raise ValueError("Installer review timestamp is invalid") from exc
-
-    request_sha256 = _require_sha256(
-        evidence.get("request_sha256"), "installer review request SHA-256"
-    )
-    request_base64 = evidence.get("request_base64")
-    if not isinstance(request_base64, str) or not request_base64:
-        raise ValueError("Installer review request bytes are missing")
-    try:
-        request_bytes = base64.b64decode(request_base64, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("Installer review request bytes are not valid base64") from exc
-    if sha256_bytes(request_bytes) != request_sha256:
-        raise ValueError("Installer review request hash does not match its exact bytes")
-    parsed_request = _strict_json_loads(request_bytes, "installer review request")
-    if not isinstance(parsed_request, dict) or request_bytes != canonical_json_bytes(parsed_request):
-        raise ValueError("Installer review request is not canonical JSON")
-    request = _validate_request(parsed_request)
+    request = _validate_request(request)
+    request_sha256 = sha256_bytes(request_bytes)
 
     expected_commit = _require_git_id(expected_commit, "expected release commit")
     expected_source_tree = _require_git_id(expected_source_tree, "expected source tree")
+    expected_run_id = _require_positive_id(expected_run_id, "expected run ID")
+    expected_run_attempt = _require_positive_id(
+        expected_run_attempt, "expected run attempt"
+    )
     if not isinstance(expected_version, str) or SEMVER_RE.fullmatch(expected_version) is None:
         raise ValueError("Expected version is invalid")
     expected_publisher = _require_safe_text(expected_publisher, "expected Publisher")
@@ -760,41 +619,37 @@ def load_installer_review(
     ):
         raise ValueError("Installer review request does not bind the expected release")
 
-    reviewer, registry_sha256 = _load_active_reviewer(
-        reviewer_registry,
-        reviewer_key_id=reviewer_key_id,
-        publisher=expected_publisher,
-        application_reviewer_key_id=application_reviewer_key_id,
+    approval_context_sha256_before = sha256_file(
+        approval_context_path, label="installer approval context"
     )
-    if reviewer.get("organization") != reviewer_organization:
-        raise ValueError("Installer reviewer organization differs from the registry")
-    try:
-        public_key = base64.b64decode(
-            str(reviewer.get("public_key_base64", "")), validate=True
-        )
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("Installer reviewer public key is invalid") from exc
-    if (
-        len(public_key) != 32
-        or sha256_bytes(public_key) != reviewer.get("public_key_sha256")
-    ):
-        raise ValueError("Installer reviewer public key does not match its registry hash")
-    signature = _load_signature(signature_path)
-    try:
-        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, evidence_bytes)
-    except (InvalidSignature, ValueError) as exc:
-        raise ValueError("Installer review evidence signature is invalid") from exc
+    approval = load_approval_context(
+        approval_context_path,
+        expected_environment=APPROVAL_ENVIRONMENT,
+        expected_repository=expected_repository,
+        expected_workflow_ref=expected_workflow_ref,
+        expected_release_commit=expected_commit,
+        expected_run_id=expected_run_id,
+        expected_run_attempt=expected_run_attempt,
+        expected_job=APPROVAL_JOB,
+        expected_subject_kind=APPROVAL_SUBJECT_KIND,
+        expected_subject_sha256=request_sha256,
+    )
+    approval_context_sha256_after = sha256_file(
+        approval_context_path, label="installer approval context"
+    )
+    if approval_context_sha256_before != approval_context_sha256_after:
+        raise ValueError("Installer approval context changed while it was verified")
 
     return InstallerReview(
         request_bytes=request_bytes,
         request_sha256=request_sha256,
-        evidence_sha256=actual_evidence_sha256,
-        signature_sha256=sha256_bytes(signature),
-        reviewer_registry_sha256=registry_sha256,
-        reviewer_key_id=reviewer_key_id,
-        reviewer_organization=reviewer_organization,
-        review_reference=review_reference,
-        reviewed_at_utc=reviewed_at,
+        approval_context_sha256=approval_context_sha256_after,
+        approval_environment=approval.environment,
+        approval_repository=approval.repository,
+        approval_workflow_ref=approval.workflow_ref,
+        approval_run_id=approval.run_id,
+        approval_run_attempt=approval.run_attempt,
+        review_model=approval.review_model,
     )
 
 
@@ -832,11 +687,12 @@ def _binding(
 
 def verify_installer_before_sign(
     *,
-    evidence_path: Path,
-    signature_path: Path,
-    reviewer_registry: Path,
-    expected_evidence_sha256: str,
-    application_reviewer_key_id: str,
+    request_path: Path,
+    approval_context_path: Path,
+    expected_repository: str,
+    expected_workflow_ref: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
     unsigned_installer: Path,
     extracted_payload_root: Path,
     signed_application_inventory: Path,
@@ -857,11 +713,12 @@ def verify_installer_before_sign(
     """Verify the exact reviewed candidate immediately before signing."""
 
     review = load_installer_review(
-        evidence_path,
-        signature_path,
-        reviewer_registry,
-        expected_evidence_sha256=expected_evidence_sha256,
-        application_reviewer_key_id=application_reviewer_key_id,
+        request_path,
+        approval_context_path,
+        expected_repository=expected_repository,
+        expected_workflow_ref=expected_workflow_ref,
+        expected_run_id=expected_run_id,
+        expected_run_attempt=expected_run_attempt,
         expected_commit=expected_commit,
         expected_source_tree=expected_source_tree,
         expected_version=expected_version,
@@ -937,11 +794,12 @@ def verify_installer_after_sign(
 
 
 def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--signature", type=Path, required=True)
-    parser.add_argument("--reviewer-registry", type=Path, required=True)
-    parser.add_argument("--expected-evidence-sha256", required=True)
-    parser.add_argument("--application-reviewer-key-id", required=True)
+    parser.add_argument("--request", type=Path, required=True)
+    parser.add_argument("--approval-context", type=Path, required=True)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--workflow-ref", required=True)
+    parser.add_argument("--run-id", type=int, required=True)
+    parser.add_argument("--run-attempt", type=int, required=True)
     parser.add_argument("--unsigned-installer", type=Path, required=True)
     parser.add_argument("--payload-root", type=Path, required=True)
     parser.add_argument("--signed-application-inventory", type=Path, required=True)
@@ -954,20 +812,21 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bootstrap-license-concluded", required=True)
     parser.add_argument("--bootstrap-copyright-text", required=True)
     parser.add_argument("--bootstrap-license-text", type=Path, required=True)
-    parser.add_argument("--commit", required=True)
-    parser.add_argument("--source-tree", required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--publisher", required=True)
+    parser.add_argument("--release-sha", required=True)
+    parser.add_argument("--expected-tree", required=True)
+    parser.add_argument("--expected-version", required=True)
+    parser.add_argument("--expected-publisher", required=True)
     parser.add_argument("--output", type=Path)
 
 
 def _review_from_args(args: argparse.Namespace) -> InstallerReview:
     return verify_installer_before_sign(
-        evidence_path=args.evidence,
-        signature_path=args.signature,
-        reviewer_registry=args.reviewer_registry,
-        expected_evidence_sha256=args.expected_evidence_sha256,
-        application_reviewer_key_id=args.application_reviewer_key_id,
+        request_path=args.request,
+        approval_context_path=args.approval_context,
+        expected_repository=args.repository,
+        expected_workflow_ref=args.workflow_ref,
+        expected_run_id=args.run_id,
+        expected_run_attempt=args.run_attempt,
         unsigned_installer=args.unsigned_installer,
         extracted_payload_root=args.payload_root,
         signed_application_inventory=args.signed_application_inventory,
@@ -980,10 +839,10 @@ def _review_from_args(args: argparse.Namespace) -> InstallerReview:
         bootstrap_license_concluded=args.bootstrap_license_concluded,
         bootstrap_copyright_text=args.bootstrap_copyright_text,
         bootstrap_license_text_path=args.bootstrap_license_text,
-        expected_commit=args.commit,
-        expected_source_tree=args.source_tree,
-        expected_version=args.version,
-        expected_publisher=args.publisher,
+        expected_commit=args.release_sha,
+        expected_source_tree=args.expected_tree,
+        expected_version=args.expected_version,
+        expected_publisher=args.expected_publisher,
     )
 
 

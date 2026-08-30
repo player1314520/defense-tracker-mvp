@@ -854,18 +854,27 @@ def test_supabase_required_env_has_current_auth_url_and_function_secrets():
 
 def test_desktop_release_gate_requires_inno_sha256_timestamp_and_dual_verification():
     gate = read(ROOT / "scripts" / "Build-AndShip.ps1")
+    application_signing = read(
+        ROOT / ".github" / "workflows" / "v9-application-signing.yml"
+    )
+    installer_signing = read(
+        ROOT / ".github" / "workflows" / "v9-signed-candidate.yml"
+    )
+    signing_workflows = application_signing + installer_signing
     installer = read(MVP / "DefenseTracker.iss")
     assert "RequireSignedInstaller" in gate
+    assert "Legacy in-process signing is removed" in gate
     assert "Assert-CleanReleaseCommit" in gate
     assert "signtool.exe" in gate
     assert "ISCC.exe" in gate
-    assert '"/fd", "SHA256", "/tr", $Timestamp, "/td", "SHA256"' in gate
-    assert "AzureArtifactSigning" in gate
-    assert "DigiCertKeyLocker" in gate
-    assert "X509NameType]::SimpleName" in gate
-    assert "SigningCertificateThumbprint" not in gate
-    assert "Get-AuthenticodeSignature" in gate
-    assert "TimeStamperCertificate" in gate
+    assert signing_workflows.count(
+        "/fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256"
+    ) >= 4
+    assert "AzureArtifactSigning" in signing_workflows
+    assert "DigiCertKeyLocker" in signing_workflows
+    assert "SigningCertificateThumbprint" not in signing_workflows
+    assert "Get-AuthenticodeSignature" in signing_workflows
+    assert "TimeStamperCertificate" in signing_workflows
     assert "pip install" not in gate
     assert 'Join-Path $distRoot "archive"' in gate
     assert "previous-active-release.json" in gate

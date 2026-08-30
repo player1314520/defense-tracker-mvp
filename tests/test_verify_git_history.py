@@ -185,12 +185,12 @@ def test_maintainer_alias_cannot_bypass_the_prescribed_noreply_identity(tmp_path
     }
 
 
-def test_ci_and_candidate_repeat_exact_redacted_full_history_scan():
+def test_ci_and_release_preparation_repeat_exact_redacted_full_history_scan():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    candidate = (
-        ROOT / ".github" / "workflows" / "v9-signed-candidate.yml"
+    preparation = (
+        ROOT / ".github" / "workflows" / "v9-release-preparation.yml"
     ).read_text(encoding="utf-8")
-    for workflow in (ci, candidate):
+    for workflow in (ci, preparation):
         assert 'GITLEAKS_VERSION: "8.30.1"' in workflow
         assert GITLEAKS_SHA256 in workflow
         assert "fetch-depth: 0" in workflow
@@ -200,5 +200,5 @@ def test_ci_and_candidate_repeat_exact_redacted_full_history_scan():
         assert '--log-opts="--all"' in workflow
         assert "scripts/verify_git_history.py" in workflow
         assert "sensitive findings are intentionally not printed" in workflow
-    assert '--revision "${RELEASE_SHA}"' in candidate
-    assert "DEFENSE_TRACKER_EPHEMERAL_RUNNER_MODE" in candidate
+    assert '--revision "${RELEASE_SHA}"' in preparation
+    assert "Prepare-UnsignedApplicationBundle.ps1" in preparation

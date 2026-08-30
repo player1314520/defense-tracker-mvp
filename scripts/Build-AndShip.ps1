@@ -23,6 +23,12 @@ param(
 
     [switch]$CandidateOnly,
 
+    [switch]$PrepareUnsignedApplicationBundle,
+
+    [string]$CredentiallessOutputRoot,
+
+    [string]$PublisherPolicyPath = (Join-Path $PSScriptRoot '..\release\publisher-policy.json'),
+
     [string]$SigningProvider = $env:DEFENSE_TRACKER_SIGNING_PROVIDER,
     [string]$TimestampUrl = $env:DEFENSE_TRACKER_TIMESTAMP_URL,
     [string]$PublisherName = $env:DEFENSE_TRACKER_PUBLISHER,
@@ -49,7 +55,7 @@ param(
     [string]$ExpectedInnoLicenseTextSha256 = $env:DEFENSE_TRACKER_INNO_LICENSE_TEXT_SHA256,
     [string]$InnoCopyrightText = $env:DEFENSE_TRACKER_INNO_COPYRIGHT_TEXT,
     [string]$ComplianceEvidencePath = $env:DEFENSE_TRACKER_COMPLIANCE_EVIDENCE,
-    [string]$ComplianceSignaturePath = $env:DEFENSE_TRACKER_COMPLIANCE_SIGNATURE,
+    [string]$ComplianceApprovalContextPath = $env:DEFENSE_TRACKER_COMPLIANCE_APPROVAL_CONTEXT,
     [string]$ExpectedComplianceEvidenceSha256 = $env:DEFENSE_TRACKER_COMPLIANCE_EVIDENCE_SHA256,
     [string]$PreparationRunId = $env:GITHUB_RUN_ID,
     [string]$PreparationRunAttempt = $env:GITHUB_RUN_ATTEMPT,
@@ -65,11 +71,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 . (Join-Path $PSScriptRoot 'ReleaseCertificatePolicy.ps1')
-if ($CandidateOnly -and -not $RequireSignedInstaller) {
-    throw "CandidateOnly requires a signed installer candidate."
+if ($RequireSignedInstaller -or $CandidateOnly) {
+    throw "Legacy in-process signing is removed. Use Prepare-UnsignedApplicationBundle.ps1, the isolated signing workflows, Prepare-UnsignedInstaller.ps1, and Finalize-SignedCandidate.ps1."
 }
-if ($RequireSignedInstaller -and -not $CandidateOnly) {
-    throw "Single-stage signed release builds are disabled. Prepare an installer-review bundle, then run Finalize-SignedCandidate.ps1 in the independent installer-signing environment."
+if ($PrepareUnsignedApplicationBundle -and ($RequireSignedInstaller -or $CandidateOnly)) {
+    throw "Credentialless application preparation cannot use a signing or installer mode."
+}
+if ($PrepareUnsignedApplicationBundle -and [string]::IsNullOrWhiteSpace($CredentiallessOutputRoot)) {
+    throw "Credentialless application preparation requires an explicit output root."
 }
 
 function Get-Sha256 {
@@ -462,66 +471,6 @@ function Assert-AndConsumeBuildEnvironment {
     return $pythonPath
 }
 
-function Invoke-SignAndVerify {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Tool,
-        [Parameter(Mandatory = $true)][string]$Provider,
-        [Parameter(Mandatory = $true)][string]$Publisher,
-        [Parameter(Mandatory = $true)][string]$Timestamp,
-        [string]$AzureDlib,
-        [string]$AzureMetadata,
-        [string]$DigiCertAlias,
-        [string]$DigiCertCertFile,
-        [Parameter(Mandatory = $true)]$CertificatePolicy,
-        [switch]$VerifyOnly
-    )
-    $arguments = @("sign", "/v", "/fd", "SHA256", "/tr", $Timestamp, "/td", "SHA256")
-    if ($Provider -eq "AzureArtifactSigning") {
-        $arguments += @("/dlib", $AzureDlib, "/dmdf", $AzureMetadata)
-    } elseif ($Provider -eq "DigiCertKeyLocker") {
-        $arguments += @(
-            "/csp", "DigiCert Signing Manager KSP", "/kc", $DigiCertAlias,
-            "/f", $DigiCertCertFile
-        )
-    } else {
-        throw "Unsupported trusted signing provider."
-    }
-    if (-not $VerifyOnly) {
-        & $Tool @arguments $Path
-        if ($LASTEXITCODE -ne 0) { throw "SignTool failed to sign $Path." }
-    }
-    & $Tool verify /pa /all /v /tw $Path
-    if ($LASTEXITCODE -ne 0) { throw "SignTool verification failed for $Path." }
-    $signature = Get-AuthenticodeSignature -LiteralPath $Path
-    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-        throw "Get-AuthenticodeSignature did not report a valid signature."
-    }
-    if ($null -eq $signature.SignerCertificate -or $null -eq $signature.TimeStamperCertificate) {
-        throw "Signature lacks a signer or trusted RFC 3161 timestamp certificate."
-    }
-    $simpleName = $signature.SignerCertificate.GetNameInfo(
-        [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
-        $false
-    )
-    if ($simpleName -cne $Publisher) {
-        throw "Signer Publisher '$simpleName' differs from DEFENSE_TRACKER_PUBLISHER."
-    }
-    $identity = Assert-ReleaseSignerCertificatePolicy $signature.SignerCertificate $CertificatePolicy
-    $null = Assert-TrustedCertificateChain $signature.TimeStamperCertificate
-    return [ordered]@{
-        provider = $Provider
-        publisher = $Publisher
-        signer_subject = $identity.normalized_subject
-        signer_spki_sha256 = $identity.spki_sha256
-        signer_issuer_subject = $identity.issuer_subject
-        signer_root_sha256 = $identity.root_sha256
-        timestamp_url = $Timestamp
-        timestamp_certificate_subject = $signature.TimeStamperCertificate.Subject
-        verified_at_utc = [DateTime]::UtcNow.ToString("o")
-    }
-}
-
 function Get-SmokeTransportStatus {
     param([Parameter(Mandatory = $true)]$ErrorRecord)
     $responseValues = @(
@@ -808,10 +757,11 @@ if ($version.semantic_version -notmatch '^\d+\.\d+\.\d+$' -or
     throw "version.json is invalid."
 }
 $unsignedDevelopmentCompanyName = "DefenseTracker Community Edition (Unsigned Development Build)"
-if ($RequireSignedInstaller -and [string]::IsNullOrWhiteSpace($PublisherName)) {
+if (($RequireSignedInstaller -or $PrepareUnsignedApplicationBundle) -and
+    [string]::IsNullOrWhiteSpace($PublisherName)) {
     throw "DEFENSE_TRACKER_PUBLISHER must be the verified legal Publisher; it is never inferred."
 }
-if ($RequireSignedInstaller) {
+if ($RequireSignedInstaller -or $PrepareUnsignedApplicationBundle) {
     $buildKind = "signed-release-candidate"
     $versionInfoCompanyName = $PublisherName.Trim()
 } else {
@@ -822,7 +772,7 @@ if ($RequireSignedInstaller) {
 $gitFacts = Assert-CleanReleaseCommit $projectRoot $ExpectedReleaseSha $version.release_baseline
 $venvRoot = Join-Path $projectRoot ".venv-build"
 $venvPython = Assert-AndConsumeBuildEnvironment $venvRoot $projectRoot `
-    -RequireVerifiedPython:$RequireSignedInstaller
+    -RequireVerifiedPython:($RequireSignedInstaller -or $PrepareUnsignedApplicationBundle)
 $buildEnvironmentMarker = Get-Content -LiteralPath (Join-Path $venvRoot ".build-environment.json") `
     -Raw | ConvertFrom-Json
 $buildRoot = Join-Path $projectRoot "build"
@@ -910,8 +860,6 @@ $packagesFile = Join-Path $venvRoot ".installed-packages.txt"
 $runtimeLockHash = Get-Sha256 (Join-Path $projectRoot "requirements.runtime.lock")
 $buildLockHash = Get-Sha256 (Join-Path $projectRoot "requirements.build.lock")
 $componentInventoryPath = Join-Path $evidenceRoot "unsigned-component-inventory.json"
-$reviewerRegistry = Join-Path $sourceRoot "release\compliance-reviewers.json"
-
 $signatureEvidence = $null
 $resolvedSignTool = ""
 $resolvedInno = ""
@@ -919,21 +867,30 @@ $resolvedSevenZip = ""
 $resolvedDefender = ""
 $resolvedInnoLicenseText = ""
 $resolvedComplianceEvidence = ""
+$resolvedComplianceApprovalContext = ""
 $toolchainEvidence = $null
 $certificatePolicy = $null
 $digicertCertificateIdentity = $null
-if ($RequireSignedInstaller) {
+if ($PrepareUnsignedApplicationBundle) {
+    & $venvPython (Join-Path $sourceRoot "scripts\generate_component_inventory.py") `
+        $stagingRoot $componentInventoryPath
+    if ($LASTEXITCODE -ne 0) { throw "Unsigned component inventory generation failed." }
+    $applicationUnsignedDigestPath = Join-Path $evidenceRoot "application-authenticode-unsigned.json"
+    & $venvPython (Join-Path $sourceRoot "scripts\authenticode_digest.py") `
+        --path $stagedExe --require-state unsigned --output $applicationUnsignedDigestPath
+    if ($LASTEXITCODE -ne 0) { throw "Unsigned application Authenticode identity capture failed." }
+} elseif ($RequireSignedInstaller) {
     if ([string]::IsNullOrWhiteSpace($ComplianceEvidencePath) -or
-        [string]::IsNullOrWhiteSpace($ComplianceSignaturePath) -or
+        [string]::IsNullOrWhiteSpace($ComplianceApprovalContextPath) -or
         $ExpectedComplianceEvidenceSha256 -cnotmatch '^[0-9a-f]{64}$') {
-        throw "Signed candidates require signed, hash-pinned compliance evidence from the protected environment."
+        throw "Signed candidates require hash-pinned compliance evidence and its protected Environment context."
     }
     $resolvedComplianceEvidence = [System.IO.Path]::GetFullPath($ComplianceEvidencePath)
-    $resolvedComplianceSignature = [System.IO.Path]::GetFullPath($ComplianceSignaturePath)
+    $resolvedComplianceApprovalContext = [System.IO.Path]::GetFullPath($ComplianceApprovalContextPath)
     if (-not (Test-Path -LiteralPath $resolvedComplianceEvidence -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $resolvedComplianceSignature -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $resolvedComplianceApprovalContext -PathType Leaf) -or
         (Get-Sha256 $resolvedComplianceEvidence) -cne $ExpectedComplianceEvidenceSha256) {
-        throw "Compliance evidence/signature is missing or differs from the protected SHA-256."
+        throw "Compliance evidence/context is missing or differs from the protected SHA-256."
     }
     & $venvPython (Join-Path $sourceRoot "scripts\generate_component_inventory.py") `
         $stagingRoot $componentInventoryPath
@@ -941,8 +898,7 @@ if ($RequireSignedInstaller) {
     $complianceVerifiedAtUtc = [DateTime]::UtcNow.ToString("o")
     & $venvPython (Join-Path $sourceRoot "scripts\verify_compliance_evidence.py") `
         --evidence $resolvedComplianceEvidence `
-        --evidence-signature $resolvedComplianceSignature `
-        --reviewer-registry $reviewerRegistry `
+        --approval-context $resolvedComplianceApprovalContext `
         --component-inventory $componentInventoryPath `
         --application-root $stagingRoot `
         --expected-sha256 $ExpectedComplianceEvidenceSha256 `
@@ -953,7 +909,11 @@ if ($RequireSignedInstaller) {
         --third-party-notices (Join-Path $sourceRoot "THIRD_PARTY_NOTICES.md") `
         --runtime-lock-sha256 $runtimeLockHash `
         --build-lock-sha256 $buildLockHash `
-        --verified-at-utc $complianceVerifiedAtUtc
+        --verified-at-utc $complianceVerifiedAtUtc `
+        --github-repository $PreparationRepository `
+        --github-workflow-ref $PreparationWorkflowRef `
+        --github-run-id $PreparationRunId `
+        --github-run-attempt $PreparationRunAttempt
     if ($LASTEXITCODE -ne 0) { throw "Pre-sign compliance evidence validation failed." }
     if ($SigningProvider -notin @("AzureArtifactSigning", "DigiCertKeyLocker")) {
         throw "Stable release requires AzureArtifactSigning or DigiCertKeyLocker."
@@ -961,11 +921,10 @@ if ($RequireSignedInstaller) {
     if ($TimestampUrl -notmatch '^https?://[^\s]+$') {
         throw "Stable release requires an explicit HTTP(S) RFC 3161 timestamp URL."
     }
-    $certificatePolicy = Get-ReleaseCertificatePolicy `
-        -ExpectedSignerSubjects $ExpectedSignerSubjects `
-        -ExpectedSignerSpkiSha256 $ExpectedSignerSpkiSha256 `
-        -ExpectedSignerIssuers $ExpectedSignerIssuers `
-        -ExpectedSignerRootSha256 $ExpectedSignerRootSha256
+    $certificatePolicy = Get-ReleasePublisherPolicy `
+        -Path $PublisherPolicyPath `
+        -SigningProvider $SigningProvider
+    $PublisherName = [string]$certificatePolicy.publisher
     $resolvedSignTool = Resolve-RequiredTool $SignToolPath "signtool.exe" "Windows SDK SignTool"
     $resolvedInno = Resolve-RequiredTool $InnoSetupCompiler "ISCC.exe" "Inno Setup compiler"
     $resolvedSevenZip = Resolve-RequiredTool $SevenZipPath "7z.exe" "7-Zip installer inspector"
@@ -1030,9 +989,7 @@ if ($RequireSignedInstaller) {
     if ($LASTEXITCODE -ne 0) { throw "Unsigned application Authenticode identity capture failed." }
     $applicationUnsignedDigest = Get-Content -LiteralPath $applicationUnsignedDigestPath -Raw |
         ConvertFrom-Json
-    $signatureEvidence = Invoke-SignAndVerify $stagedExe $resolvedSignTool $SigningProvider `
-        $PublisherName $TimestampUrl $AzureSigningDlib $AzureSigningMetadata `
-        $DigiCertKeyAlias $DigiCertCertificateFile $certificatePolicy
+    throw "Legacy application signing path is removed."
     $applicationSignedDigestPath = Join-Path $evidenceRoot "application-authenticode-signed.json"
     & $venvPython (Join-Path $sourceRoot "scripts\authenticode_digest.py") `
         --path $stagedExe --require-state signed `
@@ -1046,6 +1003,125 @@ if ($RequireSignedInstaller) {
 
 Write-Host "[SMOKE] Launching staged application."
 Invoke-DesktopSmokeTest $stagedExe $smokeRuntime $version $ExpectedReleaseSha
+
+if ($PrepareUnsignedApplicationBundle) {
+    if ($PreparationRunId -cnotmatch '^[1-9][0-9]{0,19}$' -or
+        $PreparationRunAttempt -cnotmatch '^[1-9][0-9]{0,9}$' -or
+        $PreparationRepository -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or
+        [string]::IsNullOrWhiteSpace($PreparationWorkflowRef)) {
+        throw "Credentialless preparation requires exact GitHub run provenance."
+    }
+    $policyFull = [System.IO.Path]::GetFullPath($PublisherPolicyPath)
+    if (-not (Test-Path -LiteralPath $policyFull -PathType Leaf)) {
+        throw "Committed Publisher policy is missing."
+    }
+    $outputFull = [System.IO.Path]::GetFullPath($CredentiallessOutputRoot)
+    if (Test-Path -LiteralPath $outputFull) {
+        throw "Credentialless output root already exists; use a fresh directory."
+    }
+    $bundleRoot = Join-Path $outputFull 'application-unsigned-bundle'
+    $bundleApplication = Join-Path $bundleRoot 'payload\DefenseTracker'
+    $bundleEvidence = Join-Path $bundleRoot 'evidence'
+    New-Item -ItemType Directory -Path $bundleApplication,$bundleEvidence -Force | Out-Null
+    Get-ChildItem -LiteralPath $stagingRoot -Force |
+        Copy-Item -Destination $bundleApplication -Recurse -Force
+
+    $markerPath = Join-Path $venvRoot '.build-environment.json'
+    $bootstrapLock = Join-Path $projectRoot 'requirements.bootstrap.lock'
+    $runtimeLock = Join-Path $projectRoot 'requirements.runtime.lock'
+    $buildLock = Join-Path $projectRoot 'requirements.build.lock'
+    $evidenceCopies = [ordered]@{
+        'application-authenticode-unsigned.json' = $applicationUnsignedDigestPath
+        'unsigned-component-inventory.json' = $componentInventoryPath
+        'build-environment.json' = $markerPath
+        'installed-packages.txt' = $packagesFile
+        'requirements.bootstrap.lock' = $bootstrapLock
+        'requirements.runtime.lock' = $runtimeLock
+        'requirements.build.lock' = $buildLock
+        'publisher-policy.json' = $policyFull
+        'version.json' = $versionFile
+    }
+    foreach ($name in $evidenceCopies.Keys) {
+        $sourceMaterial = Get-Item -LiteralPath $evidenceCopies[$name] -Force
+        if ($sourceMaterial.PSIsContainer -or
+            ($sourceMaterial.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Release material is not a regular non-reparse file: $name"
+        }
+        $copiedMaterial = Join-Path $bundleEvidence $name
+        Copy-Item -LiteralPath $sourceMaterial.FullName -Destination $copiedMaterial
+        $copiedItem = Get-Item -LiteralPath $copiedMaterial -Force
+        if ($copiedItem.PSIsContainer -or
+            ($copiedItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Staged release material is not a regular non-reparse file: $name"
+        }
+    }
+    $buildProvenance = [ordered]@{
+        schema = 1
+        release_commit = $ExpectedReleaseSha
+        source_tree = $gitFacts.tree
+        source_date_epoch = [int64]$gitFacts.epoch
+        build_started_at_utc = $buildStartedUtc.ToString('o')
+        build_finished_at_utc = $buildFinishedUtc.ToString('o')
+        repository = $PreparationRepository
+        workflow_ref = $PreparationWorkflowRef
+        run_id = [int64]$PreparationRunId
+        run_attempt = [int]$PreparationRunAttempt
+        job = 'prepare-unsigned-application'
+    }
+    $buildProvenance | ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath (Join-Path $bundleEvidence 'build-provenance.json') -Encoding UTF8
+
+    $requestPath = Join-Path $bundleRoot 'signing-request.json'
+    $requestPathRoot = Split-Path $bundleRoot -Parent
+    $requestBundleRelative = [IO.Path]::GetRelativePath($requestPathRoot, $bundleRoot).Replace('\','/')
+    $requestOutputRelative = [IO.Path]::GetRelativePath($requestPathRoot, $requestPath).Replace('\','/')
+    $requestEvidenceRelative = [IO.Path]::GetRelativePath($requestPathRoot, $bundleEvidence).Replace('\','/')
+    Push-Location -LiteralPath $requestPathRoot
+    try {
+        & $venvPython (Join-Path $sourceRoot 'scripts\signing_exchange.py') create-request `
+            --subject-kind application `
+            --bundle-root $requestBundleRelative `
+            --target 'payload/DefenseTracker/DefenseTracker.exe' `
+            --release-commit $ExpectedReleaseSha `
+            --source-tree $gitFacts.tree `
+            --version $version.semantic_version `
+            --publisher $PublisherName `
+            --repository $PreparationRepository `
+            --workflow-ref $PreparationWorkflowRef `
+            --run-id $PreparationRunId `
+            --run-attempt $PreparationRunAttempt `
+            --job prepare-unsigned-application `
+            --material-sha256 "python-source=$([string]$buildEnvironmentMarker.python_source_sha256)" `
+            --material "build-environment=$requestEvidenceRelative/build-environment.json" `
+            --material "installed-packages=$requestEvidenceRelative/installed-packages.txt" `
+            --material "bootstrap-lock=$requestEvidenceRelative/requirements.bootstrap.lock" `
+            --material "runtime-lock=$requestEvidenceRelative/requirements.runtime.lock" `
+            --material "build-lock=$requestEvidenceRelative/requirements.build.lock" `
+            --material "component-inventory=$requestEvidenceRelative/unsigned-component-inventory.json" `
+            --material "publisher-policy=$requestEvidenceRelative/publisher-policy.json" `
+            --material "version=$requestEvidenceRelative/version.json" `
+            --output $requestOutputRelative
+        if ($LASTEXITCODE -ne 0) { throw "Application signing request generation failed." }
+    } finally {
+        Pop-Location
+    }
+    Copy-Item -LiteralPath $requestPath -Destination (
+        Join-Path $outputFull 'application-signing-request.json'
+    )
+
+    $postStatus = Invoke-Git $projectRoot @('status','--porcelain','--untracked-files=all')
+    if (-not [string]::IsNullOrWhiteSpace($postStatus) -or
+        (Invoke-Git $projectRoot @('rev-parse','HEAD')) -cne $ExpectedReleaseSha) {
+        throw "Source changed during unsigned application preparation."
+    }
+    Invoke-Git $projectRoot @('fetch','--no-tags','origin','main') | Out-Null
+    if ((Invoke-Git $projectRoot @('rev-parse','refs/remotes/origin/main')) -cne $ExpectedReleaseSha) {
+        throw "origin/main changed during unsigned application preparation."
+    }
+    Write-Host "[APPLICATION-REQUEST] $requestPath"
+    Write-Host "[APPLICATION-BUNDLE]  $bundleRoot"
+    return
+}
 
 if ($RequireSignedInstaller) {
     $installerDefinition = Join-Path $sourceRoot "deploy\mvp\DefenseTracker.iss"
@@ -1123,13 +1199,6 @@ if ($RequireSignedInstaller) {
             --output $installerReviewRequestPath
         if ($LASTEXITCODE -ne 0) { throw "Installer review request generation failed." }
 
-        $applicationCompliance = Get-Content -LiteralPath $resolvedComplianceEvidence -Raw |
-            ConvertFrom-Json
-        $applicationReviewerKeyId = [string]$applicationCompliance.reviewer_key_id
-        if ($applicationReviewerKeyId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$') {
-            throw "Application compliance evidence has no trustworthy reviewer key ID."
-        }
-
         $bundleApplication = Join-Path $preparationStaging "application"
         $bundleInstallerRoot = Join-Path $preparationStaging "installer"
         $bundleEvidence = Join-Path $preparationStaging "evidence"
@@ -1146,7 +1215,7 @@ if ($RequireSignedInstaller) {
             "signed-component-inventory.json" = $signedComponentInventoryPath
             "toolchain-evidence.json" = $toolchainEvidencePath
             "application-compliance-evidence.json" = $resolvedComplianceEvidence
-            "application-compliance-signature.txt" = $resolvedComplianceSignature
+            "application-compliance-approval-context.json" = $resolvedComplianceApprovalContext
             "installed-packages.txt" = $packagesFile
             "installer-review-request.json" = $installerReviewRequestPath
             "inno-license.txt" = $resolvedInnoLicenseText
@@ -1200,13 +1269,13 @@ if ($RequireSignedInstaller) {
             }
             application = [ordered]@{
                 root = "application"
-                reviewer_key_id = $applicationReviewerKeyId
+                review_model = "single-maintainer-audited"
                 unsigned_digest = "evidence/application-authenticode-unsigned.json"
                 signed_digest = "evidence/application-authenticode-signed.json"
                 unsigned_component_inventory = "evidence/unsigned-component-inventory.json"
                 signed_component_inventory = "evidence/signed-component-inventory.json"
                 compliance_evidence = "evidence/application-compliance-evidence.json"
-                compliance_signature = "evidence/application-compliance-signature.txt"
+                compliance_approval_context = "evidence/application-compliance-approval-context.json"
             }
             installer = [ordered]@{
                 path = "installer/$([System.IO.Path]::GetFileName($stagedInstaller))"
@@ -1251,9 +1320,7 @@ if ($RequireSignedInstaller) {
         Write-Host "         The installer is unsigned; no stable assets were generated."
         return
     }
-    $installerSignature = Invoke-SignAndVerify $stagedInstaller $resolvedSignTool $SigningProvider `
-        $PublisherName $TimestampUrl $AzureSigningDlib $AzureSigningMetadata `
-        $DigiCertKeyAlias $DigiCertCertificateFile $certificatePolicy
+    throw "Legacy installer signing path is removed."
     $buildFinishedUtc = [DateTime]::UtcNow
     Invoke-DefenderScan $resolvedDefender $stagingRoot
     Invoke-DefenderScan $resolvedDefender $stagedInstaller
@@ -1295,8 +1362,7 @@ if ($RequireSignedInstaller) {
         --toolchain-evidence $toolchainEvidencePath `
         --compliance-evidence $resolvedComplianceEvidence `
         --compliance-evidence-sha256 $ExpectedComplianceEvidenceSha256 `
-        --compliance-signature $resolvedComplianceSignature `
-        --compliance-reviewer-registry $reviewerRegistry `
+        --compliance-approval-context $resolvedComplianceApprovalContext `
         --component-inventory $componentInventoryPath
     if ($LASTEXITCODE -ne 0) { throw "Release asset packaging failed." }
     Reset-GeneratedDirectory $portableExtract $portableExtract (Join-Path $evidenceRoot "previous-portable-extract.json")
@@ -1307,9 +1373,7 @@ if ($RequireSignedInstaller) {
     $portableFindings = @(Get-ArtifactSafetyFindings $portableExtract)
     if ($portableFindings.Count -gt 0) { throw "Portable ZIP content scan failed:`n - $($portableFindings -join "`n - ")" }
     $portableExe = Join-Path $portableExtract "DefenseTracker\DefenseTracker.exe"
-    $null = Invoke-SignAndVerify $portableExe $resolvedSignTool $SigningProvider `
-        $PublisherName $TimestampUrl $AzureSigningDlib $AzureSigningMetadata `
-        $DigiCertKeyAlias $DigiCertCertificateFile $certificatePolicy -VerifyOnly
+    throw "Legacy portable verification path is removed."
     Invoke-DefenderScan $resolvedDefender $portableExtract
     Invoke-DesktopSmokeTest $portableExe $portableSmokeRuntime $version $ExpectedReleaseSha
     Copy-Item -Path (Join-Path $portableExtract "DefenseTracker\*") `
