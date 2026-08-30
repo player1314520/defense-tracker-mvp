@@ -227,6 +227,22 @@ function Invoke-Git {
     return $output
 }
 
+function ConvertTo-ReleaseUtc {
+    param([Parameter(Mandatory = $true)]$Value)
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.UtcDateTime
+    }
+    if ($Value -is [DateTime]) {
+        return $Value.ToUniversalTime()
+    }
+    $parsed = [DateTimeOffset]::Parse(
+        [string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    )
+    return $parsed.UtcDateTime
+}
+
 function Assert-AndConsumeBuildEnvironment {
     param([string]$VenvRoot,[string]$ProjectRoot)
     $markerPath = Join-Path $VenvRoot ".build-environment.json"
@@ -247,7 +263,7 @@ function Assert-AndConsumeBuildEnvironment {
         $marker.installed_packages_sha256 -cne (Get-Sha256 $freezePath)) {
         throw "Finalizer Python environment is not fresh or hash-locked."
     }
-    $prepared = [DateTime]::Parse($marker.prepared_at_utc).ToUniversalTime()
+    $prepared = ConvertTo-ReleaseUtc $marker.prepared_at_utc
     if (([DateTime]::UtcNow - $prepared).TotalHours -gt 2) {
         throw "Finalizer Python environment is older than two hours."
     }
@@ -566,7 +582,7 @@ function Invoke-LegacyMigrationSmokeTest {
 
 function Invoke-DefenderScan {
     param([string]$Tool,[string]$Path)
-    & $Tool -DisableRemediation -Scan -ScanType 3 -File $Path
+    & $Tool -Scan -ScanType 3 -File $Path -DisableRemediation
     if ($LASTEXITCODE -ne 0) { throw "Microsoft Defender scan failed." }
 }
 
