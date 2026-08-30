@@ -405,59 +405,89 @@ function Invoke-DesktopSmokeTest {
         $deadline = [DateTime]::UtcNow.AddSeconds(60)
         $workspaceReady = $false
         $windowReady = $false
+        $lastListenerCount = 0
+        $ownedPort = 0
+        $lastListenerQuery = 'not-run'
+        $lastTransportStatus = 'not-requested'
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($process.HasExited) { throw "Desktop smoke process exited early." }
             $process.Refresh()
             if ($process.MainWindowTitle -like '*V9*Defense Command Hub*') { $windowReady = $true }
-            $ownedListeners = @(
-                Get-NetTCPConnection -State Listen -OwningProcess $process.Id -ErrorAction SilentlyContinue |
-                    Where-Object {
-                        $_.LocalAddress -eq '127.0.0.1' -and
-                        $_.LocalPort -in 49231..49235
-                    }
-            )
-            if ($ownedListeners.Count -gt 1) {
-                throw 'Desktop smoke process owns multiple registered loopback listeners.'
-            }
-            if ($ownedListeners.Count -eq 1) {
-                $response = $null
+            if (-not $workspaceReady) {
                 try {
-                    $response = Invoke-RestMethod `
-                        -Uri ("http://127.0.0.1:{0}{1}" -f $ownedListeners[0].LocalPort, $smokeEndpoint) `
-                        -Headers @{ 'X-Defense-Tracker-Smoke' = $smokeToken } `
-                        -Method Get -TimeoutSec 1 -ErrorAction Stop
-                } catch {}
-                if ($null -ne $response) {
-                    $evidence = $response.evidence
-                    if ($response.process_id -eq $process.Id -and
-                        $evidence.schema -eq 1 -and $evidence.http_status -eq 200 -and
-                        $evidence.pathname -eq '/' -and $evidence.workspace_ready -eq $true -and
-                        $evidence.version -eq $Version.semantic_version -and
-                        $evidence.display_version -eq $Version.display_version -and
-                        $evidence.release_tag -eq $Version.release_tag -and
-                        $evidence.build_commit -eq $ExpectedCommit) {
-                        $evidenceJson = $evidence | ConvertTo-Json -Compress
-                        $evidenceBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
-                            $evidenceJson + [Environment]::NewLine
-                        )
-                        $evidenceStream = [System.IO.FileStream]::new(
-                            $smokeEvidence,
-                            [System.IO.FileMode]::CreateNew,
-                            [System.IO.FileAccess]::Write,
-                            [System.IO.FileShare]::None
-                        )
-                        try {
-                            $evidenceStream.Write($evidenceBytes, 0, $evidenceBytes.Length)
-                            $evidenceStream.Flush($true)
-                        } finally { $evidenceStream.Dispose() }
-                        $workspaceReady = $true
+                    $ownedListeners = @(
+                        Get-NetTCPConnection -State Listen -OwningProcess $process.Id -ErrorAction Stop |
+                            Where-Object {
+                                $_.LocalAddress -eq '127.0.0.1' -and
+                                $_.LocalPort -in 49231..49235
+                            }
+                    )
+                    $lastListenerQuery = 'ok'
+                } catch {
+                    $ownedListeners = @()
+                    $lastListenerQuery = 'query-error'
+                }
+                $lastListenerCount = $ownedListeners.Count
+                if ($ownedListeners.Count -gt 1) {
+                    throw 'Desktop smoke process owns multiple registered loopback listeners.'
+                }
+                if ($ownedListeners.Count -eq 0) {
+                    $lastTransportStatus = 'no-owned-listener'
+                } else {
+                    $ownedPort = [int]$ownedListeners[0].LocalPort
+                    $response = $null
+                    try {
+                        $response = Invoke-RestMethod `
+                            -Uri ("http://127.0.0.1:{0}{1}" -f $ownedPort, $smokeEndpoint) `
+                            -Headers @{ 'X-Defense-Tracker-Smoke' = $smokeToken } `
+                            -Method Get -TimeoutSec 1 -ErrorAction Stop
+                        $lastTransportStatus = 'http-200'
+                    } catch {
+                        if ($null -ne $_.Exception.Response) {
+                            $lastTransportStatus = 'http-' + [int]$_.Exception.Response.StatusCode
+                        } else {
+                            $lastTransportStatus = 'connection-error'
+                        }
+                    }
+                    if ($null -ne $response) {
+                        $evidence = $response.evidence
+                        if ($response.process_id -eq $process.Id -and
+                            $evidence.schema -eq 1 -and $evidence.http_status -eq 200 -and
+                            $evidence.pathname -eq '/' -and $evidence.workspace_ready -eq $true -and
+                            $evidence.version -eq $Version.semantic_version -and
+                            $evidence.display_version -eq $Version.display_version -and
+                            $evidence.release_tag -eq $Version.release_tag -and
+                            $evidence.build_commit -eq $ExpectedCommit) {
+                            $evidenceJson = $evidence | ConvertTo-Json -Compress
+                            $evidenceBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
+                                $evidenceJson + [Environment]::NewLine
+                            )
+                            $evidenceStream = [System.IO.FileStream]::new(
+                                $smokeEvidence,
+                                [System.IO.FileMode]::CreateNew,
+                                [System.IO.FileAccess]::Write,
+                                [System.IO.FileShare]::None
+                            )
+                            try {
+                                $evidenceStream.Write($evidenceBytes, 0, $evidenceBytes.Length)
+                                $evidenceStream.Flush($true)
+                            } finally { $evidenceStream.Dispose() }
+                            $workspaceReady = $true
+                        } else {
+                            $lastTransportStatus = 'invalid-evidence'
+                        }
                     }
                 }
             }
             if ($workspaceReady -and $windowReady) { return }
             Start-Sleep -Milliseconds 400
         }
-        throw "Desktop smoke timeout."
+        throw (
+            "Desktop smoke timeout (authenticated workspace=$workspaceReady, " +
+            "V9 window=$windowReady, listener_count=$lastListenerCount, " +
+            "owned_port=$ownedPort, listener_query=$lastListenerQuery, " +
+            "transport=$lastTransportStatus)."
+        )
     } finally {
         if ($null -ne $process -and -not $process.HasExited) {
             Stop-Process -Id $process.Id -Force
