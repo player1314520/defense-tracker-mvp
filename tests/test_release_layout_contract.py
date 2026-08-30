@@ -2,6 +2,8 @@
 import json
 from datetime import timezone
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -10,6 +12,13 @@ from scripts.package_release_assets import parse_utc
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _powershell() -> str:
+    executable = shutil.which("pwsh") or shutil.which("powershell")
+    if executable is None:
+        pytest.skip("PowerShell is unavailable")
+    return executable
 
 
 def test_release_layout_uses_tag_and_never_guesses_legacy_archive_identity():
@@ -68,6 +77,16 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     )
     launcher = (ROOT / "launcher.py").read_text(encoding="utf-8")
     smoke_probe = (ROOT / "v9" / "desktop_smoke.py").read_text(encoding="utf-8")
+    transport_function = builder[
+        builder.index("function Get-SmokeTransportStatus") : builder.index(
+            "function Invoke-DesktopSmokeTest"
+        )
+    ]
+    finalizer_transport_function = finalizer[
+        finalizer.index("function Get-SmokeTransportStatus") : finalizer.index(
+            "function Invoke-DesktopSmokeTest"
+        )
+    ]
     smoke_function = builder[
         builder.index("function Invoke-DesktopSmokeTest") : builder.index(
             "function Invoke-InstallerLifecycleSmokeTest"
@@ -134,6 +153,14 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     ) < finalizer_smoke_function.index("Get-NetTCPConnection")
     assert "transport=$lastTransportStatus" in smoke_function
     assert "transport=$lastTransportStatus" in finalizer_smoke_function
+    assert "$_.Exception.Response" not in smoke_function
+    assert "$_.Exception.Response" not in finalizer_smoke_function
+    assert "Get-SmokeTransportStatus -ErrorRecord $_" in smoke_function
+    assert "Get-SmokeTransportStatus -ErrorRecord $_" in finalizer_smoke_function
+    assert "PSObject.Properties" in transport_function
+    assert "PSObject.Properties" in finalizer_transport_function
+    assert "connection-error" in transport_function
+    assert "connection-error" in finalizer_transport_function
     assert "listener_query=$lastListenerQuery" in smoke_function
     assert "listener_query=$lastListenerQuery" in finalizer_smoke_function
     assert "Get-NetTCPConnection" in smoke_function and "-ErrorAction Stop" in smoke_function
@@ -144,3 +171,48 @@ def test_desktop_smoke_requires_authenticated_webview_workspace_evidence():
     assert "Invoke-DesktopSmokeTest $portableExe" in builder
     assert "Invoke-LegacyMigrationSmokeTest" in builder
     assert "Legacy migration overwrote existing runtime configuration" in builder
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "scripts/Build-AndShip.ps1",
+        "scripts/Finalize-SignedCandidate.ps1",
+    ),
+)
+def test_smoke_transport_status_is_strictmode_safe(tmp_path, relative_path):
+    source = (ROOT / relative_path).read_text(encoding="utf-8-sig")
+    function_start = source.index("function Get-SmokeTransportStatus")
+    function_end = source.index("function Invoke-DesktopSmokeTest", function_start)
+    function_source = source[function_start:function_end]
+    probe = tmp_path / f"transport-{Path(relative_path).stem}.ps1"
+    probe.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        "Set-StrictMode -Version Latest\n"
+        + function_source
+        + "\n"
+        + "$missing = [pscustomobject]@{ Exception = "
+        "[System.InvalidOperationException]::new('missing') }\n"
+        + "$nullResponse = [pscustomobject]@{ Exception = "
+        "[System.Net.WebException]::new('null') }\n"
+        + "$httpResponse = [pscustomobject]@{ Exception = [pscustomobject]@{ "
+        "Response = [pscustomobject]@{ StatusCode = 503 } } }\n"
+        + "@($missing, $nullResponse, $httpResponse) | ForEach-Object { "
+        "Get-SmokeTransportStatus -ErrorRecord $_ }\n",
+        encoding="utf-8-sig",
+    )
+    result = subprocess.run(
+        [_powershell(), "-NoProfile", "-File", str(probe)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [
+        "connection-error",
+        "connection-error",
+        "http-503",
+    ]
