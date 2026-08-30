@@ -2,7 +2,7 @@ begin;
 
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
-select plan(11);
+select plan(12);
 
 insert into auth.users(id,email)
 values (
@@ -260,6 +260,24 @@ select is(
     ),
     0::bigint,
     'the rejected 1001st event is not persisted'
+);
+
+select throws_ok(
+    $$
+        do $corrupt_capacity$
+        begin
+            delete from private.organization_seat_usage
+            where organization_id =
+                '10000000-0000-0000-0000-000000000001'::uuid;
+            delete from public.memberships
+            where organization_id =
+                '10000000-0000-0000-0000-000000000001'::uuid;
+        end;
+        $corrupt_capacity$
+    $$,
+    'P0001',
+    'organization capacity state is unavailable',
+    'membership release fails closed while its organization still exists'
 );
 
 select * from finish();

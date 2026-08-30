@@ -16,6 +16,22 @@
 Render、Fly、Docker 和 `.railwayignore` 的发布面移除。云端不安装 AI、
 抓取、PDF、DOCX 或报告生成依赖。
 
+如在隔离的兼容环境单独运行旧机器人，除签名、应用和租户绑定外还必须配置：
+
+| 名称 | 含义 |
+|---|---|
+| `FEISHU_ALLOWED_SENDER_IDS` | 允许的发送者；必须使用 `open_id:`、`user_id:` 或 `union_id:` 限定命名空间，逗号分隔 |
+| `FEISHU_ALLOWED_CHAT_IDS` | 明确信任的会话 `chat_id`，逗号分隔；允许名单内会话的成员可调用普通处理功能 |
+| `FEISHU_ADMIN_SENDER_IDS` | 可修改订阅/模式、查看状态或立即扫描的发送者；必须使用上述命名空间格式 |
+| `FEISHU_RATE_*` / `FEISHU_COST_*` | 每发送者、每会话和全局滑动窗口预算；非法值使 webhook 返回 503 |
+| `FEISHU_MAX_INFLIGHT_JOBS` | 运行中与排队后台任务的总上限，默认 8 |
+
+生产不得设置 `FEISHU_WEBHOOK_ALLOW_TOKEN_ONLY` 或
+`FEISHU_AUTH_ALLOW_UNLISTED_DEV`。后者只有与前者同时显式启用时才允许未列入名单的
+开发调用，仍要求事件携带有效发送者身份，也永远不会授予管理员权限。兼容机器人
+的配额/并发状态为单进程内存状态，只适用于当前单 worker 启动方式；多实例部署前
+必须迁移到共享原子存储，不能把增加 worker 数当成扩容方案。
+
 ## 运行变量
 
 | 名称 | 含义 |

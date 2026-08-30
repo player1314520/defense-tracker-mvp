@@ -337,8 +337,8 @@ if not 1 <= key_version <= 100:
     raise SystemExit("access application key version must be 1..100")
 if str(key_version) != exact_dotenv_value("ACCESS_APPLICATION_ENCRYPTION_KEY_VERSION"):
     raise SystemExit("runtime encryption key version differs from the official Supabase .env")
-if str(services["storage"].get("environment", {}).get("FILE_SIZE_LIMIT", "")) != "16777232":
-    raise SystemExit("Storage limit must be 16 MiB plus one AES-GCM tag")
+if str(services["storage"].get("environment", {}).get("FILE_SIZE_LIMIT", "")) != "1048592":
+    raise SystemExit("Storage limit must be 1 MiB plus one AES-GCM tag")
 '
 
 compose_services=$(docker compose --env-file "$supabase_env" --file "$supabase_compose" \

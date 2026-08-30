@@ -42,6 +42,12 @@ cp /etc/letsencrypt/live/your-domain.com/privkey.pem /opt/defense-tracker/deploy
 
 ### 5. 配置环境变量
 编辑 `deploy/docker-compose.yml`，填写必要信息：
+
+先确认宿主路由不与默认 `172.30.240.0/29` 冲突。若需覆盖，必须同时设置
+`DEFENSE_TRACKER_DOCKER_SUBNET` 与位于该网段内的
+`DEFENSE_TRACKER_NGINX_PROXY_IP`；后者作为精确单地址传给 Flask，不能改成信任整个
+Docker bridge 网段。Nginx 会覆盖客户端自带的 `X-Forwarded-For`，tracker 仍只
+`expose` 5000 而不向宿主发布。
 ```yaml
 environment:
   ACCESS_TOKEN: "你的自定义访问令牌（至少16位字符）"

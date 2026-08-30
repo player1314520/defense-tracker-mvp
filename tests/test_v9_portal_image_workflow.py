@@ -17,6 +17,8 @@ def test_portal_image_workflow_is_manual_and_main_bound() -> None:
     assert "GITHUB_WORKFLOW_REF" in text
     assert "v9-portal-image.yml@refs/heads/main" in text
     assert "persist-credentials: false" in text
+    assert "ref: ${{ github.sha }}" in text
+    assert "ref: ${{ inputs.release_sha }}" not in text
 
 
 def test_portal_image_workflow_uses_digest_pinned_inputs_and_actions() -> None:

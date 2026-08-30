@@ -51,6 +51,8 @@ actual_supabase_sha=$(git -C "$SUPABASE_STACK_DIR" rev-parse HEAD 2>/dev/null ||
 }
 
 metadata_tool="$script_dir/backend-release-metadata.py"
+state_tool="$script_dir/release-state.py"
+[ -f "$state_tool" ] || { printf '%s\n' "atomic release state tool is missing" >&2; exit 66; }
 backend_manifest=$(python3 "$metadata_tool" --repo "$project_root" \
     --git-sha "$expected_release_sha" --field source_manifest_sha256)
 backend_wire=$(python3 "$metadata_tool" --repo "$project_root" \
@@ -146,18 +148,23 @@ if [ "$expected_backend_status" = active ]; then
         printf '%s\n' "database must have exactly one active backend release" >&2
         exit 65
     }
-    for state_file in backend.sha backend.manifest backend.wire backend.policy backend.functions backend.upstream; do
-        [ -s "$MVP_RELEASE_STATE_DIR/$state_file" ] || {
-            printf '%s\n' "active backend release state is incomplete: $state_file" >&2
-            exit 65
-        }
-    done
-    [ "$(tr -d '\r\n' < "$MVP_RELEASE_STATE_DIR/backend.sha")" = "$expected_release_sha" ] && \
-        [ "$(tr -d '\r\n' < "$MVP_RELEASE_STATE_DIR/backend.manifest")" = "$backend_manifest" ] && \
-        [ "$(tr -d '\r\n' < "$MVP_RELEASE_STATE_DIR/backend.wire")" = "$backend_wire" ] && \
-        [ "$(tr -d '\r\n' < "$MVP_RELEASE_STATE_DIR/backend.policy")" = "$backend_policy" ] && \
-        [ "$(tr -d '\r\n' < "$MVP_RELEASE_STATE_DIR/backend.functions")" = "$deployed_function_digest" ] && \
-        [ "$(tr -d '\r\n' < "$MVP_RELEASE_STATE_DIR/backend.upstream")" = "$SUPABASE_UPSTREAM_SHA" ] || {
+    # backend-state.json is accepted only after strict whole-generation validation.
+    python3 "$state_tool" exists backend "$MVP_RELEASE_STATE_DIR" || {
+        printf '%s\n' "active backend release state is incomplete" >&2
+        exit 65
+    }
+    state_release_sha=$(python3 "$state_tool" get backend "$MVP_RELEASE_STATE_DIR" active.release_sha)
+    state_manifest=$(python3 "$state_tool" get backend "$MVP_RELEASE_STATE_DIR" active.source_manifest_sha256)
+    state_wire=$(python3 "$state_tool" get backend "$MVP_RELEASE_STATE_DIR" active.wire_compatibility)
+    state_policy=$(python3 "$state_tool" get backend "$MVP_RELEASE_STATE_DIR" active.migration_policy)
+    state_functions=$(python3 "$state_tool" get backend "$MVP_RELEASE_STATE_DIR" active.function_digest)
+    state_upstream=$(python3 "$state_tool" get backend "$MVP_RELEASE_STATE_DIR" active.supabase_upstream_sha)
+    [ "$state_release_sha" = "$expected_release_sha" ] && \
+        [ "$state_manifest" = "$backend_manifest" ] && \
+        [ "$state_wire" = "$backend_wire" ] && \
+        [ "$state_policy" = "$backend_policy" ] && \
+        [ "$state_functions" = "$deployed_function_digest" ] && \
+        [ "$state_upstream" = "$SUPABASE_UPSTREAM_SHA" ] || {
         printf '%s\n' "host backend release state differs from the database release record" >&2
         exit 65
     }
@@ -173,6 +180,11 @@ for signature in \
     'public.bootstrap_mvp_first_owner(uuid,text,uuid,text,text,uuid,text,text,text)' \
     'public.register_device(uuid,uuid,text,text,text,text,text)' \
     'public.pull_sync_events(uuid,bigint,integer)' \
+    'public.revoke_current_device_session()' \
+    'public.report_sync_event_quarantine(uuid,bigint,uuid,uuid,uuid,text)' \
+    'public.list_sync_quarantine_reports(uuid,integer)' \
+    'public.admin_tombstone_quarantined_record(uuid,jsonb)' \
+    'public.admin_mark_quarantine_repaired(uuid)' \
     'public.transition_workflow(uuid,uuid,bigint,text,text)' \
     'public.put_user_ai_credential(jsonb)' \
     'public.get_user_ai_credential(text)' \

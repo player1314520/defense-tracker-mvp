@@ -24,6 +24,12 @@ PUSH = (
 CAPACITY_TEST = (
     ROOT / "supabase" / "tests" / "v9_capacity_quota_test.sql"
 )
+ISOLATION_TEST = (
+    ROOT / "supabase" / "tests" / "v9_sync_byte_quota_isolation.spec"
+)
+ZERO_KNOWLEDGE = (
+    ROOT / "supabase" / "migrations" / "202607250001_v9_zero_knowledge.sql"
+)
 
 
 def compact(path: Path) -> str:
@@ -44,6 +50,67 @@ def test_active_and_reserved_seats_share_one_atomic_capacity_ledger():
     assert "'invitation:' || m.invitation_request_id::text" in sql
     assert "on conflict (organization_id,reservation_key) do nothing" in sql
     assert "revoke all on table private.organization_seat_usage" in sql
+
+
+def test_capacity_release_remains_fail_closed_when_ledger_is_missing():
+    sql = compact(CAPACITY)
+    start = sql.index("create or replace function private.release_organization_seat")
+    end = sql.index("revoke all on function private.release_organization_seat", start)
+    body = sql[start:end]
+
+    assert "if not found then" in body
+    assert "raise exception 'organization capacity state is unavailable'" in body
+    assert "from public.organizations" not in body
+
+
+def test_organization_cleanup_preserves_immutable_provenance_contract():
+    schema = compact(ZERO_KNOWLEDGE)
+    record_versions = schema.index(
+        "create table if not exists public.record_versions"
+    )
+    sync_events = schema.index("create table if not exists public.sync_events")
+    record_block = schema[record_versions:sync_events]
+    conflicts = schema.index(
+        "create table if not exists public.conflicts", sync_events
+    )
+    sync_block = schema[sync_events:conflicts]
+
+    record_device_start = record_block.index(
+        "foreign key (organization_id, device_id)"
+    )
+    record_device_clause = record_block[record_device_start:]
+    assert "references public.devices(organization_id, id)" in record_device_clause
+    assert "on delete" not in record_device_clause
+
+    sync_device_start = sync_block.index("foreign key (organization_id, device_id)")
+    sync_version_start = sync_block.index(
+        "foreign key (organization_id, record_id, version_id)",
+        sync_device_start,
+    )
+    sync_device_clause = sync_block[sync_device_start:sync_version_start]
+    sync_version_clause = sync_block[sync_version_start:]
+    assert "references public.devices(organization_id, id)" in sync_device_clause
+    assert "on delete" not in sync_device_clause
+    assert (
+        "references public.record_versions(organization_id, record_id, "
+        "version_id)"
+    ) in sync_version_clause
+    assert "on delete" not in sync_version_clause
+
+
+def test_isolation_fixture_purges_history_in_dependency_order():
+    spec = compact(ISOLATION_TEST)
+    teardown = spec.index("teardown {")
+    sessions = spec.index("session s1", teardown)
+    body = spec[teardown:sessions]
+
+    events = body.index("delete from public.sync_events")
+    records = body.index("delete from public.record_heads")
+    memberships = body.index("delete from public.memberships")
+    organization = body.index("delete from public.organizations")
+    users = body.index("delete from auth.users")
+
+    assert events < records < memberships < organization < users
 
 
 def test_event_quota_is_atomic_per_user_and_utc_day():

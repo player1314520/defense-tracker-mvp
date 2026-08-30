@@ -1,0 +1,17 @@
+# Python 3.11 Windows CI dependencies. This intentionally includes the local
+# desktop runtime dependency while the Linux lock excludes Windows GUI packages.
+Flask==3.1.3
+requests==2.34.0
+feedparser==6.0.12
+APScheduler==3.11.2
+beautifulsoup4==4.14.3
+lxml==6.0.2
+trafilatura==2.0.0
+pdfplumber==0.11.9
+reportlab==4.5.0
+python-docx==1.2.0
+cryptography==46.0.5
+pywebview==6.1
+openpyxl==3.1.5
+pytest==9.0.3
+PyYAML==6.0.2

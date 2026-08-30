@@ -4,6 +4,7 @@
 The public download limit is only the first boundary.  DOCX is a ZIP container,
 so compressed and expanded sizes are checked before ``python-docx`` sees it.
 PDF parsing is kept in a subprocess that the parent can terminate on timeout.
+On Windows the worker also enters a fail-closed Job Object before parser import.
 No parser exception text is returned to callers because third-party exceptions
 may echo document bytes, filenames, or other untrusted input.
 """
@@ -22,6 +23,37 @@ from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 
 MIB = 1024 * 1024
+_RUNNING_ON_WINDOWS = os.name == "nt"
+_WINDOWS_JOB_HANDLE: object | None = None
+
+
+def _pdf_worker_environment() -> dict[str, str]:
+    """Return a minimal parser environment without application credentials."""
+    allowed = {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TZ",
+        "WINDIR",
+    }
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in allowed
+    }
+    environment.update(
+        {
+            "PYTHONHASHSEED": "0",
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+        }
+    )
+    return environment
 
 
 _SAFE_MESSAGES = {
@@ -361,6 +393,8 @@ def extract_pdf_text_isolated(
                 encoding="utf-8",
                 errors="strict",
                 creationflags=creationflags,
+                env=_pdf_worker_environment(),
+                close_fds=True,
             )
         except subprocess.TimeoutExpired:
             _reject("PDF_PARSE_TIMEOUT")
@@ -403,8 +437,110 @@ def extract_pdf_text_isolated(
                 pass
 
 
+def _create_and_assign_windows_job() -> object:
+    """Put this worker in a one-process Windows Job Object with hard limits."""
+    if not _RUNNING_ON_WINDOWS:
+        raise OSError("Windows Job Objects are unavailable on this platform")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job_object_extended_limit_information = 9
+    job_object_limit_process_time = 0x00000002
+    job_object_limit_active_process = 0x00000008
+    job_object_limit_process_memory = 0x00000100
+    job_object_limit_job_memory = 0x00000200
+    job_object_limit_kill_on_job_close = 0x00002000
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    limits.BasicLimitInformation.PerProcessUserTimeLimit = 15 * 10_000_000
+    limits.BasicLimitInformation.ActiveProcessLimit = 1
+    limits.BasicLimitInformation.LimitFlags = (
+        job_object_limit_process_time
+        | job_object_limit_active_process
+        | job_object_limit_process_memory
+        | job_object_limit_job_memory
+        | job_object_limit_kill_on_job_close
+    )
+    limits.ProcessMemoryLimit = 768 * MIB
+    limits.JobMemoryLimit = 768 * MIB
+
+    try:
+        if not kernel32.SetInformationJobObject(
+            job,
+            job_object_extended_limit_information,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+            raise ctypes.WinError(ctypes.get_last_error())
+    except BaseException:
+        kernel32.CloseHandle(job)
+        raise
+    return job
+
+
 def _apply_worker_limits() -> None:
-    if os.name == "nt":
+    global _WINDOWS_JOB_HANDLE
+    if _RUNNING_ON_WINDOWS:
+        # Keep the handle alive until worker exit. KILL_ON_JOB_CLOSE then also
+        # terminates any descendant that somehow existed despite ActiveProcessLimit=1.
+        _WINDOWS_JOB_HANDLE = _create_and_assign_windows_job()
         return
     try:
         import resource

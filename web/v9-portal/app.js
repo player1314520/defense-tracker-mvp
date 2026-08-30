@@ -3,6 +3,7 @@ import {
   bytesToBase64url,
   createBrowserDeviceKeyPair,
   decryptRecord,
+  encryptRecord,
   openOrgKeyForP256,
   sealOrgKeyForP256,
 } from "./crypto.mjs";
@@ -43,12 +44,19 @@ const state = {
   accessApplications: [],
   accessNextCursor: null,
   pendingDevices: [],
+  quarantineReports: [],
+  quarantineCount: 0,
+  pendingQuarantineReports: 0,
   accessApplicationsEnabled: false,
 };
 
+const MAX_SYNC_PAGE_ENCODED_BYTES = 24 * 1024 * 1024;
+const SYNC_PROCESS_YIELD_BYTES = 1024 * 1024;
+const textEncoder = new TextEncoder();
+
 function openDatabase() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("defense-tracker-v9", 2);
+    const request = indexedDB.open("defense-tracker-v9", 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("auth")) db.createObjectStore("auth");
@@ -58,6 +66,9 @@ function openDatabase() {
       }
       if (!db.objectStoreNames.contains("syncState")) {
         db.createObjectStore("syncState");
+      }
+      if (!db.objectStoreNames.contains("syncQuarantine")) {
+        db.createObjectStore("syncQuarantine");
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -410,6 +421,9 @@ async function lockWorkspace() {
   state.accessApplications = [];
   state.accessNextCursor = null;
   state.pendingDevices = [];
+  state.quarantineReports = [];
+  state.quarantineCount = 0;
+  state.pendingQuarantineReports = 0;
   render();
   if (wakeChannel) {
     await state.client.removeChannel(wakeChannel);
@@ -429,24 +443,194 @@ function recordCacheKey(organizationId, userId, recordId) {
   return JSON.stringify([organizationId, userId, recordId]);
 }
 
-async function clearCachedWorkspace(organizationId, userId) {
-  const allHeads = await databaseOperation(
-    "recordHeads",
-    "readonly",
-    (store) => store.getAll(),
+function quarantineCacheKey(organizationId, userId, eventId) {
+  if (!eventId) throw new Error("同步隔离事件无效");
+  return JSON.stringify([organizationId, userId, eventId]);
+}
+
+function quarantineFailureCode(error) {
+  const code = String(error?.code || "");
+  return new Set([
+    "invalid_json",
+    "invalid_schema",
+    "unsupported_schema",
+    "integrity_failure",
+  ]).has(code) ? code : "decrypt_failure";
+}
+
+function syncEventRecordId(event) {
+  return String(event?.payload?.record_id || event?.record_id || "");
+}
+
+function quarantineEvent(organizationId, userId, event, error) {
+  return {
+    organizationId,
+    userId,
+    eventId: String(event?.event_id || ""),
+    recordId: syncEventRecordId(event),
+    versionId: String(event?.payload?.version_id || ""),
+    recordType: String(event?.payload?.record_type || "").slice(0, 64),
+    cursor: Number(event?.cursor || 0),
+    failureCode: quarantineFailureCode(error),
+    quarantinedAt: new Date().toISOString(),
+  };
+}
+
+function tombstonePlaintext(recordType) {
+  const content = {
+    schema_version: 1,
+    deleted: true,
+  };
+  if ([
+    "alert", "job", "scenario", "document", "publication_item",
+  ].includes(recordType)) {
+    content.title = "已删除的隔离记录";
+  }
+  if (recordType === "alert_rule") content.name = "已删除的隔离规则";
+  if (recordType === "publication_item") content.status = "deleted";
+  if (recordType === "audit_event") content.action = "quarantine_tombstone";
+  return content;
+}
+
+async function buildQuarantineTombstoneEvent(report) {
+  const organizationId = state.organizationId;
+  const userId = state.session?.user?.id || "";
+  const recordId = String(report?.record_id || "");
+  const baseVersionId = String(report?.version_id || "");
+  const recordType = String(report?.record_type || "");
+  const previousVersion = Number(report?.logical_version);
+  if (
+    !organizationId
+    || !userId
+    || !state.orgKey
+    || !Number.isInteger(state.orgKeyVersion)
+    || state.orgKeyVersion < 1
+    || !recordId
+    || !baseVersionId
+    || !recordType
+    || !Number.isSafeInteger(previousVersion)
+    || previousVersion < 1
+  ) {
+    throw new Error("隔离报告或当前加密工作区状态无效");
+  }
+  const device = await storedDevice(organizationId, userId);
+  if (!device?.id) throw new Error("当前浏览器设备身份不可用");
+  const version = previousVersion + 1;
+  const encrypted = await encryptRecord(state.orgKey, {
+    organizationId,
+    recordId,
+    recordType,
+    version,
+    keyVersion: state.orgKeyVersion,
+    content: tombstonePlaintext(recordType),
+  });
+  return {
+    event_id: crypto.randomUUID(),
+    organization_id: organizationId,
+    record_id: recordId,
+    operation: "delete",
+    payload: {
+      organization_id: organizationId,
+      record_id: recordId,
+      record_type: recordType,
+      version,
+      version_id: crypto.randomUUID(),
+      base_version_id: baseVersionId,
+      key_version: state.orgKeyVersion,
+      device_id: device.id,
+      deleted: true,
+      ...encrypted,
+    },
+  };
+}
+
+async function reportQuarantineEvent(item) {
+  try {
+    const { data, error } = await state.client.rpc(
+      "report_sync_event_quarantine",
+      {
+        p_organization_id: item.organizationId,
+        p_event_cursor: item.cursor,
+        p_event_id: item.eventId,
+        p_record_id: item.recordId,
+        p_version_id: item.versionId,
+        p_failure_code: item.failureCode,
+      },
+    );
+    return !error && Boolean(data?.report_id);
+  } catch {
+    return false;
+  }
+}
+
+async function markQuarantineReported(item) {
+  await databaseOperation(
+    "syncQuarantine",
+    "readwrite",
+    (store) => store.put(
+      { ...item, reportedAt: new Date().toISOString() },
+      quarantineCacheKey(item.organizationId, item.userId, item.eventId),
+    ),
   );
-  await databaseWriteTransaction(["recordHeads", "syncState"], (transaction) => {
-    const headsStore = transaction.objectStore("recordHeads");
-    for (const entry of allHeads || []) {
-      if (
-        entry.organizationId === organizationId
-        && entry.userId === userId
-      ) {
-        headsStore.delete(
-          recordCacheKey(organizationId, userId, entry.recordId),
-        );
+}
+
+async function retryPendingQuarantineReports(organizationId, userId) {
+  let entries;
+  try {
+    entries = await databaseOperation(
+      "syncQuarantine",
+      "readonly",
+      (store) => store.getAll(),
+    );
+  } catch {
+    return 0;
+  }
+  const pendingEntries = (entries || []).filter((entry) => (
+    entry.organizationId === organizationId
+    && entry.userId === userId
+    && !entry.reportedAt
+  ));
+  let unreported = pendingEntries.length;
+  for (const item of pendingEntries.slice(0, 50)) {
+    if (await reportQuarantineEvent(item)) {
+      try {
+        await markQuarantineReported(item);
+        unreported -= 1;
+      } catch {
+        // The durable entry remains unreported and is counted for a later retry.
       }
     }
+  }
+  return unreported;
+}
+
+async function clearCachedWorkspace(organizationId, userId) {
+  await databaseWriteTransaction(["recordHeads", "syncState"], (transaction) => {
+    const headsStore = transaction.objectStore("recordHeads");
+    const allHeadsRequest = headsStore.getAll();
+    const allHeadKeysRequest = headsStore.getAllKeys();
+    let allHeads = null;
+    let allHeadKeys = null;
+    const deleteWorkspaceHeads = () => {
+      if (!allHeads || !allHeadKeys) return;
+      for (let index = 0; index < allHeads.length; index += 1) {
+        const entry = allHeads[index];
+        if (
+          entry.organizationId === organizationId
+          && entry.userId === userId
+        ) {
+          headsStore.delete(allHeadKeys[index]);
+        }
+      }
+    };
+    allHeadsRequest.onsuccess = () => {
+      allHeads = allHeadsRequest.result || [];
+      deleteWorkspaceHeads();
+    };
+    allHeadKeysRequest.onsuccess = () => {
+      allHeadKeys = allHeadKeysRequest.result || [];
+      deleteWorkspaceHeads();
+    };
     transaction.objectStore("syncState").delete(
       workspaceCacheKey(organizationId, userId),
     );
@@ -459,7 +643,7 @@ async function restoreCachedWorkspace(
   orgKey,
   generation = state.generation,
 ) {
-  const [allHeads, syncState] = await Promise.all([
+  const [allHeads, syncState, quarantineEntries] = await Promise.all([
     databaseOperation(
       "recordHeads",
       "readonly",
@@ -470,17 +654,23 @@ async function restoreCachedWorkspace(
       "readonly",
       (store) => store.get(workspaceCacheKey(organizationId, userId)),
     ),
+    databaseOperation(
+      "syncQuarantine",
+      "readonly",
+      (store) => store.getAll(),
+    ),
   ]);
   if (!isCurrentGeneration(generation)) return false;
   const records = [];
-  try {
-    for (const entry of allHeads || []) {
-      if (
-        entry.organizationId !== organizationId
-        || entry.userId !== userId
-      ) {
-        continue;
-      }
+  let invalidCache = false;
+  for (const entry of allHeads || []) {
+    if (
+      entry.organizationId !== organizationId
+      || entry.userId !== userId
+    ) {
+      continue;
+    }
+    try {
       const content = await decryptRecord(orgKey, entry.payload);
       if (!isCurrentGeneration(generation)) return false;
       records.push({
@@ -490,17 +680,33 @@ async function restoreCachedWorkspace(
         content_hash: entry.payload.content_hash,
         content,
       });
+    } catch {
+      invalidCache = true;
+      break;
     }
-  } catch {
+  }
+  if (invalidCache) {
+    if (!isCurrentGeneration(generation)) return false;
     await clearCachedWorkspace(organizationId, userId);
     if (!isCurrentGeneration(generation)) return false;
     state.records = [];
     state.cursor = 0;
+    state.pendingQuarantineReports = (quarantineEntries || []).filter(
+      (entry) => entry.organizationId === organizationId
+        && entry.userId === userId
+        && !entry.reportedAt,
+    ).length;
+    render();
     return true;
   }
   const cursor = Number(syncState?.cursor || 0);
   state.records = records;
   state.cursor = Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : 0;
+  state.pendingQuarantineReports = (quarantineEntries || []).filter(
+    (entry) => entry.organizationId === organizationId
+      && entry.userId === userId
+      && !entry.reportedAt,
+  ).length;
   render();
   return true;
 }
@@ -528,35 +734,48 @@ async function persistCiphertextPage(
 ) {
   if (!userId) return;
   const latest = new Map();
-  for (const event of events || []) {
+  const quarantined = [];
+  for (const processed of events || []) {
+    const { event, disposition, quarantine } = processed;
+    const recordId = syncEventRecordId(event);
     if (event.applied === false) continue;
-    latest.set(
-      event.record_id,
-      event.payload?.deleted === true
-        ? null
-        : cacheableCiphertextPayload(event.payload),
-    );
-  }
-  await databaseWriteTransaction(["recordHeads", "syncState"], (transaction) => {
-    const headsStore = transaction.objectStore("recordHeads");
-    for (const [recordId, payload] of latest) {
-      const key = recordCacheKey(organizationId, userId, recordId);
-      if (payload === null) {
-        headsStore.delete(key);
-      } else {
-        headsStore.put({
-          organizationId,
-          userId,
-          recordId,
-          payload,
-        }, key);
-      }
+    if (disposition === "keep") {
+      latest.set(recordId, cacheableCiphertextPayload(event.payload));
+    } else if (disposition === "delete" || disposition === "quarantine") {
+      latest.set(recordId, null);
     }
-    transaction.objectStore("syncState").put(
-      { cursor },
-      workspaceCacheKey(organizationId, userId),
-    );
-  });
+    if (quarantine) quarantined.push(quarantine);
+  }
+  await databaseWriteTransaction(
+    ["recordHeads", "syncState", "syncQuarantine"],
+    (transaction) => {
+      const headsStore = transaction.objectStore("recordHeads");
+      for (const [recordId, payload] of latest) {
+        const key = recordCacheKey(organizationId, userId, recordId);
+        if (payload === null) {
+          headsStore.delete(key);
+        } else {
+          headsStore.put({
+            organizationId,
+            userId,
+            recordId,
+            payload,
+          }, key);
+        }
+      }
+      transaction.objectStore("syncState").put(
+        { cursor },
+        workspaceCacheKey(organizationId, userId),
+      );
+      const quarantineStore = transaction.objectStore("syncQuarantine");
+      for (const item of quarantined) {
+        quarantineStore.put(
+          item,
+          quarantineCacheKey(organizationId, userId, item.eventId),
+        );
+      }
+    },
+  );
 }
 
 async function loadWorkflowStates(generation = state.generation) {
@@ -598,6 +817,11 @@ async function pullCiphertextChanges(generation = state.generation) {
   );
   let cursor = state.cursor;
   let conflicts = 0;
+  let quarantines = 0;
+  let unreportedQuarantines = state.pendingQuarantineReports > 0
+    ? await retryPendingQuarantineReports(organizationId, userId)
+    : 0;
+  state.pendingQuarantineReports = unreportedQuarantines;
   let finished = false;
   while (!finished) {
     for (let page = 0; page < 100; page += 1) {
@@ -609,7 +833,7 @@ async function pullCiphertextChanges(generation = state.generation) {
           {
             organization_id: organizationId,
             after_cursor: cursor,
-            page_size: 500,
+            page_size: 100,
           },
         );
       } catch (error) {
@@ -624,14 +848,31 @@ async function pullCiphertextChanges(generation = state.generation) {
         finished = true;
         break;
       }
+      const encodedPageBytes = textEncoder.encode(
+        JSON.stringify(eventPage),
+      ).byteLength;
+      if (encodedPageBytes > MAX_SYNC_PAGE_ENCODED_BYTES) {
+        throw new Error("同步页超过 24 MiB 编码上限，已拒绝处理");
+      }
+      const processedPage = [];
+      const pageQuarantines = [];
+      let processedBytes = 0;
       for (const event of eventPage) {
-        cursor = Math.max(cursor, Number(event.cursor || 0));
+        const recordId = syncEventRecordId(event);
+        if (!recordId) throw new Error("同步事件记录身份无效");
+        const eventCursor = Number(event.cursor);
+        if (!Number.isSafeInteger(eventCursor) || eventCursor <= cursor) {
+          throw new Error("同步事件游标无效或未严格递增");
+        }
+        cursor = Math.max(cursor, eventCursor);
         if (event.applied === false) {
           conflicts += 1;
+          processedPage.push({ event, disposition: "ignore" });
           continue;
         }
         if (event.payload?.deleted === true) {
-          heads.delete(event.record_id);
+          heads.delete(recordId);
+          processedPage.push({ event, disposition: "delete" });
           continue;
         }
         let content;
@@ -639,22 +880,63 @@ async function pullCiphertextChanges(generation = state.generation) {
           content = await decryptRecord(orgKey, event.payload);
         } catch (error) {
           if (!isCurrentGeneration(generation)) return false;
-          throw error;
+          const quarantine = quarantineEvent(
+            organizationId,
+            userId,
+            event,
+            error,
+          );
+          heads.delete(recordId);
+          processedPage.push({
+            event,
+            disposition: "quarantine",
+            quarantine,
+          });
+          pageQuarantines.push(quarantine);
+          quarantines += 1;
+          continue;
         }
         if (!isCurrentGeneration(generation)) return false;
-        heads.set(event.record_id, {
-          record_id: event.record_id,
+        heads.set(recordId, {
+          record_id: recordId,
           record_type: event.payload.record_type,
           version: event.payload.version,
           content_hash: event.payload.content_hash,
           content,
         });
+        processedPage.push({ event, disposition: "keep" });
+        processedBytes += textEncoder.encode(JSON.stringify(event)).byteLength;
+        if (processedBytes >= SYNC_PROCESS_YIELD_BYTES) {
+          processedBytes = 0;
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          if (!isCurrentGeneration(generation)) return false;
+        }
       }
       if (!isCurrentGeneration(generation)) return false;
-      await persistCiphertextPage(organizationId, userId, eventPage, cursor);
+      await persistCiphertextPage(
+        organizationId,
+        userId,
+        processedPage,
+        cursor,
+      );
       if (!isCurrentGeneration(generation)) return false;
+      for (const quarantine of pageQuarantines) {
+        if (await reportQuarantineEvent(quarantine)) {
+          try {
+            await markQuarantineReported(quarantine);
+          } catch {
+            unreportedQuarantines += 1;
+          }
+        } else {
+          unreportedQuarantines += 1;
+          state.pendingQuarantineReports += 1;
+        }
+        if (!isCurrentGeneration(generation)) return false;
+      }
       state.records = [...heads.values()];
       state.cursor = cursor;
+      state.quarantineCount = quarantines;
+      state.pendingQuarantineReports = unreportedQuarantines;
       if (cursor <= pageStartCursor) {
         throw new Error("同步游标未前进，已停止以避免重复拉取");
       }
@@ -667,7 +949,9 @@ async function pullCiphertextChanges(generation = state.generation) {
   render();
   setStatus(
     `已在本页内存解锁 ${state.records.length} 条记录 · 游标 ${cursor}`
-      + (conflicts ? ` · 待桌面合并冲突 ${conflicts}` : ""),
+      + (conflicts ? ` · 待桌面合并冲突 ${conflicts}` : "")
+      + (quarantines ? ` · 已隔离异常记录 ${quarantines}` : "")
+      + (unreportedQuarantines ? ` · ${unreportedQuarantines} 条待联网审计` : ""),
   );
   return true;
 }
@@ -835,6 +1119,30 @@ function renderAdminQueues() {
     );
   });
   renderList("device-list", devices, "暂无待批准设备");
+
+  const quarantines = state.quarantineReports.map((report) => {
+    const actions = [];
+    if (report.status === "open") {
+      actions.push(actionButton(
+        "创建端到端加密墓碑",
+        "quarantine-tombstone",
+        "tombstone",
+        report.report_id,
+      ));
+      actions.push(actionButton(
+        "确认桌面端已修复",
+        "quarantine-repaired",
+        "repair",
+        report.report_id,
+      ));
+    }
+    return card(
+      `${String(report.record_type || "record")} · ${String(report.record_id).slice(0, 8)}`,
+      `${String(report.failure_code || "invalid_schema")} · 游标 ${Number(report.event_cursor || 0)} · ${String(report.status || "open")}`,
+      actions,
+    );
+  });
+  renderList("quarantine-list", quarantines, "暂无异常密文记录");
 }
 
 async function loadAdminQueues(generation = state.generation) {
@@ -846,7 +1154,7 @@ async function loadAdminQueues(generation = state.generation) {
   ) {
     return false;
   }
-  const [applications, deviceResult] = await Promise.all([
+  const [applications, deviceResult, quarantineResult] = await Promise.all([
     listAccessApplications(state.client, null),
     state.client
       .from("devices")
@@ -855,9 +1163,14 @@ async function loadAdminQueues(generation = state.generation) {
       .eq("status", "pending")
       .order("created_at", { ascending: true })
       .limit(50),
+    state.client.rpc("list_sync_quarantine_reports", {
+      p_organization_id: state.organizationId,
+      p_limit: 50,
+    }),
   ]);
   if (!isCurrentGeneration(generation)) return false;
   if (deviceResult.error) throw deviceResult.error;
+  if (quarantineResult.error) throw quarantineResult.error;
   state.accessApplications = (applications.applications || []).map(
     safeApplicationSummary,
   );
@@ -873,6 +1186,16 @@ async function loadAdminQueues(generation = state.generation) {
     public_key: device.public_key,
     device_kind: device.device_kind,
     created_at: device.created_at,
+  }));
+  state.quarantineReports = (quarantineResult.data || []).map((report) => ({
+    report_id: String(report.report_id || ""),
+    event_cursor: Number(report.event_cursor || 0),
+    record_id: String(report.record_id || ""),
+    version_id: String(report.version_id || ""),
+    logical_version: Number(report.logical_version || 0),
+    record_type: String(report.record_type || "").slice(0, 64),
+    failure_code: String(report.failure_code || "").slice(0, 64),
+    status: String(report.status || "").slice(0, 32),
   }));
   renderAdminQueues();
   return true;
@@ -1038,6 +1361,41 @@ async function handlePortalAction(event) {
       } else {
         setStatus("邀请状态未确认，请刷新后重试", true);
       }
+    });
+    return;
+  }
+  if (action === "quarantine-tombstone") {
+    if (!window.confirm("确认删除当前异常记录头？此操作会写入可审计墓碑。")) {
+      return;
+    }
+    await runBusyAction(`quarantine-tombstone:${recordId}`, button, async () => {
+      const report = state.quarantineReports.find(
+        (item) => item.report_id === recordId && item.status === "open",
+      );
+      if (!report) throw new Error("隔离报告已刷新，请重新加载");
+      const tombstoneEvent = await buildQuarantineTombstoneEvent(report);
+      const { data, error } = await state.client.rpc(
+        "admin_tombstone_quarantined_record",
+        { p_report_id: recordId, p_event: tombstoneEvent },
+      );
+      if (error) throw error;
+      if (!data?.tombstoned) throw new Error("墓碑写入未确认");
+      await loadAdminQueues();
+      await pullCiphertextChanges();
+      setStatus("异常记录已创建可审计墓碑");
+    });
+    return;
+  }
+  if (action === "quarantine-repaired") {
+    await runBusyAction(`quarantine-repaired:${recordId}`, button, async () => {
+      const { data, error } = await state.client.rpc(
+        "admin_mark_quarantine_repaired",
+        { p_report_id: recordId },
+      );
+      if (error) throw error;
+      if (!data?.repaired) throw new Error("修复状态未确认");
+      await loadAdminQueues();
+      setStatus("桌面端替换版本已核验，隔离报告关闭");
     });
   }
 }
@@ -1336,7 +1694,11 @@ byId("logout").addEventListener("click", async (event) => {
   await runBusyAction("logout", event.currentTarget, async () => {
     const wakeChannel = state.wakeChannel;
     const result = await logoutPortalSession({
-      signOut: () => state.client.auth.signOut(),
+      revokeDeviceSession: () => state.client.rpc(
+        "revoke_current_device_session",
+        {},
+      ),
+      signOut: () => state.client.auth.signOut({ scope: "local" }),
       removeWakeChannel: async () => {
         if (wakeChannel) await state.client.removeChannel(wakeChannel);
       },
@@ -1357,6 +1719,9 @@ byId("logout").addEventListener("click", async (event) => {
         state.accessApplications = [];
         state.accessNextCursor = null;
         state.pendingDevices = [];
+        state.quarantineReports = [];
+        state.quarantineCount = 0;
+        state.pendingQuarantineReports = 0;
         state.busyActions.clear();
         byId("authenticated-dashboard").hidden = true;
         byId("anonymous-access").hidden = false;
@@ -1368,9 +1733,14 @@ byId("logout").addEventListener("click", async (event) => {
         "内存已锁定，但浏览器会话清理失败；请关闭此页面并清理站点数据",
         true,
       );
-    } else if (!result.remoteConfirmed) {
+    } else if (!result.deviceSessionRevoked) {
       setStatus(
-        "本地会话已清除；远程撤销未确认，请联网后重新登录再退出",
+        "本地会话已清除；服务端设备会话撤销失败，请联网后重新登录再退出",
+        true,
+      );
+    } else if (!result.authSignedOut) {
+      setStatus(
+        "设备会话已撤销且本地已清除；Supabase 注销未确认",
         true,
       );
     } else {

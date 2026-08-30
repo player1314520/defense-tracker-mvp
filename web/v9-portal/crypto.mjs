@@ -1,4 +1,15 @@
+import {
+  RecordPlaintextError,
+  validateRecordPlaintext,
+} from "./record-schema.mjs";
+
 const encoder = new TextEncoder();
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const CONTENT_COMMITMENT_DOMAIN = encoder.encode(
+  "DefenseTracker-V9-record-ciphertext-commitment-v1\0",
+);
+
+export { RecordPlaintextError } from "./record-schema.mjs";
 
 export function base64urlToBytes(value) {
   const padded = String(value) + "=".repeat((4 - String(value).length % 4) % 4);
@@ -10,6 +21,21 @@ export function bytesToBase64url(value) {
   let binary = "";
   for (const byte of value) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+function bytesToHex(value) {
+  return [...value].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function concatBytes(...values) {
+  const length = values.reduce((total, value) => total + value.length, 0);
+  const result = new Uint8Array(length);
+  let offset = 0;
+  for (const value of values) {
+    result.set(value, offset);
+    offset += value.length;
+  }
+  return result;
 }
 
 export async function createPkceRequest(
@@ -55,6 +81,86 @@ async function aesDecrypt(keyBytes, nonce, ciphertext, additionalData) {
   ));
 }
 
+async function aesEncrypt(keyBytes, nonce, plaintext, additionalData) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"],
+  );
+  return new Uint8Array(await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: nonce,
+      additionalData: encoder.encode(additionalData),
+      tagLength: 128,
+    },
+    key,
+    plaintext,
+  ));
+}
+
+async function recordCiphertextCommitment(
+  contentAad,
+  nonce,
+  ciphertext,
+) {
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest(
+    "SHA-256",
+    concatBytes(
+      CONTENT_COMMITMENT_DOMAIN,
+      encoder.encode(contentAad),
+      nonce,
+      ciphertext,
+    ),
+  )));
+}
+
+export async function encryptRecord(
+  orgKeyBytes,
+  {
+    organizationId,
+    recordId,
+    recordType,
+    version,
+    keyVersion,
+    content,
+  },
+) {
+  validateRecordPlaintext(recordType, content);
+  const plaintext = encoder.encode(JSON.stringify(content));
+  const dataKey = crypto.getRandomValues(new Uint8Array(32));
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const wrapNonce = crypto.getRandomValues(new Uint8Array(12));
+  const contentAad = `v9:record-content:1:${organizationId}:${recordId}:${recordType}:${Number(version)}`;
+  const keyAad = `v9:record-key:1:${organizationId}:${recordId}:${recordType}:${Number(version)}:${Number(keyVersion)}`;
+  const ciphertext = await aesEncrypt(
+    dataKey,
+    nonce,
+    plaintext,
+    contentAad,
+  );
+  const wrappedDataKey = await aesEncrypt(
+    orgKeyBytes,
+    wrapNonce,
+    dataKey,
+    keyAad,
+  );
+  dataKey.fill(0);
+  return {
+    ciphertext: bytesToBase64url(ciphertext),
+    nonce: bytesToBase64url(nonce),
+    wrapped_data_key: bytesToBase64url(wrappedDataKey),
+    wrap_nonce: bytesToBase64url(wrapNonce),
+    content_hash: await recordCiphertextCommitment(
+      contentAad,
+      nonce,
+      ciphertext,
+    ),
+  };
+}
+
 export async function decryptRecord(orgKeyBytes, envelope) {
   const orgId = envelope.organization_id;
   const recordId = envelope.record_id;
@@ -69,20 +175,33 @@ export async function decryptRecord(orgKeyBytes, envelope) {
     keyAad,
   );
   const contentAad = `v9:record-content:1:${orgId}:${recordId}:${recordType}:${version}`;
+  const nonce = base64urlToBytes(envelope.nonce);
+  const ciphertext = base64urlToBytes(envelope.ciphertext);
   const plaintext = await aesDecrypt(
     dataKey,
-    base64urlToBytes(envelope.nonce),
-    base64urlToBytes(envelope.ciphertext),
+    nonce,
+    ciphertext,
     contentAad,
   );
-  const digest = bytesToBase64url(
+  const legacyDigest = bytesToHex(
     new Uint8Array(await crypto.subtle.digest("SHA-256", plaintext)),
   );
-  const expected = bytesToBase64url(
-    Uint8Array.from(envelope.content_hash.match(/.{2}/g), (part) => parseInt(part, 16)),
+  const currentDigest = await recordCiphertextCommitment(
+    contentAad,
+    nonce,
+    ciphertext,
   );
-  if (digest !== expected) throw new Error("内容哈希校验失败");
-  return JSON.parse(new TextDecoder().decode(plaintext));
+  const expected = String(envelope.content_hash || "").toLowerCase();
+  if (currentDigest !== expected && legacyDigest !== expected) {
+    throw new RecordPlaintextError("integrity_failure");
+  }
+  let content;
+  try {
+    content = JSON.parse(decoder.decode(plaintext));
+  } catch {
+    throw new RecordPlaintextError("invalid_json");
+  }
+  return validateRecordPlaintext(recordType, content);
 }
 
 export async function createBrowserDeviceKeyPair() {

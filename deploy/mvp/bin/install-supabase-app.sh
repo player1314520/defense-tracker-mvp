@@ -52,6 +52,8 @@ actual_release_sha=$(git -C "$project_root" rev-parse HEAD 2>/dev/null || true)
 
 metadata_tool="$script_dir/backend-release-metadata.py"
 [ -f "$metadata_tool" ] || { printf '%s\n' "backend release metadata tool is missing" >&2; exit 66; }
+state_tool="$script_dir/release-state.py"
+[ -f "$state_tool" ] || { printf '%s\n' "atomic release state tool is missing" >&2; exit 66; }
 backend_manifest=$(python3 "$metadata_tool" --repo "$project_root" \
     --git-sha "$expected_release_sha" --field source_manifest_sha256)
 backend_wire=$(python3 "$metadata_tool" --repo "$project_root" \
@@ -104,10 +106,13 @@ case "$MVP_RELEASE_STATE_DIR" in
     /*) ;;
     *) printf '%s\n' "MVP_RELEASE_STATE_DIR must be absolute" >&2; exit 64 ;;
 esac
-mkdir -p "$MVP_RELEASE_STATE_DIR"
-chmod 0700 "$MVP_RELEASE_STATE_DIR"
+python3 "$state_tool" prepare "$MVP_RELEASE_STATE_DIR"
+# shellcheck disable=SC1090
+. "$script_dir/deployment-lock.sh"
+acquire_mvp_deployment_lock "$MVP_RELEASE_STATE_DIR"
 exec 8>"$MVP_RELEASE_STATE_DIR/.supabase-app.lock"
 flock -n 8 || { printf '%s\n' "another Supabase application install is active" >&2; exit 75; }
+python3 "$state_tool" migrate backend "$MVP_RELEASE_STATE_DIR" >/dev/null
 
 hash_tree() {
     tree_root=$1
@@ -352,20 +357,10 @@ SQL
     backend_install_pending=false
 fi
 
-write_backend_state() {
-    state_name=$1
-    state_value=$2
-    printf '%s\n' "$state_value" > "$MVP_RELEASE_STATE_DIR/.backend.$state_name.tmp-$$"
-    mv -f "$MVP_RELEASE_STATE_DIR/.backend.$state_name.tmp-$$" \
-        "$MVP_RELEASE_STATE_DIR/backend.$state_name"
-}
-write_backend_state sha "$expected_release_sha"
-write_backend_state manifest "$backend_manifest"
-write_backend_state wire "$backend_wire"
-write_backend_state policy "$backend_policy"
-write_backend_state functions "$function_digest"
-write_backend_state upstream "$SUPABASE_UPSTREAM_SHA"
-chmod 0600 "$MVP_RELEASE_STATE_DIR"/backend.*
+# backend-state.json atomically binds the complete six-field active generation.
+python3 "$state_tool" backend-commit "$MVP_RELEASE_STATE_DIR" \
+    "$expected_release_sha" "$backend_manifest" "$backend_wire" \
+    "$backend_policy" "$function_digest" "$SUPABASE_UPSTREAM_SHA"
 
 "$script_dir/verify-supabase-app.sh" "$expected_release_sha" "$config_file"
 printf '%s\n' "[SUPABASE-APP] All hash-registered migrations through the exact release and both Edge Functions are installed."

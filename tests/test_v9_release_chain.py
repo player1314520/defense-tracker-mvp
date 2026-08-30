@@ -945,6 +945,9 @@ def test_release_workflows_are_manual_exact_sha_and_fail_closed():
     assert "dist/releases/v9.0.0/" not in candidate
     assert "v9-trusted-signing" in candidate
     assert "v9-deployment-evidence.yml" in release
+    assert "if: github.ref == 'refs/heads/main'" in release
+    assert "ref: ${{ github.sha }}" in release
+    assert "ref: ${{ inputs.release_sha }}" not in release
     assert "portal_image_run_id:" in release
     assert "immutable-releases" in release
     assert "actions/attest@" in release

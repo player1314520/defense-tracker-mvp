@@ -117,7 +117,8 @@ MIN_ARCHIVED_WORDS = 120
 # ══════════════════════════════════════════════════════════════
 # 安全配置
 # ══════════════════════════════════════════════════════════════
-import secrets, ipaddress, time, socket
+import ipaddress
+import secrets, time, socket
 from functools import wraps
 from urllib.parse import urlparse, urljoin
 
@@ -207,6 +208,12 @@ MAX_FETCH_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 5
 AUTH_RATE_LIMIT = 120
 AUTH_RATE_WINDOW = 60
+TRUSTED_PROXIES_ENV = "DEFENSE_TRACKER_TRUSTED_PROXIES"
+MAX_FORWARDED_FOR_LENGTH = 1024
+MAX_FORWARDED_FOR_HOPS = 16
+MAX_RATE_IP_LENGTH = 45
+MAX_TRUSTED_PROXY_CONFIG_LENGTH = 2048
+MAX_TRUSTED_PROXY_NETWORKS = 64
 
 # 速率限制状态 _rate_store / _rate_lock 见 state.py（顶部已 import）
 
@@ -227,8 +234,99 @@ def _check_rate(ip: str, limit: int = 20, window: int = 60) -> bool:
         _rate_store[ip] = hits
     return True
 
+def _canonical_rate_address(value):
+    """Return a strict, bounded IP object suitable for a rate-limit key."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if (
+        not candidate
+        or len(candidate) > MAX_RATE_IP_LENGTH
+        or "%" in candidate
+    ):
+        return None
+    try:
+        return ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+
+
+def _trusted_proxy_networks(value: str | None = None) -> tuple:
+    """Parse the explicit proxy allowlist; any invalid entry rejects it all."""
+    raw = os.environ.get(TRUSTED_PROXIES_ENV, "") if value is None else value
+    if not isinstance(raw, str):
+        return ()
+    raw = raw.strip()
+    if not raw:
+        return ()
+    if len(raw) > MAX_TRUSTED_PROXY_CONFIG_LENGTH:
+        return ()
+
+    entries = []
+    for comma_group in raw.split(","):
+        group_entries = comma_group.split()
+        if not group_entries:
+            return ()
+        entries.extend(group_entries)
+    if not entries or len(entries) > MAX_TRUSTED_PROXY_NETWORKS:
+        return ()
+
+    networks = []
+    try:
+        for entry in entries:
+            if not entry or "%" in entry:
+                return ()
+            if "/" in entry:
+                network = ipaddress.ip_network(entry, strict=True)
+            else:
+                address = ipaddress.ip_address(entry)
+                network = ipaddress.ip_network(
+                    f"{address}/{address.max_prefixlen}",
+                    strict=True,
+                )
+            networks.append(network)
+    except ValueError:
+        return ()
+    return tuple(networks)
+
+
+def _is_trusted_proxy(address, networks: tuple) -> bool:
+    return any(
+        address.version == network.version and address in network
+        for network in networks
+    )
+
+
 def _get_ip() -> str:
-    return request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    """Resolve a canonical rate identity across an explicitly trusted chain."""
+    peer = _canonical_rate_address(request.remote_addr)
+    if peer is None:
+        return "unknown"
+    peer_key = str(peer)
+    trusted_networks = _trusted_proxy_networks()
+    if not trusted_networks or not _is_trusted_proxy(peer, trusted_networks):
+        return peer_key
+
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if not forwarded_for or len(forwarded_for) > MAX_FORWARDED_FOR_LENGTH:
+        return peer_key
+    raw_hops = forwarded_for.split(",")
+    if not raw_hops or len(raw_hops) > MAX_FORWARDED_FOR_HOPS:
+        return peer_key
+
+    hops = []
+    for raw_hop in raw_hops:
+        hop = _canonical_rate_address(raw_hop)
+        if hop is None:
+            return peer_key
+        hops.append(hop)
+
+    client = peer
+    for hop in reversed(hops):
+        if not _is_trusted_proxy(client, trusted_networks):
+            break
+        client = hop
+    return str(client)
 
 def _is_api_request() -> bool:
     return request.path.startswith("/api/")

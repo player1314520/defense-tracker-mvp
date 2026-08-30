@@ -1,0 +1,98 @@
+name: V9 unsigned-development candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact protected main commit for an ephemeral unsigned-development verification
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v9-unsigned-development-${{ inputs.release_sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-and-retain:
+    name: Build and test ephemeral unsigned-development candidate
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      RELEASE_SHA: ${{ inputs.release_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Bind unsigned-development build to protected main
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          remote_main="$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')"
+          test "${remote_main}" = "${RELEASE_SHA}"
+          test "${GITHUB_SHA}" = "${RELEASE_SHA}"
+          test "${GITHUB_WORKFLOW_SHA}" = "${RELEASE_SHA}"
+          test "${GITHUB_WORKFLOW_REF}" = "${GITHUB_REPOSITORY}/.github/workflows/v9-development-candidate.yml@refs/heads/main"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Validate hash-locked build inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($lock in @('requirements.bootstrap.lock', 'requirements.build.lock')) {
+            $content = [System.IO.File]::ReadAllText((Join-Path $PWD $lock))
+            if ($content -notmatch '--hash=sha256:[0-9a-f]{64}') {
+              throw "Hash-locked build input is invalid: $lock"
+            }
+          }
+      - name: Prepare one-use hash-locked unsigned-development toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = (Get-Command python -ErrorAction Stop).Source
+          .\scripts\Prepare-BuildEnv.ps1 -PythonExecutable $python
+      - name: Build, privacy-scan, PE-check and smoke-test unsigned-development candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\scripts\Build-AndShip.ps1 -ExpectedReleaseSha $env:RELEASE_SHA
+      - name: Verify NotSigned development manifest and publish no binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidate = Join-Path $PWD "dist\unsigned-development\v9.0.0\$env:RELEASE_SHA"
+          $manifestPath = Join-Path $candidate 'release-manifest.json'
+          $exePath = Join-Path $candidate 'DefenseTracker.exe'
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.kind -cne 'unsigned-development-candidate' -or
+              $manifest.artifact.channel -cne 'development' -or
+              $manifest.signature.authenticode -cne 'NotSigned' -or
+              $manifest.artifact.stable_release_eligible -ne $false -or
+              $manifest.artifact.public_release_eligible -ne $false) {
+            throw 'Unsigned-development manifest contract failed.'
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $exePath
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+            throw "Expected NotSigned executable; got $($signature.Status)."
+          }
+          $exeHash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            '### Unsigned-development verification'
+            ''
+            '- Binary publication: disabled (public repository)'
+            '- Authenticode: `NotSigned`'
+            "- Source commit: ``$env:RELEASE_SHA``"
+            "- Ephemeral EXE SHA-256: ``$exeHash``"
+            '- Stable/public release eligible: `false`'
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+          Write-Host "UNSIGNED_DEVELOPMENT_VERIFIED commit=$env:RELEASE_SHA sha256=$exeHash publication=disabled"

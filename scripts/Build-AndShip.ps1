@@ -313,14 +313,14 @@ function Assert-VersionInfo {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)]$Version,
-        [Parameter(Mandatory = $true)][string]$Publisher
+        [Parameter(Mandatory = $true)][string]$CompanyName
     )
     $info = (Get-Item -LiteralPath $Path).VersionInfo
     $expected = [ordered]@{
         FileVersion = $Version.windows_file_version
         ProductVersion = $Version.semantic_version
         ProductName = $Version.product_name
-        CompanyName = $Publisher
+        CompanyName = $CompanyName
         OriginalFilename = "$($Version.product_name).exe"
     }
     foreach ($entry in $expected.GetEnumerator()) {
@@ -623,7 +623,7 @@ function Write-DevelopmentBuildManifest {
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)]$Version,
         [Parameter(Mandatory = $true)]$GitFacts,
-        [Parameter(Mandatory = $true)][string]$Publisher
+        [Parameter(Mandatory = $true)][string]$VersionInfoCompanyName
     )
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd("\") + "\"
     $files = @(
@@ -638,15 +638,25 @@ function Write-DevelopmentBuildManifest {
     )
     [ordered]@{
         schema = 2
-        kind = "unsigned-development-build"
+        kind = "unsigned-development-candidate"
+        artifact = [ordered]@{
+            channel = "development"
+            stability = "development"
+            stable_release_eligible = $false
+            public_release_eligible = $false
+        }
         product = $Version.product_name
         version = $Version
-        release = [ordered]@{
+        source = [ordered]@{
             commit = $GitFacts.commit
             baseline_commit = $Version.release_baseline
             source_tree = $GitFacts.tree
         }
-        signature = [ordered]@{ authenticode = "NotRequiredForDevelopment"; publisher = $Publisher }
+        signature = [ordered]@{
+            authenticode = "NotSigned"
+            legal_identity_asserted = $false
+            version_info_company_name = $VersionInfoCompanyName
+        }
         files = $files
     } | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath (Join-Path $Root "release-manifest.json") -Encoding UTF8
@@ -661,8 +671,16 @@ if ($version.semantic_version -notmatch '^\d+\.\d+\.\d+$' -or
     $version.release_tag -ne "v$($version.semantic_version)") {
     throw "version.json is invalid."
 }
-if ([string]::IsNullOrWhiteSpace($PublisherName)) {
+$unsignedDevelopmentCompanyName = "DefenseTracker Community Edition (Unsigned Development Build)"
+if ($RequireSignedInstaller -and [string]::IsNullOrWhiteSpace($PublisherName)) {
     throw "DEFENSE_TRACKER_PUBLISHER must be the verified legal Publisher; it is never inferred."
+}
+if ($RequireSignedInstaller) {
+    $buildKind = "signed-release-candidate"
+    $versionInfoCompanyName = $PublisherName.Trim()
+} else {
+    $buildKind = "unsigned-development-candidate"
+    $versionInfoCompanyName = $unsignedDevelopmentCompanyName
 }
 
 $gitFacts = Assert-CleanReleaseCommit $projectRoot $ExpectedReleaseSha $version.release_baseline
@@ -710,8 +728,9 @@ if ($builderFindings.Count -gt 0) { throw "Builder safety gate failed: $($builde
 
 $environmentNames = @(
     "DEFENSE_TRACKER_BUILD_OUTPUT_ROOT", "DEFENSE_TRACKER_BUILD_TOOLCHAIN_ROOT",
-    "DEFENSE_TRACKER_PUBLISHER", "DEFENSE_TRACKER_EXPECTED_RELEASE_SHA",
-    "DEFENSE_TRACKER_SOURCE_TREE", "SOURCE_DATE_EPOCH"
+    "DEFENSE_TRACKER_VERSION_INFO_COMPANY_NAME", "DEFENSE_TRACKER_BUILD_KIND",
+    "DEFENSE_TRACKER_EXPECTED_RELEASE_SHA", "DEFENSE_TRACKER_SOURCE_TREE",
+    "SOURCE_DATE_EPOCH"
 )
 $previousEnvironment = @{}
 foreach ($name in $environmentNames) {
@@ -722,7 +741,8 @@ $buildFinishedUtc = $null
 try {
     [Environment]::SetEnvironmentVariable("DEFENSE_TRACKER_BUILD_OUTPUT_ROOT", $buildRoot, "Process")
     [Environment]::SetEnvironmentVariable("DEFENSE_TRACKER_BUILD_TOOLCHAIN_ROOT", $venvRoot, "Process")
-    [Environment]::SetEnvironmentVariable("DEFENSE_TRACKER_PUBLISHER", $PublisherName, "Process")
+    [Environment]::SetEnvironmentVariable("DEFENSE_TRACKER_VERSION_INFO_COMPANY_NAME", $versionInfoCompanyName, "Process")
+    [Environment]::SetEnvironmentVariable("DEFENSE_TRACKER_BUILD_KIND", $buildKind, "Process")
     [Environment]::SetEnvironmentVariable("DEFENSE_TRACKER_EXPECTED_RELEASE_SHA", $ExpectedReleaseSha, "Process")
     [Environment]::SetEnvironmentVariable("DEFENSE_TRACKER_SOURCE_TREE", $gitFacts.tree, "Process")
     [Environment]::SetEnvironmentVariable("SOURCE_DATE_EPOCH", [string]$gitFacts.epoch, "Process")
@@ -747,7 +767,7 @@ if (([DateTime]::UtcNow - $exe.LastWriteTimeUtc).TotalMinutes -gt $MaxArtifactAg
     throw "Staged executable is older than the allowed build window."
 }
 Assert-WindowsPeFile $stagedExe -RequireX64
-Assert-VersionInfo $stagedExe $version $PublisherName
+Assert-VersionInfo $stagedExe $version $versionInfoCompanyName
 $artifactFindings = @(Get-ArtifactSafetyFindings $stagingRoot)
 if ($artifactFindings.Count -gt 0) { throw "Artifact safety scan failed:`n - $($artifactFindings -join "`n - ")" }
 $packagesFile = Join-Path $venvRoot ".installed-packages.txt"
@@ -1172,7 +1192,11 @@ if ($RequireSignedInstaller) {
         $assetStaging --expected-commit $ExpectedReleaseSha
     if ($LASTEXITCODE -ne 0) { throw "Release asset verification failed." }
 } else {
-    Write-DevelopmentBuildManifest $stagingRoot $version $gitFacts $PublisherName
+    $developmentSignature = Get-AuthenticodeSignature -LiteralPath $stagedExe
+    if ($developmentSignature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+        throw "Unsigned development executable must be Authenticode NotSigned; got $($developmentSignature.Status)."
+    }
+    Write-DevelopmentBuildManifest $stagingRoot $version $gitFacts $versionInfoCompanyName
 }
 
 $postStatus = Invoke-Git $projectRoot @("status", "--porcelain", "--untracked-files=all")
@@ -1268,15 +1292,15 @@ if ($RequireSignedInstaller -and $CandidateOnly) {
     Write-Host "     SHA-256: $(Get-Sha256 $releasedExe.FullName)"
     Write-Host "     Stable assets: $publishedAssetRoot"
 } else {
-    $candidateParent = Join-Path $distRoot ("candidates\" + $version.release_tag)
+    $candidateParent = Join-Path $distRoot ("unsigned-development\" + $version.release_tag)
     $candidateRoot = Join-Path $candidateParent $ExpectedReleaseSha
     if (Test-Path -LiteralPath $candidateRoot) {
-        throw "Unsigned candidate directory already exists: $candidateRoot"
+        throw "Unsigned development candidate directory already exists: $candidateRoot"
     }
     New-Item -ItemType Directory -Path $candidateParent -Force | Out-Null
     Move-Item -LiteralPath $stagingRoot -Destination $candidateRoot
     $candidateExe = Get-Item -LiteralPath (Join-Path $candidateRoot "DefenseTracker.exe")
-    Write-Host "[CANDIDATE] Unsigned build retained without changing dist\DefenseTracker."
+    Write-Host "[UNSIGNED-DEVELOPMENT] NotSigned development candidate retained without changing dist\DefenseTracker."
     Write-Host "            EXE: $($candidateExe.FullName)"
     Write-Host "            SHA-256: $(Get-Sha256 $candidateExe.FullName)"
 }
