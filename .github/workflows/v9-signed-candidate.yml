@@ -435,7 +435,7 @@ jobs:
         shell: pwsh
         run: |
           foreach($name in @('application','installer')){$output=Join-Path $env:RUNNER_TEMP "$name-bundle";New-Item -ItemType Directory $output|Out-Null;$zip=[IO.Compression.ZipFile]::OpenRead((Join-Path $env:RUNNER_TEMP "$name.zip"));try{foreach($entry in $zip.Entries){if($entry.FullName-cnotmatch'^payload/[^\\:]+$'-or$entry.FullName.EndsWith('/')){throw 'unsafe ZIP.'};$relative=$entry.FullName.Substring(8);if($relative-match'(^|/)\.\.?(/|$)'){throw 'unsafe segment.'};$path=[IO.Path]::GetFullPath((Join-Path $output $relative));New-Item -ItemType Directory (Split-Path $path -Parent)-Force|Out-Null;$a=$entry.Open();$b=[IO.File]::Create($path);try{$a.CopyTo($b)}finally{$b.Dispose();$a.Dispose()}}}finally{$zip.Dispose()}}
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
