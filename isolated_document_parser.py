@@ -248,7 +248,8 @@ def _worker_directory_valid() -> bool:
     root = Path.cwd()
     root_stat = root.lstat()
     if (
-        root.parent != Path(tempfile.gettempdir()).resolve()
+        # Windows can report an 8.3 cwd alias for the same physical temp folder.
+        not root.parent.samefile(Path(tempfile.gettempdir()))
         or not re.fullmatch(r"defensetracker-parser-[A-Za-z0-9_-]+", root.name)
         or not stat.S_ISDIR(root_stat.st_mode)
         or getattr(root_stat, "st_file_attributes", 0) & 0x400

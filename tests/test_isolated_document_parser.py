@@ -318,6 +318,34 @@ def test_worker_rejects_uncontrolled_working_directory(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_worker_accepts_same_parent_directory_with_alternate_path_spelling(
+    worker_directory, monkeypatch
+):
+    # Keep a genuine filesystem alias unnormalised, like Windows 8.3 cwd names.
+    root = worker_directory.resolve()
+    alias = root.parent / ".." / root.parent.name / root.name
+    assert alias.parent != root.parent
+    assert alias.parent.samefile(root.parent)
+    monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: alias))
+
+    assert isolated_document_parser.worker_file_entry(
+        "request.json", "input.bin", "result.json"
+    ) == 0
+    result = json.loads(Path("result.json").read_text(encoding="utf-8"))
+    assert result["result"]["text"] == "controlled input"
+
+
+def test_worker_rejects_correctly_named_directory_outside_temp_parent(tmp_path, monkeypatch):
+    outside = tmp_path / "defensetracker-parser-outside"
+    outside.mkdir(mode=0o700)
+    monkeypatch.chdir(outside)
+
+    assert isolated_document_parser.worker_file_entry(
+        "request.json", "input.bin", "result.json"
+    ) == 64
+    assert list(outside.iterdir()) == []
+
+
 def test_worker_rejects_existing_result_without_overwriting(worker_directory):
     Path("result.json").write_bytes(b"preserve existing file")
     assert isolated_document_parser.worker_file_entry(
