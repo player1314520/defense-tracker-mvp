@@ -54,7 +54,7 @@
   background: none !important; border: none !important; color: var(--ink1) !important;
   font-family: var(--sans) !important; font-size: 13.5px !important; caret-color: var(--accent) !important;
 }
-#tab-content-news .news-search-input::placeholder { color: var(--ink4); }
+#tab-content-news .news-search-input::placeholder { color: var(--ink2); }
 
 /* 地区过滤 → 文字下划线式 */
 #tab-content-news .filter-bar { gap: 18px; padding: 0 0 14px; border-bottom: 1px solid var(--line2) !important; margin: 4px 0 0; clear: both; }
@@ -82,7 +82,7 @@
 }
 #tab-content-news .sort-btn:hover, #tab-content-news .star-filter-btn:hover { color: var(--ink1); background: none; }
 #tab-content-news .sort-btn.active, #tab-content-news .star-filter-btn.active { color: var(--accent); background: none; box-shadow: none !important; }
-#tab-content-news .shortcut-hint { color: var(--ink4); }
+#tab-content-news .shortcut-hint { color: var(--ink2); }
 #tab-content-news .shortcut-hint kbd { background: var(--card); border-color: var(--line2) !important; color: var(--ink3); }
 
 /* 预警条 */
@@ -125,7 +125,7 @@
 #tab-content-news .ed-breaking { color: var(--accent); font-weight: 500 !important; animation: edPulse 1.3s infinite; }
 #tab-content-news .ed-toptier { color: var(--ochre); }
 #tab-content-news .ed-alertb { color: var(--accent); }
-#tab-content-news .ed-readb { color: var(--ink4); }
+#tab-content-news .ed-readb { color: var(--ink2); }
 #tab-content-news .ed-bm { margin-left: auto !important; background: none; border: none; color: var(--ink4); cursor: pointer; font-size: 13px !important; }
 #tab-content-news .ed-bm.bookmarked { color: var(--ochre); }
 
@@ -204,7 +204,7 @@
 
 /* 加载/空态 */
 #tab-content-news .loading-state { color: var(--ink3); }
-#tab-content-news .loading-state small { color: var(--ink4); }
+#tab-content-news .loading-state small { color: var(--ink2); }
 
 /* 窄屏：分析栏落到下方 */
 @media (max-width: 900px) {
@@ -216,3 +216,120 @@
 /* 一键要讯：卡片主动作，赭石突出 */
 #tab-content-news .ed-act.brief-one-btn { color: var(--ochre) !important; }
 #tab-content-news .ed-act.brief-one-btn:hover { color: var(--accent) !important; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k2-chain-upgrade.css §1 实时新闻(news 屏)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════
+   §1 实时新闻(news):三行工具条收敛层级 · 卡片密度 · 右栏统一 · 空错态
+   ═══════════════════════════════════════════════════════════ */
+
+/* 版头与搜索:搜索框给足 40px 目标,弱化占位符 */
+#tab-content-news .search-bar-wrap { min-height: 40px; align-items: center; }
+#tab-content-news .news-search-input { min-height: 32px; font-size: 14px !important; }
+#tab-content-news .search-clear-btn { min-width: 32px; min-height: 32px; }
+
+/* 第一行:地区过滤(一级)——保持 13.5px 下划线式,是工具条最高权重 */
+#tab-content-news .filter-bar { margin-top: 8px; }
+
+/* 第二行:排序/星级(二级)——由 10.5px 提到 12px,可点击控件不再迷你 */
+#tab-content-news .ctrl-row { font-size: 12px !important; letter-spacing: .2px !important; }
+#tab-content-news .sort-btn, #tab-content-news .star-filter-btn {
+  font-size: 12px !important; letter-spacing: .2px !important;
+  min-height: 32px; padding: 2px 8px !important;
+}
+#tab-content-news .sort-btn.active, #tab-content-news .star-filter-btn.active {
+  font-weight: 700;
+  text-decoration: underline; text-underline-offset: 4px;   /* 激活态:颜色+下划线双编码 */
+}
+#tab-content-news .unread-badge {
+  background: var(--accentsoft) !important; border: 1px solid var(--line2) !important;
+  color: var(--ink1) !important; border-radius: 0 !important;
+}
+#tab-content-news .unread-badge button { color: var(--accent) !important; font-size: 12px !important; }
+
+/* 第三行:预警词(三级)——视觉降噪为弱辅助行,功能不变 */
+#tab-content-news .alert-bar { padding: 6px 12px !important; margin-top: 8px !important; }
+#tab-content-news .alert-tag { font-size: 12px; }
+#tab-content-news .alert-input { font-size: 13px; }
+#tab-content-news .alert-toggle-btn, #tab-content-news .v9-rule-open {
+  min-height: 32px; color: var(--ink3) !important; font-size: 12px !important;
+}
+#tab-content-news .alert-toggle-btn:hover, #tab-content-news .v9-rule-open:hover { color: var(--ink1) !important; }
+
+/* 搜索结果提示条:信息色左边条 + 文字 */
+#tab-content-news .search-result-tip {
+  margin: 8px 0 0; padding: 8px 12px;
+  background: var(--accentsoft); border-left: 3px solid var(--info);
+  color: var(--ink2); font-size: 13px;
+}
+#tab-content-news .search-result-tip strong { color: var(--ink1); }
+#tab-content-news .search-result-tip .tip-clear {
+  background: none; border: none; color: var(--accent);
+  font-size: 12px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;
+}
+
+/* 新闻卡:密度收紧(垂直 22→16px),扫读节奏靠标题与评分 */
+#tab-content-news .ed-card { padding: 16px 0 15px !important; column-gap: 20px !important; }
+#tab-content-news .ed-score-num { font-size: 28px !important; }
+#tab-content-news .ed-meta { font-size: 11px !important; margin-bottom: 8px !important; }
+#tab-content-news .ed-title { font-size: 18px !important; margin-bottom: 8px !important; }
+#tab-content-news .news-summary { margin-bottom: 10px !important; }
+#tab-content-news .news-summary .sum-short, #tab-content-news .news-summary .sum-full {
+  font-size: 14px !important;      /* 正文 ≥14px 铁律 */
+}
+#tab-content-news .ed-judge { margin-bottom: 10px !important; }
+#tab-content-news .ed-judge-txt { font-size: 14px !important; }
+#tab-content-news .ed-judge-lab { font-size: 10px !important; }
+#tab-content-news .ed-act { font-size: 11px !important; min-height: 32px; }
+#tab-content-news .ed-tags { font-size: 11px !important; }
+#tab-content-news .ed-tags .vtag { min-height: 32px; display: inline-flex; align-items: center; }
+#tab-content-news .sum-toggle { font-size: 12px !important; }
+
+/* 右栏:三面板统一节奏,统计数字层级一致 */
+#tab-content-news .news-aside { gap: 24px !important; }
+#tab-content-news .news-aside .panel-header h2::after { content: none !important; }   /* 修 news-editorial 特异性战败:右栏小标题不应带英文副题 */
+#tab-content-news .news-aside .panel { border-top: 1px solid var(--line2) !important; padding-top: 16px !important; }
+#tab-content-news .news-aside .panel:first-child { border-top: none !important; padding-top: 0 !important; }
+#tab-content-news .news-aside .panel[style] { margin-top: 0 !important; }   /* 清掉 DOM 内联 margin-top:12px,统一由 gap 控制 */
+
+/* 新闻源状态:健康/异常/死亡三色 + 符号双编码(news.js 已供 ✓/⚠/✕ 文字) */
+#tab-content-news .feed-summary-ok { color: var(--success) !important; }
+#tab-content-news .feed-summary-warn { color: var(--warning) !important; }
+#tab-content-news .feed-summary-dead { color: var(--danger) !important; }
+#tab-content-news .feed-summary-toggle { min-height: 32px; font-size: 12px !important; color: var(--ink2); }
+#tab-content-news .feed-dot.ok { background: var(--success) !important; }
+#tab-content-news .feed-dot.err { background: var(--danger) !important; }
+#tab-content-news .feed-streak { color: var(--warning) !important; }
+#tab-content-news .feed-row { min-height: 40px; }
+
+/* 价值标签统计:news.js 内联旧暖色(#d1442f/#7d7566)→ token 强制回正;
+   榜首标签用警告色 + 其余中性,差异由「颜色 + 数值」承担 */
+#tab-content-news .vstats-tag { color: var(--ink2) !important; font-size: 13px !important; }
+#tab-content-news .vstats-row:first-of-type .vstats-tag { color: var(--warning) !important; font-weight: 700; }
+#tab-content-news .vstats-bar { background: var(--line2) !important; }
+#tab-content-news .vstats-row:first-of-type .vstats-bar { background: var(--warning) !important; }
+#tab-content-news .vstats-count { font-size: 12px !important; color: var(--ink1) !important; }
+
+/* 写作优先级分布:行序固定 10★→0★(nth-child 1-3 = 8★以上);
+   旧锈红 #d1442f 全量回正:高优先级=主蓝,中=信息青,低=弱化墨 */
+#tab-content-news .pstats-row { min-height: 32px; margin-bottom: 4px !important; }
+#tab-content-news .pstats-label { font-size: 12px !important; color: var(--ink3) !important; }
+#tab-content-news .pstats-row:nth-child(-n+3) .pstats-label { color: var(--accent) !important; font-weight: 700; }
+#tab-content-news .pstats-row:nth-child(4) .pstats-label,
+#tab-content-news .pstats-row:nth-child(5) .pstats-label { color: var(--info) !important; }
+#tab-content-news .pstats-bar-fill { background: var(--line2) !important; }
+#tab-content-news .pstats-row:nth-child(-n+3) .pstats-bar-fill { background: var(--accent) !important; }
+#tab-content-news .pstats-row:nth-child(4) .pstats-bar-fill,
+#tab-content-news .pstats-row:nth-child(5) .pstats-bar-fill { background: var(--info) !important; }
+#tab-content-news .pstats-cnt { font-size: 12px !important; color: var(--ink2) !important; }
+
+/* 空结果/错误/加载:诚实呈现,错误给危险色左边条 + 「错误」文字 */
+#tab-content-news .news-list > .loading-state { padding: 40px 16px; }
+#tab-content-news .news-list > .loading-state p { font-size: 14px; color: var(--ink2); }
+#tab-content-news .error-state {
+  padding: 20px 16px; text-align: left;
+  color: var(--danger); background: rgba(222, 93, 93, .08);
+  border-left: 3px solid var(--danger); font-size: 14px; line-height: 1.6;
+}
+#tab-content-news .error-state small { color: var(--ink2); font-size: 12px; }

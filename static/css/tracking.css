@@ -155,3 +155,137 @@
 
 /* 顶部 tab 按钮的一点点强调 */
 .track-tab.active { color: var(--amber, #f59e0b) !important; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k2-chain-upgrade.css §3 告警分诊+追踪清单(tracking 屏)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════
+   §3 告警分诊 + 我的追踪清单(tracking):双工作台层级 · 严重度双编码
+   ═══════════════════════════════════════════════════════════ */
+
+/* V9 告警分诊(一级工作台):页头压缩,摘要数字成组 */
+#tab-content-tracking .v9-p3-panel { padding: 24px 32px; }
+#tab-content-tracking .v9-page-head { min-height: 0; padding-bottom: 16px; }
+#tab-content-tracking .v9-page-head h1 { font-size: 26px; font-family: var(--sans); font-weight: 600; margin: 8px 0 0; }
+#tab-content-tracking .v9-page-head p { margin: 8px 0 0; font-size: 13px; }
+#tab-content-tracking .v9-page-actions .v9-primary { min-height: 44px; padding: 0 20px; font-size: 14px; }
+#tab-content-tracking .v9-alert-summary { margin-bottom: 0; }
+#tab-content-tracking .v9-alert-summary span { padding: 12px 16px; font-size: 11px; letter-spacing: 1px; }
+#tab-content-tracking .v9-alert-summary strong { font: 600 22px/1.1 var(--sans); margin-top: 6px; }
+
+/* 告警卡:严重度 = 左边条颜色 + 元行文字色,双编码;critical 追加字重 */
+#tab-content-tracking .v9-alert-card { padding: 16px 18px; }
+#tab-content-tracking .v9-alert-card > div { font-size: 10px; letter-spacing: 1px; }
+#tab-content-tracking .v9-alert-card > div > span:first-child { font-weight: 700; }
+#tab-content-tracking .v9-alert-card.severity-critical > div > span:first-child,
+#tab-content-tracking .v9-alert-card.severity-high > div > span:first-child { color: var(--danger); }
+#tab-content-tracking .v9-alert-card.severity-critical { box-shadow: inset 3px 0 0 var(--danger); background: rgba(222,93,93,.05); }
+#tab-content-tracking .v9-alert-card.severity-high { box-shadow: inset 3px 0 0 var(--danger); }
+#tab-content-tracking .v9-alert-card.severity-medium { box-shadow: inset 3px 0 0 var(--warning); }
+#tab-content-tracking .v9-alert-card.severity-medium > div > span:first-child { color: var(--warning); }
+#tab-content-tracking .v9-alert-card.severity-low { box-shadow: inset 3px 0 0 var(--ink4); }
+#tab-content-tracking .v9-alert-card.severity-low > div > span:first-child { color: var(--ink3); }
+#tab-content-tracking .v9-alert-card h2 { font: 600 16px/1.45 var(--sans); margin: 8px 0 6px; }
+#tab-content-tracking .v9-alert-card p { font-size: 12px; }
+#tab-content-tracking .v9-alert-card footer { gap: 8px; margin-top: 12px; }
+#tab-content-tracking .v9-alert-card button {
+  min-height: 32px; padding: 0 12px; font-size: 12px;
+  color: var(--ink2); border-color: var(--line2); background: var(--panel);
+}
+#tab-content-tracking .v9-alert-card button:hover { color: var(--ink1); border-color: var(--ink3); background: var(--cardh); }
+/* 「转案件」是分诊主路径出口:蓝边强调(颜色 + 文字) */
+#tab-content-tracking .v9-alert-card button[data-action="convert_case"] { color: var(--accent); border-color: var(--accent); }
+#tab-content-tracking .v9-alert-card button[data-action="convert_case"]:hover { background: var(--accentsoft); }
+/* 「关闭」为终结性动作:仅 hover 显危险色 */
+#tab-content-tracking .v9-alert-card button[data-action="close"]:hover { color: var(--danger); border-color: var(--danger); }
+
+/* 我的追踪清单(二级工作台):去掉 opacity:.72 遗留(可读性铁律),
+   改用分隔带 + 分区标题与一级工作台分层 */
+#tab-content-tracking .v9-p3-panel + .trk-zone { opacity: 1; margin-top: 0; }
+#tab-content-tracking .trk-zone {
+  max-width: none; padding: 24px 32px 80px;
+  border-top: 1px solid var(--line);
+}
+#tab-content-tracking .trk-header { margin: 0 0 16px; padding-bottom: 16px; border-bottom-color: var(--line2); }
+#tab-content-tracking .trk-logo { filter: none; font-size: 22px; }
+#tab-content-tracking .trk-header h2 { font-size: 20px; font-family: var(--sans); font-weight: 600; }
+#tab-content-tracking .trk-sub { font-size: 12px; color: var(--ink3); }
+#tab-content-tracking .trk-stat { font-size: 12px; color: var(--ink3); }
+#tab-content-tracking .trk-stat strong { color: var(--accent); font-size: 16px; }
+#tab-content-tracking .trk-refresh-btn {
+  min-height: 40px; padding: 0 14px;
+  background: var(--panel); border-color: var(--line2); color: var(--ink2);
+  font-size: 12px; border-radius: 0;
+}
+#tab-content-tracking .trk-refresh-btn:hover { background: var(--cardh); color: var(--ink1); }
+
+/* 添加追踪:表单行 = 二级表面 + 主蓝提交钮(本区唯一主操作) */
+#tab-content-tracking .trk-add {
+  background: var(--panel); border-color: var(--line2); border-radius: 0;
+  padding: 12px 16px;
+}
+#tab-content-tracking .trk-input, #tab-content-tracking .trk-select {
+  background: var(--bg); border-color: var(--line2); border-radius: 0;
+  min-height: 40px; font-size: 13px; color: var(--ink1);
+}
+#tab-content-tracking .trk-input:focus, #tab-content-tracking .trk-select:focus {
+  border-color: var(--accent); box-shadow: none; outline: var(--focus-outline); outline-offset: -1px;
+}
+#tab-content-tracking .trk-add-btn {
+  min-height: 40px; padding: 0 20px;
+  background: var(--accent); color: var(--on-accent);
+  font-size: 13px; font-weight: 700; border-radius: 0;
+}
+#tab-content-tracking .trk-add-btn:hover { background: #6DB3EE; }
+#tab-content-tracking .trk-hint { color: var(--info); font-size: 12px; }
+#tab-content-tracking .trk-hint-err { color: var(--danger); }
+
+/* 追踪项卡:命中徽章信息青(非红),关键词警告色,暂停态图形+文字 */
+#tab-content-tracking .trk-item { background: var(--card); border-color: var(--line); border-radius: 0; }
+#tab-content-tracking .trk-item-head { padding: 12px 16px; }
+#tab-content-tracking .trk-item-label { font-size: 15px; color: var(--ink1); }
+#tab-content-tracking .trk-item-kw { color: var(--warning); font-size: 12px; }
+#tab-content-tracking .trk-item-kw i { color: var(--ink3); }
+#tab-content-tracking .trk-item-mode { color: var(--ink3); border-color: var(--line2); border-radius: 0; font-size: 11px; }
+#tab-content-tracking .trk-badge {
+  color: var(--info); background: var(--panel); border-color: var(--line2);
+  border-radius: 0; font-size: 12px;
+}
+#tab-content-tracking .trk-btn {
+  min-height: 32px; padding: 0 12px;
+  background: var(--panel); border-color: var(--line2); color: var(--ink2);
+  border-radius: 0; font-size: 12px;
+}
+#tab-content-tracking .trk-btn:hover { background: var(--cardh); color: var(--ink1); }
+/* 删除类动作:默认克制,hover 才显危险色(文字 + 边框) */
+#tab-content-tracking .trk-btn-danger:hover { border-color: var(--danger); color: var(--danger); }
+
+/* 命中文章行:星标=警告色,相关度分=信息青,高亮词=警告色 */
+#tab-content-tracking .trk-matches { background: var(--bg); border-top-color: var(--line); }
+#tab-content-tracking .trk-hit { min-height: 40px; padding: 8px 16px; border-bottom-color: var(--line); }
+#tab-content-tracking .trk-hit-title { font-size: 13px; color: var(--ink1); }
+#tab-content-tracking .trk-hit-title:hover { color: var(--accent); }
+#tab-content-tracking .trk-hit-meta { font-size: 11px; color: var(--ink3); }
+#tab-content-tracking .trk-star { color: var(--ink4); min-width: 32px; min-height: 32px; }
+#tab-content-tracking .trk-star.on { color: var(--warning); }
+#tab-content-tracking .trk-hit-score { color: var(--info); border-color: var(--line2); border-radius: 0; }
+#tab-content-tracking .trk-mark { color: var(--warning); }
+
+/* 内联编辑行 */
+#tab-content-tracking .trk-edit { background: var(--panel); border-top-color: var(--line); }
+#tab-content-tracking .trk-edit-en { color: var(--ink2); }
+#tab-content-tracking .trk-edit-en input { accent-color: var(--accent); }
+
+/* 暂停态:透明度 + 「已暂停」文字标,双编码 */
+#tab-content-tracking .trk-item-off { opacity: .62; }
+#tab-content-tracking .trk-item-offtag { color: var(--warning); border-color: var(--warning); border-radius: 0; }
+
+/* Tab 角标(命中总数):信息青实底深字,数字本身表意 */
+.trk-tab-badge { background: var(--info) !important; color: var(--on-accent) !important; font-weight: 700; }
+
+/* 收藏夹面板 */
+#tab-content-tracking .trk-fav { background: var(--card); border-color: var(--line2); border-radius: 0; }
+#tab-content-tracking .trk-fav-head { color: var(--warning); background: var(--panel); border-bottom-color: var(--line); font-size: 13px; }
+
+/* 空态 */
+#tab-content-tracking .trk-empty { padding: 32px 16px; font-size: 14px; color: var(--ink2); }

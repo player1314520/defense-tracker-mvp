@@ -1,65 +1,76 @@
 /* ═══════════════════════════════════════════════════════════
-   Design Tokens · 编辑室/报纸审美 全局单一真相（第2步 P0-A）
-   来源：Claude Design 稿 防务追踪-实时新闻-顶尖升级.dc.html:31
-   放在 <head> 第一个 <link>：所有后续样式消费这里的变量。
-
-   相对设计稿的两处修正（前端审计 P0-A）：
-   · --ink3 7d7566→8a8172、--ink4 544d42→6a6255：原值对 --bg 对比度
-     4.2:1 / 2.3:1 不达标（WCAG AA 正文 4.5:1）；#544d42 降级为纯装饰线
-     用色 --line-deco，不再用于承载信息的文本
-   · 字体链不走 Google Fonts（CSP+GFW 拿不到），用系统衬线栈
+   Design Tokens · 全局单一真相(K1 批次,2026-08-30 石墨深色收敛)
+   原暖黑编辑室色板(#12100e/锈红 #d1442f)整体替换为 K1 规定的
+   石墨深色工作台色板。所有变量名保持不变,16 份既有 CSS 无感切换;
+   对比度实测:#A8B5C3/#748395 对 #0B1118 分别 ≈9.4:1 / ≈4.9:1(AA 达标);
+   #4F9FE8 填充时配深色文字 #0B1118(≈7:1),不配白字(仅 2.9:1)。
+   字体链不走 Google Fonts(CSP+GFW 拿不到),用系统字体栈。
    ═══════════════════════════════════════════════════════════ */
 :root {
-  /* 面 */
-  --bg:      #12100e;   /* newsprint 底 */
-  --panel:   #17140f;
-  --card:    #1a1712;
-  --cardh:   #211d17;   /* card hover */
-  /* 线 */
-  --line:    rgba(240,230,214,.09);
-  --line2:   rgba(240,230,214,.16);
-  --line-deco: #544d42; /* 仅装饰性分隔，禁用于文本 */
-  /* 墨 */
-  --ink1:    #ece6da;   /* 主文本 */
-  --ink2:    #ada491;   /* 次级 */
-  --ink3:    #8a8172;   /* 弱化（已提亮达标） */
-  --ink4:    #6a6255;   /* 最弱（已提亮，仅大字号/非关键） */
-  /* 色 */
-  --accent:     #d1442f;             /* 锈红 */
-  --accentsoft: rgba(209,68,47,.13);
-  --ochre:      #b28a4d;             /* 赭石 */
-  /* 字 */
+  /* ── 面(石墨深色)── */
+  --bg:      #0B1118;   /* 页面背景 */
+  --panel:   #111A24;   /* 一级表面 */
+  --card:    #16212D;   /* 二级表面 */
+  --cardh:   #1B2836;   /* 表面 hover */
+  /* ── 线 ── */
+  --line:    #1E2B3A;   /* 细分隔 */
+  --line2:   #293747;   /* 标准边框 */
+  --line-deco: #3A4A5C; /* 仅装饰性分隔,禁用于文本 */
+  /* ── 墨 ── */
+  --ink1:    #E7EDF4;   /* 主文本 */
+  --ink2:    #A8B5C3;   /* 次级 */
+  --ink3:    #748395;   /* 弱化(对 --bg ≈4.9:1,AA 达标) */
+  --ink4:    #5B6A7B;   /* 最弱,仅非文字装饰 */
+  /* ── 色(状态/操作)── */
+  --accent:     #4F9FE8;             /* 主操作(唯一最高权重按钮色) */
+  --accentsoft: rgba(79,159,232,.14);
+  --on-accent:  #0B1118;             /* 主操作填充上的文字色 */
+  --info:       #45B4CE;
+  --warning:    #D7A447;
+  --danger:     #DE5D5D;             /* 仅高危/阻断/破坏性动作 */
+  --success:    #61B58A;
+  /* ── 高危动作按钮(K2 新增):仅删除/清空/阻断类破坏性操作使用;
+     实心填充 + 白字 ≈6.1:1(AA);普通主操作一律用 --accent,不得用红 ── */
+  --btn-danger-bg: #A93E3E;
+  --on-danger:     #FFFFFF;
+  --ochre:      var(--warning);      /* 旧赭石桥接 → 警告色 */
+  /* ── 字 ── */
   --serif: 'Songti SC','Noto Serif SC','Source Han Serif SC',Georgia,'Times New Roman',serif;
   --sans:  'PingFang SC','Microsoft YaHei',system-ui,sans-serif;
   --mono:  ui-monospace,'SFMono-Regular',Consolas,'PingFang SC',monospace;
+  /* ── 间距(4/8/12/16/24/32 序列)── */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;
+  --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
+  /* ── 焦点(全站唯一焦点态)── */
+  --focus-outline: 2px solid var(--accent);
 
-  /* ═══ 旧变量桥接（过渡期）═══
-     未迁移 Tab（报告源抓取/报告写作/智库等）的旧 CSS 全部消费下面这些
-     v5/v9/霓虹时代的变量名——在此重映射到编辑室值，让全站底色系一次统一。
-     每完成一个 Tab 的正式迁移并删净旧规则后，这块随最后一个旧文件一起删。 */
+  /* ═══ 旧变量桥接(过渡期)═══
+     未迁移 Tab(报告源抓取/报告写作/智库等)的旧 CSS 全部消费下面这些
+     v5/v9/霓虹时代的变量名——在此重映射到石墨色板,让全站底色系一次统一。
+     每完成一个 Tab 的正式迁移并删净旧规则后,这块随最后一个旧文件一起删。 */
   --bg-base:   var(--bg);
   --bg-shell:  var(--bg);
   --bg-panel:  var(--panel);
   --bg-card:   var(--card);
   --bg-card-2: var(--cardh);
   --bg-hover:  var(--cardh);
-  --border:        rgba(240,230,214,.14);
-  --border-strong: rgba(240,230,214,.22);
-  --border-glow:   rgba(209,68,47,.18);
+  --border:        var(--line2);
+  --border-strong: #35485C;
+  --border-glow:   rgba(79,159,232,.25);
   --text-1: var(--ink1);
   --text-2: var(--ink2);
   --text-3: var(--ink3);
-  --blue-1: #8d6a3f;            /* 旧蓝强调 → 深赭 */
-  --blue-2: var(--ochre);
-  --blue-3: #c9a86a;            /* 旧亮蓝 → 亮赭 */
-  --amber:  var(--ochre);
-  --purple: #a08058;            /* 旧紫 → 灰赭 */
-  --red-1:  var(--accent);
-  --red-2:  #e06a56;
-  --green-1: #7a8a5a;           /* 旧绿 → 橄榄 */
-  --green-2: #93a06b;
+  --blue-1: #2F6FA8;            /* 旧蓝填充 → 深主蓝(白字 ≈4.6:1) */
+  --blue-2: var(--accent);
+  --blue-3: #8FC3F2;            /* 旧亮蓝文字 → 浅主蓝 */
+  --amber:  var(--warning);
+  --purple: #8A7FB8;            /* 旧紫 → 灰紫 */
+  --red-1:  var(--danger);
+  --red-2:  #E87E7E;
+  --green-1: #4E9A75;           /* 旧绿 → 深成功绿 */
+  --green-2: var(--success);
   --font:   var(--sans);
-  --radius: 0;                  /* 编辑室：直角 */
+  --radius: 0;                  /* 编辑室:直角 */
   --terminal-line:   var(--line);
   --terminal-shadow: none;
 }

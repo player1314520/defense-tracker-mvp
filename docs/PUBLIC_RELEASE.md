@@ -37,6 +37,28 @@ the exact protected default-branch commit may represent a stable version.
 
 ## Pre-publication gates
 
+### Explicit unsigned desktop MVP preview
+
+The separately authorized `v9.0.0-mvp.1` channel may publish a portable Windows
+x64 ZIP as a GitHub **Pre-release**, with `make_latest=false` and an explicit
+**unsigned MVP preview** label. Use `Build-AndShip.ps1 -UnsignedMvpPreview` from
+the exact protected `origin/main` commit. This preserves the clean-source,
+hash-locked dependency, PE, privacy, and desktop smoke gates. Only its explicit
+`unsigned-mvp-preview` manifest is accepted by `package_mvp_preview.py`, which
+checks every payload byte and emits the ZIP, `SHA256SUMS`, and
+`preview-release.json`. Existing development candidates cannot be repackaged
+as previews through this entrypoint. The preview retains the unsigned
+development CompanyName resource and asserts no legal publisher identity.
+
+This narrow channel does not require an Authenticode provider or Portal
+deployment evidence. It does not publish an installer, use the stable `v9.0.0`
+tag, or satisfy any signed stable-release requirement below. A preview does
+not establish SmartScreen reputation, clean-machine compatibility, or cloud
+and multi-user production readiness. Preserve each published preview's bytes;
+subsequent fixes require a new explicitly reviewed preview tag.
+
+### Signed stable release
+
 Run these gates against the exact commit and tracked tree to be published:
 
 1. `python scripts/verify_public_tree.py` passes.

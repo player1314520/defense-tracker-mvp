@@ -68,7 +68,7 @@
 #tab-content-ai .ai-save-btn, #tab-content-ai .ai-qa-send, #tab-content-ai [class*="primary"],
 #tab-content-agent [class*="primary"], #tab-content-agent [class*="generate"], #tab-content-agent [class*="run"] {
   background: var(--accent) !important; background-image: none !important;
-  color: #faf5ef !important; border: none !important; letter-spacing: 1px;
+  color: var(--on-accent) !important; border: none !important; letter-spacing: 1px;
 }
 #tab-content-ai .ai-test-btn, #tab-content-ai .ai-config-btn, #tab-content-ai .ai-copy-btn,
 #tab-content-ai .ai-close-btn, #tab-content-agent .agent-link {
@@ -217,4 +217,12 @@
 #tab-content-ai [class*="next-item"], #tab-content-ai [class*="ops-section"],
 #tab-content-agent [class*="dim"], #tab-content-agent [class*="valid-row"] {
   line-height: 1.6 !important; padding-top: 3px; padding-bottom: 3px;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k2-chain-upgrade.css §2 之 .consult-workbench 规则(须排本文件末,赢得 gap 同特异性对决)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+#tab-content-ai .consult-workbench {
+  grid-template-columns: minmax(300px, .95fr) minmax(0, 1.05fr) !important;
+  gap: 12px !important;
 }

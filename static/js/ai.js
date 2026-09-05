@@ -69,7 +69,7 @@ function selectProvider(pid) {
     `<option value="${m.id}">${m.name}</option>`).join('');
   if (urlHintEl) urlHintEl.textContent = `${p.flag} ${p.name} · ${p.desc}`;
   if (keyHintEl) keyHintEl.textContent = p.id==='ollama' ? '本地部署无需 API Key（随便填一个）' : '密钥仅保存在本机环境变量/内存中';
-  if (getKeyEl)  { getKeyEl.href = p.key_url; getKeyEl.style.display = p.key_url ? '' : 'none'; }
+  if (getKeyEl)  { getKeyEl.href = safeUrl(p.key_url); getKeyEl.style.display = p.key_url ? '' : 'none'; }
   // 更新激活样式
   document.querySelectorAll('.ai-preset-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.pid === pid));
@@ -244,7 +244,6 @@ let consultSearchStatus = null;
 let consultLastMeta = null;
 let consultAssets = [];
 let consultAssetFailures = [];
-let consultArchivePath = '';
 let consultCaptureJob = null;
 let consultCapturePollTimer = null;
 let consultCurrentPreview = null;
@@ -419,7 +418,6 @@ async function consultOpenSession(sessionId, opts = {}) {
     const assetResp = await apiFetch(`/api/consult/sessions/${encodeURIComponent(sessionId)}/assets`, {}, {toast: false});
     const assetData = await assetResp.json();
     consultAssets = assetData.assets || [];
-    consultArchivePath = assetData.source_archive_path || '';
     consultAssetFailures = consultAssets.filter(a => a.status === 'failed');
     consultLastMeta = {
       archived_count: assetData.archived_count || 0,
@@ -431,7 +429,6 @@ async function consultOpenSession(sessionId, opts = {}) {
       diagnosis_cards: assetData.diagnosis_cards || [],
       archive_shortfall: assetData.archive_shortfall || 0,
       target_source_count: consultCurrentSession?.target_source_count,
-      source_archive_path: assetData.source_archive_path || '',
     };
     const ready = consultEvidence.filter(consultIsHandoffReady);
     const extractable = consultEvidence.filter(consultCanExtract);
@@ -462,7 +459,6 @@ function consultNewSessionDraft() {
   consultLastMeta = null;
   consultAssets = [];
   consultAssetFailures = [];
-  consultArchivePath = '';
   consultCaptureJob = null;
   consultCurrentPreview = null;
   consultEvidenceFilter = 'all';
@@ -659,7 +655,7 @@ function consultRenderEvidenceFilters() {
 }
 
 function consultAssetDisplayTitle(asset) {
-  return asset?.title || asset?.url || asset?.local_path || '未命名资料';
+  return asset?.title || asset?.source_url || asset?.filename || '未命名资料';
 }
 
 function consultRenderReadingQueue() {
@@ -1105,8 +1101,7 @@ function consultRenderOpsBoard() {
       </div>
     </div>
     <div class="consult-source-strip">${strips || '<span class="consult-source-pill">等待检索结果</span>'}</div>
-    ${consultCaptureStatusHtml(consultCaptureJob)}
-    ${consultArchivePath ? `<div class="consult-archive-path">本地资料库：${escHtml(consultArchivePath)}</div>` : ''}`;
+    ${consultCaptureStatusHtml(consultCaptureJob)}`;
   consultRenderWorkflowModules(stats);
 }
 
@@ -1305,7 +1300,7 @@ function consultRenderAssetPreview(data) {
   const body = isBlockedReader
     ? blockedBody
     : data?.preview_mode === 'pdf' && fileUrl
-    ? `<iframe class="consult-asset-frame" src="${escHtml(fileUrl)}#view=FitH"></iframe>`
+    ? `<iframe class="consult-asset-frame" src="${escHtml(safeUrl(fileUrl))}#view=FitH"></iframe>`
     : `<div class="consult-reader-layout">${outlineHtml}<div class="consult-document-paper">${consultPreviewTextHtml(data?.text || '')}</div></div>`;
   const openLink = asset.url ? `<a class="consult-preview-link" href="${escHtml(safeExternalUrl(asset.url))}" target="_blank" rel="noopener noreferrer">打开网页</a>` : '';
   const downloadLink = downloadUrl ? `<a class="consult-preview-link" href="${escHtml(safeUrl(downloadUrl))}" target="_blank" rel="noopener">下载原件</a>` : '';
@@ -1400,7 +1395,6 @@ async function consultCreateSession() {
     consultLastMeta = null;
     consultAssets = [];
     consultAssetFailures = [];
-    consultArchivePath = '';
     consultCaptureJob = null;
     consultCurrentPreview = null;
     consultEvidenceFilter = 'all';
@@ -1450,7 +1444,6 @@ async function consultSearchSources() {
     consultSelectedEvidence = consultDefaultEvidenceSelection(consultEvidence);
     consultCurrentAnswer = null;
     consultAssets = data.meta?.assets || consultAssets;
-    consultArchivePath = data.meta?.source_archive_path || consultArchivePath;
     consultSetCapability(data);
     consultRenderPlan();
     consultRenderEvidence(data.meta || {});
@@ -1481,7 +1474,6 @@ async function consultRefreshSessionBundle(render = true) {
   const assetResp = await apiFetch(`/api/consult/sessions/${encodeURIComponent(consultCurrentSession.session_id)}/assets`, {}, {toast: false});
   const assetData = await assetResp.json();
   consultAssets = assetData.assets || consultAssets;
-  consultArchivePath = assetData.source_archive_path || consultArchivePath;
   consultLastMeta = {
     ...(consultLastMeta || {}),
     archived_count: assetData.archived_count || 0,
@@ -1493,7 +1485,6 @@ async function consultRefreshSessionBundle(render = true) {
     diagnosis_cards: assetData.diagnosis_cards || [],
     archive_shortfall: assetData.archive_shortfall || 0,
     target_source_count: consultCurrentSession.target_source_count,
-    source_archive_path: assetData.source_archive_path || '',
   };
   const ready = consultEvidence.filter(consultIsHandoffReady);
   consultSelectedEvidence = new Set((ready.length ? ready : consultEvidence.filter(consultCanExtract)).map(ev => ev.evidence_id));
@@ -1682,7 +1673,6 @@ async function consultExtractEvidenceIds(ids, opts = {}) {
     consultMergeEvidence(data.evidence || []);
     consultAssets = data.all_assets || data.assets || consultAssets;
     consultAssetFailures = data.failures || [];
-    consultArchivePath = data.meta?.source_archive_path || consultArchivePath;
     const focusRows = [...(data.evidence || []), ...(data.resolved_evidence || [])];
     consultSelectedEvidence = new Set((focusRows.length ? focusRows : consultEvidence).map(ev => ev.evidence_id));
     consultRenderEvidence({
@@ -1739,13 +1729,11 @@ async function consultOpenLocalArchive() {
     const resp = await apiFetch(`/api/consult/sessions/${encodeURIComponent(consultCurrentSession.session_id)}/assets`, {}, {toast: false});
     const data = await resp.json();
     consultAssets = data.assets || [];
-    consultArchivePath = data.source_archive_path || consultArchivePath;
     consultRenderOpsBoard();
-    const text = consultArchivePath || '暂无本地资料库路径';
-    if (navigator.clipboard && text) await navigator.clipboard.writeText(text);
-    showToast(`本地资料库路径已复制：${text}`);
+    consultRenderEvidence(consultLastMeta || data);
+    showToast(`资料清单已刷新：${consultAssets.length} 项；可在列表中预览或受控下载`);
   } catch(e) {
-    showToast('读取本地资料库失败：' + e.message);
+    showToast('刷新资料清单失败：' + e.message);
   }
 }
 

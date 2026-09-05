@@ -456,3 +456,307 @@
   border-radius:3px;padding:1px 5px;font-family:'Courier New',monospace;
   font-size:10px;color:var(--text-2);margin:0 1px}
 
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k2-chain-upgrade.css §2 证据库+抓取 Agent(ai 屏)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════
+   §2 证据库 + 报告源抓取 Agent(ai):布局补缺 + 双工作台重组
+   现状缺口(实测):.wb-stepper / .consult-stage / .consult-project-rail /
+   .consult-project-list / .consult-filter-tabs / .consult-mini-module /
+   .consult-capture-cockpit / .consult-asset-preview / .consult-workflow-strip
+   在全站 CSS 中无任何定义,仅靠 workbench-editorial 的 [class*=] 兜底,
+   项目栏整栏塌缩为通宽块。本节补齐布局并统一层级。
+   ═══════════════════════════════════════════════════════════ */
+
+/* 证据库(V9):压缩为页内一级分区,不再撑满首屏 */
+#tab-content-ai .v9-evidence-shelf > header { padding: 16px 24px !important; }
+#tab-content-ai .v9-evidence-shelf h1 { font: 600 22px/1.2 var(--sans) !important; margin: 4px 0 !important; }
+#tab-content-ai .v9-evidence-shelf .v9-kicker { font-size: 11px !important; letter-spacing: 2px !important; }
+#tab-content-ai .v9-evidence-shelf p { font-size: 12px !important; }
+#tab-content-ai .v9-evidence-search input { padding: 8px 12px; font-size: 13px; min-height: 40px; }
+#tab-content-ai .v9-evidence-card { padding: 14px 16px; }
+#tab-content-ai .v9-evidence-card h2 { font: 600 15px/1.45 var(--sans) !important; margin: 8px 0 6px !important; }
+#tab-content-ai .v9-evidence-card p { font-size: 12px !important; }
+#tab-content-ai .v9-evidence-card footer a { color: var(--info); }
+
+/* ai-zone:与壳层栅格对齐,去掉自体额外留白 */
+#tab-content-ai .ai-zone { padding: 12px 24px 80px; }
+
+/* 配置栏:降为页内工具行(此前是通栏大卡) */
+#tab-content-ai .ai-config-bar {
+  padding: 10px 16px; margin-bottom: 12px;
+  background: var(--panel) !important; border: 1px solid var(--line2) !important;
+}
+#tab-content-ai .ai-config-left h2 { font-size: 16px !important; font-weight: 600; }
+#tab-content-ai .ai-config-sub { font-size: 12px; }
+#tab-content-ai .ai-logo {
+  width: 32px; height: 32px; font-size: 13px;
+  background: var(--accentsoft) !important; color: var(--accent) !important;
+  border: 1px solid var(--line2) !important;
+}
+#tab-content-ai .ai-config-btn { min-height: 40px; font-size: 12px !important; }
+
+/* 设置面板:与配置栏同宽对齐,预设卡 active 用主蓝双编码 */
+#tab-content-ai .ai-settings-panel { padding: 16px; margin-bottom: 12px; }
+#tab-content-ai .ai-preset-btn { min-height: 40px; text-align: left; }
+#tab-content-ai .ai-preset-btn.active {
+  border-color: var(--accent) !important; background: var(--accentsoft) !important;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+#tab-content-ai .ai-preset-btn.active::after { color: var(--accent); }
+#tab-content-ai .ai-preset-tier.flagship { background: var(--accent); color: var(--on-accent); }
+#tab-content-ai .ai-preset-tier.hub { background: var(--info); color: var(--on-accent); }
+#tab-content-ai .ai-preset-tier.local { background: var(--success); color: var(--on-accent); }
+#tab-content-ai .ai-save-btn, #tab-content-ai .ai-test-btn { min-height: 40px; font-size: 13px; }
+
+/* ── 抓取工作台:项目栏(左 264px)+ 任务/证据池(中)+ 交付复核(下通栏)── */
+#tab-content-ai .consult-stage {
+  display: grid; grid-template-columns: 264px minmax(0, 1fr);
+  gap: 12px; align-items: start;
+}
+/* (.consult-workbench 规则移至 workbench-editorial.css 末,见该文件 K4 区块) */
+#tab-content-ai .consult-output { grid-column: 1 / -1; }
+
+/* 项目栏 */
+#tab-content-ai .consult-project-rail { padding: 12px; min-height: 0; }
+#tab-content-ai .consult-project-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+  padding-bottom: 10px; border-bottom: 1px solid var(--line2); margin-bottom: 8px;
+}
+#tab-content-ai .consult-project-head h3 { font-size: 14px; color: var(--ink1); margin: 0; }
+#tab-content-ai .consult-project-head span { display: block; margin-top: 4px; font-size: 11px; color: var(--ink3); }
+#tab-content-ai .consult-project-head b {
+  font-family: var(--mono); font-size: 16px; color: var(--accent); font-weight: 600;
+}
+#tab-content-ai .consult-project-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+#tab-content-ai .consult-project-actions .consult-secondary { flex: 1; min-height: 32px; }
+#tab-content-ai .consult-project-list {
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: 560px; overflow-y: auto;
+}
+#tab-content-ai .consult-project-item {
+  display: block; width: 100%; text-align: left;
+  background: var(--card); border: 1px solid var(--line);
+  padding: 10px 12px; cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+#tab-content-ai .consult-project-item:hover { border-color: var(--ink3); background: var(--cardh); }
+#tab-content-ai .consult-project-item.active {
+  border-color: var(--accent); box-shadow: inset 2px 0 0 var(--accent);
+}
+#tab-content-ai .consult-project-item .consult-project-status {
+  display: inline-block; margin-bottom: 6px; padding: 1px 8px;
+  font-size: 10px; font-family: var(--mono); letter-spacing: 1px;
+  color: var(--info); border: 1px solid var(--line2); background: var(--panel);
+}
+#tab-content-ai .consult-project-item.active .consult-project-status {
+  color: var(--accent); border-color: var(--accent);
+}
+#tab-content-ai .consult-project-item strong {
+  display: block; font-size: 13px; color: var(--ink1); line-height: 1.4;
+}
+#tab-content-ai .consult-project-item small {
+  display: block; margin-top: 6px; font-size: 11px; color: var(--ink3); line-height: 1.5;
+}
+
+/* 任务面板(mission):标签与控件统一 ink/线色,主操作蓝字深底 */
+#tab-content-ai .consult-panel-head h3 { font-size: 14px; white-space: nowrap; }
+#tab-content-ai .consult-badge, #tab-content-ai .consult-muted { font-size: 12px; }
+#tab-content-ai .consult-capability { background: var(--panel); border-color: var(--line2); }
+#tab-content-ai .consult-capability strong { color: var(--ink1); font-size: 12px; }
+#tab-content-ai .consult-capability span { color: var(--ink2); font-size: 12px; line-height: 1.6; }
+#tab-content-ai .consult-search-config { background: var(--panel); border-color: var(--line); }
+#tab-content-ai .consult-label { color: var(--ink2); font-size: 12px; font-weight: 600; }
+#tab-content-ai .consult-provider-chip.on { color: var(--success); border-color: rgba(97,181,138,.4); background: rgba(97,181,138,.1); }
+#tab-content-ai .consult-provider-chip.off { color: var(--ink2); border-color: var(--line); background: var(--panel); }
+#tab-content-ai .consult-advanced-config summary { color: var(--ink3); font-size: 12px; }
+#tab-content-ai .consult-advanced-config summary:hover,
+#tab-content-ai .consult-advanced-config[open] summary { color: var(--info); }
+#tab-content-ai .consult-primary { color: var(--on-accent) !important; font-weight: 700; min-height: 40px; }
+#tab-content-ai .consult-secondary { color: var(--ink2) !important; min-height: 32px; }
+#tab-content-ai .consult-secondary:hover {
+  color: var(--ink1) !important; border-color: var(--ink3) !important; background: var(--cardh) !important;
+}
+#tab-content-ai .consult-plan { background: var(--panel); }
+#tab-content-ai .consult-plan-row strong { color: var(--info); }
+#tab-content-ai .consult-chip { color: var(--ink2); background: var(--panel); border-color: var(--line2); }
+
+/* 证据池:状态/渠道/评分 chip token 化,抓取失败「颜色+文字」 */
+#tab-content-ai .consult-evidence-card { background: var(--card); }
+#tab-content-ai .consult-evidence-card.selected {
+  border-color: var(--accent) !important; background: var(--accentsoft) !important;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+#tab-content-ai .consult-evidence-check { accent-color: var(--accent); }
+#tab-content-ai .consult-channel { color: var(--info); background: rgba(69,180,206,.1); border-color: rgba(69,180,206,.3); }
+#tab-content-ai .consult-score { color: var(--success); background: rgba(97,181,138,.1); border-color: rgba(97,181,138,.3); }
+#tab-content-ai .consult-provider, #tab-content-ai .consult-doc-type {
+  color: var(--ink2); background: var(--panel); border-color: var(--line2);
+}
+#tab-content-ai .consult-fetch-state { color: var(--ink3); background: var(--panel); border-color: var(--line); }
+#tab-content-ai .consult-fetch-state.done { color: var(--success); background: rgba(97,181,138,.1); border-color: rgba(97,181,138,.3); }
+#tab-content-ai .consult-fetch-state.partial,
+#tab-content-ai .consult-fetch-state.need { color: var(--warning); background: rgba(215,164,71,.1); border-color: rgba(215,164,71,.3); }
+#tab-content-ai .consult-fetch-state.fail { color: var(--danger); background: rgba(222,93,93,.1); border-color: rgba(222,93,93,.35); }
+#tab-content-ai .consult-source { color: var(--info); }
+#tab-content-ai .consult-evidence-failure { color: var(--danger); border-left-color: var(--danger); }
+#tab-content-ai .consult-evidence-query { border-left-color: var(--line2); color: var(--ink3); }
+#tab-content-ai .consult-evidence-link { color: var(--accent); border-bottom-color: var(--accent); }
+#tab-content-ai .consult-evidence-title { font-size: 13px; }
+#tab-content-ai .consult-evidence-snippet { font-size: 12px; }
+
+/* 证据过滤 tabs(JS 生成 .consult-filter-btn):补齐缺失样式 */
+#tab-content-ai .consult-filter-tabs {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+}
+#tab-content-ai .consult-filter-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-height: 32px; padding: 0 10px;
+  background: var(--panel); border: 1px solid var(--line2);
+  color: var(--ink2); font-size: 12px; cursor: pointer;
+}
+#tab-content-ai .consult-filter-btn b { font-family: var(--mono); font-size: 11px; color: var(--ink3); font-weight: 500; }
+#tab-content-ai .consult-filter-btn:hover:not(.disabled) { color: var(--ink1); border-color: var(--ink3); }
+#tab-content-ai .consult-filter-btn.active {
+  color: var(--accent); border-color: var(--accent); background: var(--accentsoft);
+}
+#tab-content-ai .consult-filter-btn.active b { color: var(--accent); }
+#tab-content-ai .consult-filter-btn.disabled { opacity: .45; cursor: not-allowed; }
+
+/* 抓取座舱(#consultCaptureCockpit,JS 生成):补齐缺失样式 */
+#tab-content-ai .consult-capture-cockpit { margin-top: 12px; }
+#tab-content-ai .consult-cockpit-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--line2); margin-bottom: 8px;
+  font-size: 12px; color: var(--ink2);
+}
+#tab-content-ai .consult-cockpit-module {
+  background: var(--panel); border: 1px solid var(--line);
+  padding: 10px 12px; margin-bottom: 8px;
+}
+#tab-content-ai .consult-cockpit-title {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; margin-bottom: 8px;
+}
+#tab-content-ai .consult-cockpit-title b { color: var(--ink1); font-weight: 600; }
+#tab-content-ai .consult-cockpit-title em {
+  font-style: normal; font-family: var(--mono); font-size: 11px; color: var(--info);
+}
+#tab-content-ai .consult-cockpit-query {
+  font-size: 12px; color: var(--ink2); line-height: 1.5;
+  padding: 6px 8px; border-left: 2px solid var(--line2); margin-bottom: 6px;
+  word-break: break-word;
+}
+#tab-content-ai .consult-cockpit-query.active { border-left-color: var(--accent); color: var(--ink1); }
+#tab-content-ai .consult-cockpit-empty, #tab-content-ai .consult-cockpit-rules {
+  font-size: 12px; color: var(--ink3); line-height: 1.6;
+}
+
+/* 交付与复核(output):ops 板/小模块/阅读窗补齐并 token 化 */
+#tab-content-ai .consult-ops-board { background: var(--panel); border-color: var(--line2); }
+#tab-content-ai .consult-ops-kicker { color: var(--ink3); }
+#tab-content-ai .consult-ops-title { color: var(--ink1); font-size: 15px; }
+#tab-content-ai .consult-ops-sub { color: var(--ink3); }
+#tab-content-ai .consult-ops-state { color: var(--success); border-color: rgba(97,181,138,.35); background: rgba(97,181,138,.08); }
+#tab-content-ai .consult-ops-state.warn { color: var(--warning); border-color: rgba(215,164,71,.35); background: rgba(215,164,71,.08); }
+#tab-content-ai .consult-ops-state.idle { color: var(--ink3); border-color: var(--line2); background: var(--panel); }
+#tab-content-ai .consult-ops-progress { background: var(--line); }
+#tab-content-ai .consult-ops-grid { border-bottom-color: var(--line); }
+#tab-content-ai .consult-metric { border-right-color: var(--line); }
+#tab-content-ai .consult-metric b { color: var(--ink1); font-size: 20px; }
+#tab-content-ai .consult-metric span { color: var(--ink3); }
+#tab-content-ai .consult-checklist, #tab-content-ai .consult-nextbox { border-right-color: var(--line); }
+#tab-content-ai .consult-ops-section-title { color: var(--ink2); font-size: 12px; }
+#tab-content-ai .consult-check-row { color: var(--ink2); border-bottom-color: var(--line); }
+#tab-content-ai .consult-check-status.ok { color: var(--success); background: rgba(97,181,138,.1); border-color: rgba(97,181,138,.3); }
+#tab-content-ai .consult-check-status.wait { color: var(--warning); background: rgba(215,164,71,.1); border-color: rgba(215,164,71,.3); }
+#tab-content-ai .consult-next-item { color: var(--ink2); }
+#tab-content-ai .consult-next-num { background: var(--accentsoft); border-color: var(--line2); color: var(--accent); }
+#tab-content-ai .consult-source-pill { color: var(--ink2); background: var(--panel); border-color: var(--line2); }
+#tab-content-ai .consult-source-pill.warn { color: var(--warning); background: rgba(215,164,71,.1); border-color: rgba(215,164,71,.3); }
+#tab-content-ai .consult-source-pill.danger { color: var(--danger); background: rgba(222,93,93,.1); border-color: rgba(222,93,93,.3); }
+#tab-content-ai .consult-capture-status { background: var(--panel); border-color: var(--line); }
+#tab-content-ai .consult-capture-top strong { color: var(--ink1); }
+#tab-content-ai .consult-capture-top span { color: var(--info); border-color: var(--line2); background: var(--card); }
+#tab-content-ai .consult-capture-grid b { border-color: var(--line); background: var(--card); color: var(--ink1); }
+#tab-content-ai .consult-capture-grid em { color: var(--ink3); }
+#tab-content-ai .consult-capture-query, #tab-content-ai .consult-capture-stop { color: var(--ink3); }
+#tab-content-ai .consult-capture-stop { color: var(--warning); }
+#tab-content-ai .consult-archive-path { background: var(--panel); border-color: var(--line); color: var(--ink3); }
+#tab-content-ai .consult-preview-head { color: var(--ink2); font-size: 13px; }
+#tab-content-ai .consult-preview-head small { color: var(--ink2); }
+#tab-content-ai .consult-report-body { background: var(--card); font-size: 14px; }
+#tab-content-ai .consult-report-body h1 { color: var(--ink1); font-size: 18px; }
+#tab-content-ai .consult-report-body h2 { color: var(--ink1); font-size: 15px; }
+#tab-content-ai .consult-report-body h3 { color: var(--ink2); font-size: 14px; }
+#tab-content-ai .consult-empty { font-size: 13px; }
+#tab-content-ai .consult-empty-strong { border-color: var(--line2); background: var(--panel); }
+#tab-content-ai .consult-empty-strong b { color: var(--ink1); }
+
+/* 工作流小模块(交接清单/缺口建议/阅读队列,JS 生成):补齐缺失样式 */
+#tab-content-ai .consult-workflow-strip {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px;
+}
+#tab-content-ai .consult-mini-module {
+  background: var(--panel); border: 1px solid var(--line);
+  padding: 10px 12px; min-width: 0;
+}
+#tab-content-ai .consult-mini-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--line); margin-bottom: 8px;
+}
+#tab-content-ai .consult-mini-head h4 { margin: 0; font-size: 12px; color: var(--ink1); font-weight: 600; }
+#tab-content-ai .consult-mini-head span { font-family: var(--mono); font-size: 11px; color: var(--info); }
+#tab-content-ai .consult-mini-empty { font-size: 12px; color: var(--ink3); line-height: 1.6; }
+#tab-content-ai .consult-mini-note { margin-top: 8px; font-size: 11px; color: var(--ink2); }
+#tab-content-ai .consult-gap-queries { display: flex; flex-direction: column; gap: 6px; }
+#tab-content-ai .consult-reading-queue { margin-top: 12px; }
+
+/* 资料阅读窗(#consultAssetPreview,JS 生成):补齐缺失样式 */
+#tab-content-ai .consult-asset-preview {
+  margin-top: 12px; background: var(--panel); border: 1px solid var(--line2); min-width: 0;
+}
+#tab-content-ai .consult-asset-preview.is-empty { border-style: dashed; }
+#tab-content-ai .consult-asset-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 24px 16px; text-align: center;
+}
+#tab-content-ai .consult-asset-empty strong { font-size: 13px; color: var(--ink1); }
+#tab-content-ai .consult-asset-empty span { font-size: 12px; color: var(--ink3); line-height: 1.6; max-width: 560px; }
+#tab-content-ai .consult-asset-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap;
+}
+#tab-content-ai .consult-asset-kicker {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 2px; color: var(--ink3);
+}
+#tab-content-ai .consult-asset-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+#tab-content-ai .consult-asset-body { padding: 12px; font-size: 13px; color: var(--ink2); line-height: 1.7; }
+#tab-content-ai .consult-asset-frame { width: 100%; min-height: 480px; border: none; background: var(--card); }
+
+/* AI 结果面板/QA/历史:主蓝字深底,危险仅 hover 关闭 */
+#tab-content-ai .ai-qa-send, #tab-content-ai .ai-go-btn { color: var(--on-accent) !important; font-weight: 700; }
+#tab-content-ai .ai-copy-btn:hover { border-color: var(--info) !important; color: var(--info) !important; }
+#tab-content-ai .ai-close-btn:hover { border-color: var(--danger) !important; color: var(--danger) !important; }
+#tab-content-ai .ai-cancel-btn:hover, #tab-content-ai .ai-clear-history:hover {
+  border-color: var(--danger) !important; color: var(--danger) !important;
+}
+#tab-content-ai .ai-model-badge { background: var(--accentsoft); color: var(--accent); }
+#tab-content-ai .ai-result-body strong { color: var(--ink1); }
+#tab-content-ai .ai-result-body blockquote { border-left-color: var(--accent); }
+#tab-content-ai .ai-spinner { border-top-color: var(--accent); }
+
+/* ai 屏响应式:≤1180 项目栏上置为通栏,≤820 全单列(与 ai.css 断点对齐) */
+@media (max-width: 1180px) {
+  #tab-content-ai .consult-stage { grid-template-columns: 1fr; }
+  #tab-content-ai .consult-project-list { max-height: 260px; }
+}
+@media (max-width: 920px) {
+  #tab-content-ai .consult-workflow-strip { grid-template-columns: 1fr; }
+}
+@media (max-width: 820px) {
+  #tab-content-ai .ai-zone { padding: 12px 12px 60px; }
+  #tab-content-ai .consult-workbench { grid-template-columns: 1fr !important; }
+  #tab-content-ai .wb-stepper, #tab-content-agent .wb-stepper { padding: 8px 12px 0; flex-wrap: wrap; }
+  #tab-content-ai .wb-step-aux, #tab-content-agent .wb-step-aux { margin-left: 0; }
+}

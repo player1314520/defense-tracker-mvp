@@ -365,3 +365,19 @@ kbd{background:var(--bg-card);border:1px solid var(--border);border-radius:3px;p
   opacity:0;transform:translateX(20px);transition:all .35s ease;pointer-events:none}
 .toast-item.show{opacity:1;transform:translateX(0)}
 
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k1-shell-upgrade.css §6 Toast(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §6 Toast:收敛为二级表面卡片,左边条表意,不遮挡主操作区 ── */
+.toast-wrap { bottom: 24px; right: 24px; gap: 8px; }
+.toast-item {
+  background: var(--card);
+  border: 1px solid var(--line2);
+  border-left: 3px solid var(--info);
+  border-radius: 0;
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--ink1);
+  max-width: 320px;
+  line-height: 1.5;
+}

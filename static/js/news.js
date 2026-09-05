@@ -31,6 +31,22 @@ function udSync(path, body) {
   } catch (e) { /* noop */ }
 }
 
+// briefResults 使用乐观并发；bootstrap 是 revision/schema 的唯一启动来源。
+window.__USERDATA_REVISION__ = Number.isInteger(window.__USERDATA_REVISION__)
+  ? window.__USERDATA_REVISION__ : null;
+window.__USERDATA_SCHEMA_VERSION__ = Number.isInteger(window.__USERDATA_SCHEMA_VERSION__)
+  ? window.__USERDATA_SCHEMA_VERSION__ : 0;
+
+function userdataApplyMeta(state) {
+  if (!state || typeof state !== 'object') return;
+  const revision = Number(state.revision);
+  const schemaVersion = Number(state.schema_version);
+  if (Number.isInteger(revision) && revision >= 0) window.__USERDATA_REVISION__ = revision;
+  if (Number.isInteger(schemaVersion) && schemaVersion >= 0) {
+    window.__USERDATA_SCHEMA_VERSION__ = schemaVersion;
+  }
+}
+
 // ══════════════════════════════════════════════════════════
 // 🔖 书签系统（localStorage 缓存 + 服务端同步）
 // ══════════════════════════════════════════════════════════
@@ -223,26 +239,39 @@ document.addEventListener('keydown', e => {
 // ══════════════════════════════════════════════════════════
 let allNews = [], currentFilter = 'all', currentSort = 'priority', activeTagFilter = null, minStarFilter = 0;
 
-// ── ☁ 启动合并：拉服务端全量 → 一次性迁移本地存量 → 并集 → 刷 UI ──
+// ── ☁ 启动合并：bootstrap → 按服务端 schema 迁移 → 并集 → 刷 UI ──
 async function userdataBoot() {
   let d = null;
   try {
-    const r = await fetch('/api/userdata/all', { credentials: 'same-origin' });
+    const r = await fetch('/api/userdata/bootstrap', { credentials: 'same-origin' });
     if (!r.ok) return;
     d = await r.json();
+    userdataApplyMeta(d);
   } catch (e) { return; }  // 服务端不可达：保持纯 localStorage 模式
 
-  // 一次性迁移：把升级前攒在 localStorage 的存量推上去（幂等，标记防重复）
-  if (!localStorage.getItem('defense_ud_migrated')) {
-    udSync('/api/userdata/migrate', {
-      bookmarks: [...bookmarks].map(link => {
-        const a = (typeof allNews !== 'undefined' && allNews.find(x => x.link === link)) || {};
-        return { link, title: a.title || '', source: a.source_cn || a.source || '', date: a.date || '' };
-      }),
-      read: [...readSet],
-      alerts: [...alertKeywords],
-    });
-    localStorage.setItem('defense_ud_migrated', '1');
+  // 迁移标记跟随服务器 schema；只有迁移请求成功才推进，失败时下次启动重试。
+  const markerKey = 'defense_ud_schema_version';
+  const localSchemaVersion = Number.parseInt(localStorage.getItem(markerKey) || '0', 10) || 0;
+  const serverSchemaVersion = window.__USERDATA_SCHEMA_VERSION__;
+  if (localSchemaVersion < serverSchemaVersion) {
+    try {
+      const migration = await fetch('/api/userdata/migrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          bookmarks: [...bookmarks].map(link => {
+            const a = (typeof allNews !== 'undefined' && allNews.find(x => x.link === link)) || {};
+            return { link, title: a.title || '', source: a.source_cn || a.source || '', date: a.date || '' };
+          }),
+          read: [...readSet],
+          alerts: [...alertKeywords],
+        }),
+      });
+      if (migration.ok) localStorage.setItem(markerKey, String(serverSchemaVersion));
+    } catch (e) {
+      console.warn('[userdata migrate]', e.message);
+    }
   }
 
   // 并集合并（跨设备各自的增量都保留）

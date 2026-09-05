@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from .crypto import RecordEnvelope
+from .errors import VersionConflict
 
 
 RECORD_TYPES = {
@@ -41,14 +42,31 @@ def _dict(row: sqlite3.Row | None) -> dict | None:
 
 
 class V9Repository:
-    def __init__(self, database_path: Path):
+    def __init__(
+        self,
+        database_path: Path,
+        *,
+        initialize: bool = True,
+        read_only: bool = False,
+    ):
         self.database_path = Path(database_path)
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
+        if not self.read_only:
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._init_schema()
+        if initialize:
+            if self.read_only:
+                raise ValueError("read-only repository cannot initialize schema")
+            self._init_schema()
+        elif not self.database_path.is_file():
+            raise FileNotFoundError(self.database_path)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.database_path, timeout=15)
+        if self.read_only:
+            uri = f"file:{self.database_path.resolve().as_posix()}?mode=ro"
+            conn = sqlite3.connect(uri, timeout=15, uri=True)
+        else:
+            conn = sqlite3.connect(self.database_path, timeout=15)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
@@ -625,6 +643,54 @@ class V9Repository:
         version_id: str | None = None,
         base_version_id: str | None = None,
     ) -> None:
+        with self._lock, self._connect() as conn:
+            self._put_record(
+                conn,
+                envelope,
+                device_id,
+                deleted=deleted,
+                enqueue=enqueue,
+                version_id=version_id,
+                base_version_id=base_version_id,
+            )
+
+    def put_records_atomically(self, entries: Iterable[Mapping]) -> None:
+        """Commit workflow records and their outbox events as one transaction."""
+        entries = list(entries)
+        if not entries:
+            return
+        with self._lock, self._connect() as conn:
+            for entry in entries:
+                envelope = entry.get("envelope")
+                if not isinstance(envelope, RecordEnvelope):
+                    raise TypeError("atomic record envelope is required")
+                self._put_record(
+                    conn,
+                    envelope,
+                    str(entry.get("device_id") or ""),
+                    deleted=bool(entry.get("deleted", False)),
+                    enqueue=bool(entry.get("enqueue", True)),
+                    version_id=entry.get("version_id"),
+                    base_version_id=entry.get("base_version_id"),
+                    expected_current_version=entry.get(
+                        "expected_current_version"
+                    ),
+                    require_outbox=bool(entry.get("enqueue", True)),
+                )
+
+    def _put_record(
+        self,
+        conn: sqlite3.Connection,
+        envelope: RecordEnvelope,
+        device_id: str,
+        *,
+        deleted: bool = False,
+        enqueue: bool = True,
+        version_id: str | None = None,
+        base_version_id: str | None = None,
+        expected_current_version: int | None = None,
+        require_outbox: bool = False,
+    ) -> None:
         version_id = str(version_id or uuid.uuid4())
         if not self._is_uuid(version_id):
             raise ValueError("version_id must be a UUID")
@@ -635,105 +701,115 @@ class V9Repository:
             "version_id": version_id,
             "base_version_id": base_version_id,
         }
-        with self._lock, self._connect() as conn:
-            if enqueue:
-                active_snapshot = conn.execute(
-                    """
-                    SELECT 1 FROM initial_snapshot_sessions
-                    WHERE organization_id=? AND state='active'
-                    """,
-                    (envelope.org_id,),
-                ).fetchone()
-                if active_snapshot is not None:
-                    raise ValueError(
-                        "record writes are frozen during initial snapshot import"
-                    )
-                blocked = conn.execute(
-                    """
-                    SELECT 1 FROM sync_blocks
-                    WHERE organization_id=? AND record_id=?
-                      AND resolved_at IS NULL
-                    """,
-                    (envelope.org_id, envelope.record_id),
-                ).fetchone()
-                if blocked is not None:
-                    raise ValueError(
-                        "record sync is blocked pending conflict resolution"
-                    )
-            current = conn.execute(
-                "SELECT cloud_version_id FROM encrypted_records WHERE record_id=?",
-                (envelope.record_id,),
-            ).fetchone()
-            if enqueue and base_version_id is None and current is not None:
-                snapshot = conn.execute(
-                    """
-                    SELECT cloud_version_id FROM initial_snapshot_map
-                    WHERE organization_id=? AND record_id=? AND state='queued'
-                    """,
-                    (envelope.org_id, envelope.record_id),
-                ).fetchone()
-                payload["base_version_id"] = (
-                    snapshot["cloud_version_id"]
-                    if snapshot is not None
-                    else current["cloud_version_id"]
-                )
-            conn.execute(
+        if enqueue:
+            active_snapshot = conn.execute(
                 """
-                INSERT INTO encrypted_records(
-                    record_id,organization_id,record_type,version,
-                    cloud_version_id,device_id,
-                    ciphertext,nonce,wrapped_data_key,wrap_nonce,key_version,
-                    content_hash,updated_at,deleted
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(record_id) DO UPDATE SET
-                    organization_id=excluded.organization_id,
-                    record_type=excluded.record_type,
-                    version=excluded.version,
-                    cloud_version_id=excluded.cloud_version_id,
-                    device_id=excluded.device_id,
-                    ciphertext=excluded.ciphertext,
-                    nonce=excluded.nonce,
-                    wrapped_data_key=excluded.wrapped_data_key,
-                    wrap_nonce=excluded.wrap_nonce,
-                    key_version=excluded.key_version,
-                    content_hash=excluded.content_hash,
-                    updated_at=excluded.updated_at,
-                    deleted=excluded.deleted
+                SELECT 1 FROM initial_snapshot_sessions
+                WHERE organization_id=? AND state='active'
+                """,
+                (envelope.org_id,),
+            ).fetchone()
+            if active_snapshot is not None:
+                raise ValueError(
+                    "record writes are frozen during initial snapshot import"
+                )
+            blocked = conn.execute(
+                """
+                SELECT 1 FROM sync_blocks
+                WHERE organization_id=? AND record_id=?
+                  AND resolved_at IS NULL
+                """,
+                (envelope.org_id, envelope.record_id),
+            ).fetchone()
+            if blocked is not None:
+                raise ValueError(
+                    "record sync is blocked pending conflict resolution"
+                )
+        current = conn.execute(
+            """
+            SELECT version,cloud_version_id FROM encrypted_records
+            WHERE record_id=?
+            """,
+            (envelope.record_id,),
+        ).fetchone()
+        if expected_current_version is not None:
+            actual_version = int(current["version"]) if current else 0
+            if actual_version != int(expected_current_version):
+                raise VersionConflict(
+                    f"expected {expected_current_version}, current {actual_version}"
+                )
+        if enqueue and base_version_id is None and current is not None:
+            snapshot = conn.execute(
+                """
+                SELECT cloud_version_id FROM initial_snapshot_map
+                WHERE organization_id=? AND record_id=? AND state='queued'
+                """,
+                (envelope.org_id, envelope.record_id),
+            ).fetchone()
+            payload["base_version_id"] = (
+                snapshot["cloud_version_id"]
+                if snapshot is not None
+                else current["cloud_version_id"]
+            )
+        conn.execute(
+            """
+            INSERT INTO encrypted_records(
+                record_id,organization_id,record_type,version,
+                cloud_version_id,device_id,
+                ciphertext,nonce,wrapped_data_key,wrap_nonce,key_version,
+                content_hash,updated_at,deleted
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(record_id) DO UPDATE SET
+                organization_id=excluded.organization_id,
+                record_type=excluded.record_type,
+                version=excluded.version,
+                cloud_version_id=excluded.cloud_version_id,
+                device_id=excluded.device_id,
+                ciphertext=excluded.ciphertext,
+                nonce=excluded.nonce,
+                wrapped_data_key=excluded.wrapped_data_key,
+                wrap_nonce=excluded.wrap_nonce,
+                key_version=excluded.key_version,
+                content_hash=excluded.content_hash,
+                updated_at=excluded.updated_at,
+                deleted=excluded.deleted
+            """,
+            (
+                envelope.record_id,
+                envelope.org_id,
+                envelope.record_type,
+                envelope.version,
+                version_id,
+                device_id,
+                envelope.ciphertext,
+                envelope.nonce,
+                envelope.wrapped_data_key,
+                envelope.wrap_nonce,
+                envelope.key_version,
+                envelope.content_hash,
+                payload["updated_at"],
+                int(deleted),
+            ),
+        )
+        if enqueue:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO sync_outbox(
+                    event_id,organization_id,record_id,operation,payload_json,
+                    attempts,state,created_at
+                ) VALUES(?,?,?,?,?,0,'pending',?)
                 """,
                 (
-                    envelope.record_id,
+                    str(uuid.uuid4()),
                     envelope.org_id,
-                    envelope.record_type,
-                    envelope.version,
-                    version_id,
-                    device_id,
-                    envelope.ciphertext,
-                    envelope.nonce,
-                    envelope.wrapped_data_key,
-                    envelope.wrap_nonce,
-                    envelope.key_version,
-                    envelope.content_hash,
-                    payload["updated_at"],
-                    int(deleted),
+                    envelope.record_id,
+                    "delete" if deleted else "upsert",
+                    json.dumps(payload, sort_keys=True),
+                    _now(),
                 ),
             )
-            if enqueue:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO sync_outbox(
-                        event_id,organization_id,record_id,operation,payload_json,
-                        attempts,state,created_at
-                    ) VALUES(?,?,?,?,?,0,'pending',?)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        envelope.org_id,
-                        envelope.record_id,
-                        "delete" if deleted else "upsert",
-                        json.dumps(payload, sort_keys=True),
-                        _now(),
-                    ),
-                )
+            if require_outbox and cursor.rowcount != 1:
+                raise RuntimeError("required sync outbox event was not inserted")
 
     def get_record(self, record_id: str) -> dict | None:
         with self._connect() as conn:

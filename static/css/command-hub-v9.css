@@ -1,18 +1,21 @@
 /* Defense Command Hub · V9
-   Screenshot-led recovery: editorial command-room shell, no external assets. */
+   Screenshot-led recovery: editorial command-room shell, no external assets.
+   K1(2026-08-30):--v9-* 全部映射到 tokens.css 石墨色板,本文件不再自成色板。 */
 :root {
-  --v9-bg: #0d0c0a;
-  --v9-panel: #13110e;
-  --v9-panel-2: #17140f;
-  --v9-line: rgba(232, 222, 203, .12);
-  --v9-line-strong: rgba(232, 222, 203, .22);
-  --v9-ink: #eee7d9;
-  --v9-muted: #998f7e;
-  --v9-faint: #625b4f;
-  --v9-red: #e34a31;
-  --v9-gold: #c49a4c;
-  --v9-green: #55a87a;
-  --v9-cyan: #43b6d8;
+  --v9-bg: var(--bg);
+  --v9-panel: var(--panel);
+  --v9-panel-2: var(--card);
+  --v9-line: var(--line);
+  --v9-line-strong: var(--line2);
+  --v9-ink: var(--ink1);
+  --v9-muted: var(--ink2);
+  --v9-faint: var(--ink3);
+  --v9-accent: var(--accent);   /* 主操作 #4F9FE8 */
+  --v9-on-accent: var(--on-accent);
+  --v9-red: var(--danger);      /* 仅高危/阻断/推断标记 */
+  --v9-gold: var(--warning);
+  --v9-green: var(--success);
+  --v9-cyan: var(--info);
 }
 
 html, body { min-height: 100%; background: var(--v9-bg) !important; }
@@ -20,7 +23,7 @@ body { margin: 0; color: var(--v9-ink); overflow-x: hidden; }
 body.v9-modal-open { overflow: hidden; }
 button, input, textarea, select { font: inherit; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
-  outline: 1px solid var(--v9-cyan) !important;
+  outline: var(--focus-outline) !important;   /* K1:全站唯一焦点态,取代 cyan 1px */
   outline-offset: 2px;
 }
 
@@ -30,13 +33,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   justify-content: center;
   align-items: center;
   gap: 17px;
-  border-top: 2px solid var(--v9-red);
-  border-bottom: 1px solid rgba(58, 142, 88, .42);
-  background: #0b160f;
-  color: #4d8d62;
+  border-top: 2px solid var(--v9-green);
+  border-bottom: 1px solid var(--v9-line);
+  background: var(--v9-panel);
+  color: var(--v9-green);
   font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 4px;
+  font-size: 11px;
+  letter-spacing: 2px;
   text-transform: uppercase;
 }
 .v9-classification span:last-child { position: absolute; right: 32px; letter-spacing: 1.5px; }
@@ -99,13 +102,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .v9-wire-label { color: var(--v9-muted); font-size: 10px; letter-spacing: 3px; padding-left: 32px; white-space: nowrap; }
 .v9-wire-label i { display: inline-block; width: 7px; height: 7px; margin-right: 10px; border-radius: 50%; background: var(--v9-red); }
-.v9-wire-track { display: flex; gap: 36px; white-space: nowrap; overflow: hidden; color: #ada28f; font-family: var(--serif); font-size: 13px; }
+.v9-wire-track { display: flex; gap: 36px; white-space: nowrap; overflow: hidden; color: var(--v9-muted); font-family: var(--serif); font-size: 14px; }
 .v9-wire-track b { color: var(--v9-faint); font-size: 8px; }
 .v9-runtime-stats { display: flex; gap: 15px; padding: 0 24px; border-left: 1px solid var(--v9-line); color: var(--v9-faint); font-size: 8px; letter-spacing: 1px; }
 .v9-runtime-stats strong { color: var(--v9-muted); font-weight: 500; }
 
 .v9-workspace { display: grid; grid-template-columns: 272px minmax(0, 1fr); min-height: calc(100vh - 201px); }
-.v9-rail { border-right: 1px solid var(--v9-line-strong); background: #0f0e0c; }
+.v9-rail { border-right: 1px solid var(--v9-line-strong); background: var(--v9-panel); }
 .v9-stage { min-width: 0; }
 .v9-stage > .tab-content { max-width: none !important; margin: 0 !important; }
 .v9-stage > .tab-content[hidden] { display: none !important; }
@@ -175,8 +178,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-page-head p { margin: 15px 0 0; color: var(--v9-muted); font-size: 13px; }
 .v9-page-actions { display: flex; gap: 14px; flex-shrink: 0; }
 .v9-primary, .v9-secondary { min-height: 54px; padding: 0 30px; font-size: 16px; }
-.v9-primary { border-color: var(--v9-red); background: var(--v9-red); color: #fff7ed; }
-.v9-primary:hover { background: #f05238; border-color: #f05238; }
+/* K1:主操作收敛为 #4F9FE8 + 深色文字(白字对比度仅 2.9:1 不达标);红只留高危/阻断 */
+.v9-primary { border-color: var(--v9-accent); background: var(--v9-accent); color: var(--v9-on-accent); font-weight: 600; }
+.v9-primary:hover { background: #6DB3EE; border-color: #6DB3EE; }
 
 .v9-risk-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .v9-risk-card { min-height: 280px; padding: 32px 27px; border-right: 1px solid var(--v9-line); border-bottom: 1px solid var(--v9-line); }
@@ -195,7 +199,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-risk-meter i { display: block; height: 100%; background: var(--v9-gold); }
 .v9-risk-card.danger .v9-risk-meter i { background: var(--v9-red); }
 .v9-risk-card.space .v9-risk-meter i { background: var(--v9-gold); }
-.v9-risk-card p { margin: 21px 0 0; color: #9b917f; font-family: var(--serif); font-size: 16px; line-height: 1.75; }
+.v9-risk-card p { margin: 21px 0 0; color: var(--v9-muted); font-family: var(--serif); font-size: 16px; line-height: 1.75; }
 .v9-panel-loading { grid-column: 1 / -1; min-height: 180px; display: grid; place-items: center; padding: 28px; color: var(--v9-muted); font-family: var(--mono); font-size: 12px; letter-spacing: 1px; }
 .v9-panel-loading.error { color: var(--v9-red); }
 .v9-risk-card.insufficient .v9-risk-value strong { color: var(--v9-muted); }
@@ -212,13 +216,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-wire-track a { color: inherit; text-decoration: none; }
 .v9-wire-track a:hover { color: var(--v9-ink); }
 
-.v9-evidence-shelf { margin-bottom: 18px; border: 1px solid var(--v9-line); background: rgba(9, 9, 8, .7); }
+.v9-evidence-shelf { margin-bottom: 18px; border: 1px solid var(--v9-line); background: var(--v9-panel); }
 .v9-evidence-shelf > header { display: flex; justify-content: space-between; gap: 24px; padding: 24px 28px; border-bottom: 1px solid var(--v9-line); }
 .v9-evidence-shelf h1 { margin: 5px 0; color: var(--v9-ink); font: 34px/1.1 var(--serif); }
 .v9-evidence-shelf p { margin: 0; color: var(--v9-muted); font-size: 12px; }
 .v9-evidence-search { min-width: 280px; align-self: end; }
 .v9-evidence-search span { display: block; margin-bottom: 7px; color: var(--v9-faint); font: 9px var(--mono); letter-spacing: 1px; }
-.v9-evidence-search input { width: 100%; border: 1px solid var(--v9-line); background: #0b0a08; color: var(--v9-ink); padding: 11px 13px; }
+.v9-evidence-search input { width: 100%; border: 1px solid var(--v9-line); background: var(--v9-bg); color: var(--v9-ink); padding: 11px 13px; }
 .v9-evidence-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); min-height: 150px; }
 .v9-evidence-card { padding: 20px; border-right: 1px solid var(--v9-line); border-bottom: 1px solid var(--v9-line); cursor: grab; }
 .v9-evidence-card:nth-child(3n) { border-right: 0; }
@@ -233,7 +237,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   border: 1px solid var(--v9-line-strong); background: transparent; color: var(--v9-muted);
   padding: 5px 10px; font-family: var(--mono); font-size: 10px; cursor: pointer;
 }
-.v9-rule-open:hover { border-color: var(--v9-red); color: var(--v9-red); }
+.v9-rule-open:hover { border-color: var(--v9-accent); color: var(--v9-accent); }
 .v9-rule-editor {
   margin: 0 0 14px; border: 1px solid var(--v9-line-strong); background: var(--v9-panel);
   padding: 16px;
@@ -266,10 +270,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .v9-rule-form label { display: grid; gap: 5px; color: var(--v9-muted); font: 9px/1.2 var(--mono); letter-spacing: .5px; }
 .v9-rule-form input, .v9-rule-form select {
-  min-width: 0; border: 1px solid var(--v9-line-strong); background: #0b0a08;
+  min-width: 0; border: 1px solid var(--v9-line-strong); background: var(--v9-bg);
   color: var(--v9-ink); padding: 8px; font: 11px/1.2 var(--sans); outline: none;
 }
-.v9-rule-form input:focus, .v9-rule-form select:focus { border-color: var(--v9-red); }
+.v9-rule-form input:focus, .v9-rule-form select:focus { border-color: var(--v9-accent); }
 .v9-rule-form .v9-rule-check { display: flex; align-items: center; padding-bottom: 9px; white-space: nowrap; }
 .v9-rule-form .v9-rule-check input { width: auto; }
 .v9-rule-form-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
@@ -277,7 +281,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   border: 1px solid var(--v9-line-strong); background: transparent; color: var(--v9-muted);
   padding: 7px 11px; font: 10px/1 var(--mono); cursor: pointer;
 }
-.v9-rule-form-actions button[type="submit"] { background: var(--v9-red); border-color: var(--v9-red); color: #fff; }
+.v9-rule-form-actions button[type="submit"] { background: var(--v9-accent); border-color: var(--v9-accent); color: var(--v9-on-accent); }
 .v9-rule-list { display: grid; gap: 0; }
 .v9-rule-row {
   display: grid; grid-template-columns: minmax(160px, 1.2fr) 2fr auto auto;
@@ -288,11 +292,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-rule-row small { color: var(--v9-faint); font: 9px/1.4 var(--mono); text-transform: uppercase; }
 .v9-rule-row.off { opacity: .5; }
 
-.v9-p3-panel { margin: 0; padding: 34px 38px; border-bottom: 1px solid var(--v9-line-strong); background: #0d0c09; }
+.v9-p3-panel { margin: 0; padding: 34px 38px; border-bottom: 1px solid var(--v9-line-strong); background: var(--v9-panel); }
 .v9-p3-panel + .china-workbench, .v9-p3-panel + .wb-stepper, .v9-p3-panel + .trk-zone { margin-top: 26px; opacity: .72; }
 .v9-time-control { display: flex; align-items: center; gap: 20px; min-height: 52px; border: 1px solid var(--v9-line); padding: 8px 16px; color: var(--v9-muted); font: 10px var(--mono); }
 .v9-time-control label { display: flex; align-items: center; gap: 12px; flex: 1; }
-.v9-time-control input[type="range"] { flex: 1; accent-color: var(--v9-red); }
+.v9-time-control input[type="range"] { flex: 1; accent-color: var(--v9-accent); }
 .v9-time-control button { border: 1px solid var(--v9-line-strong); background: transparent; color: var(--v9-gold); padding: 7px 12px; }
 .v9-graph-legend { display: flex; gap: 8px; align-items: center; }
 .v9-graph-legend i { width: 20px; border-top: 2px solid var(--v9-green); }
@@ -304,7 +308,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-graph-edge.claim line { stroke: var(--v9-gold); stroke-dasharray: 2 7; }
 .v9-graph-edge.inference line { stroke: var(--v9-red); stroke-dasharray: 10 7; }
 .v9-graph-edge text { fill: var(--v9-muted); font: 10px var(--mono); text-anchor: middle; }
-.v9-graph-node circle { fill: #15130f; stroke: var(--v9-green); stroke-width: 2; }
+.v9-graph-node circle { fill: var(--v9-panel); stroke: var(--v9-green); stroke-width: 2; }
 .v9-graph-node.claim circle { stroke: var(--v9-gold); }
 .v9-graph-node.inference circle { stroke: var(--v9-red); stroke-dasharray: 6 4; }
 .v9-graph-node text, .v9-svg-empty { fill: var(--v9-ink); font: 11px var(--serif); text-anchor: middle; }
@@ -320,16 +324,16 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-p3-list small { grid-column: 1 / -1; color: var(--v9-faint); font: 9px var(--mono); }
 .v9-p3-form { display: grid; grid-template-columns: repeat(6, minmax(100px, 1fr)); gap: 10px; padding: 14px; border: 1px solid var(--v9-line); border-top: 0; }
 .v9-p3-form[hidden] { display: none !important; }
-.v9-p3-form input, .v9-p3-form select, .v9-p3-form textarea { min-width: 0; border: 1px solid var(--v9-line-strong); background: #090907; color: var(--v9-ink); padding: 9px; }
+.v9-p3-form input, .v9-p3-form select, .v9-p3-form textarea { min-width: 0; border: 1px solid var(--v9-line-strong); background: var(--v9-bg); color: var(--v9-ink); padding: 9px; }
 .v9-p3-form textarea { grid-column: span 3; min-height: 72px; }
-.v9-p3-form button { border: 0; background: var(--v9-red); color: #fff; padding: 9px 12px; cursor: pointer; }
+.v9-p3-form button { border: 0; background: var(--v9-accent); color: var(--v9-on-accent); font-weight: 600; padding: 9px 12px; cursor: pointer; }
 .v9-offline-map { position: relative; overflow: hidden; min-height: 470px; border-right: 1px solid var(--v9-line); }
 .v9-offline-map > img { width: 100%; height: 100%; object-fit: cover; opacity: .92; }
 .v9-offline-map > span { position: absolute; left: 14px; bottom: 10px; color: var(--v9-faint); font: 9px var(--mono); letter-spacing: 2px; }
 #v9GeoMarkers { position: absolute; inset: 0; }
-.v9-map-marker { position: absolute; width: 13px; height: 13px; transform: translate(-50%,-50%); border: 2px solid #111; border-radius: 50%; background: var(--v9-green); box-shadow: 0 0 0 5px rgba(88,163,124,.18); cursor: pointer; }
-.v9-map-marker.claim { background: var(--v9-gold); box-shadow: 0 0 0 5px rgba(196,156,74,.18); }
-.v9-map-marker.inference { background: var(--v9-red); box-shadow: 0 0 0 5px rgba(207,61,39,.18); }
+.v9-map-marker { position: absolute; width: 13px; height: 13px; transform: translate(-50%,-50%); border: 2px solid var(--v9-bg); border-radius: 50%; background: var(--v9-green); box-shadow: 0 0 0 5px rgba(97,181,138,.18); cursor: pointer; }
+.v9-map-marker.claim { background: var(--v9-gold); box-shadow: 0 0 0 5px rgba(215,164,71,.18); }
+.v9-map-marker.inference { background: var(--v9-red); box-shadow: 0 0 0 5px rgba(222,93,93,.18); }
 .v9-evidence-card.focused { border-color: var(--v9-gold); box-shadow: inset 3px 0 0 var(--v9-gold); }
 .v9-layer-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 14px; border-bottom: 1px solid var(--v9-line); color: var(--v9-muted); font: 10px var(--mono); }
 .v9-alert-summary { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--v9-line); }
@@ -415,7 +419,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-p4-list span { color: var(--v9-red); font: 9px var(--mono); letter-spacing: 1px; text-transform: uppercase; }
 .v9-p4-list strong { color: var(--v9-ink); font: 17px var(--serif); }
 .v9-p4-list small { color: var(--v9-faint); font: 10px var(--mono); }
-.v9-p4-list i { height: 3px; overflow: hidden; background: #25211b; }
+.v9-p4-list i { height: 3px; overflow: hidden; background: var(--v9-line); }
 .v9-p4-list i b { display: block; height: 100%; background: var(--v9-gold); }
 #v9JobDetail, .v9-scenario-workbench > main { min-width: 0; padding: 26px; }
 #v9JobDetail > header span, #v9ScenarioDetail > header span { color: var(--v9-red); font: 9px var(--mono); letter-spacing: 2px; }
@@ -436,10 +440,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-job-error { margin-top: 14px; padding: 15px; border-left: 3px solid var(--v9-red); background: rgba(207,61,39,.08); }
 .v9-job-error strong { color: var(--v9-red); font: 10px var(--mono); }
 .v9-stage-output { display: grid; gap: 8px; margin-top: 16px; color: var(--v9-muted); font: 10px var(--mono); }
-.v9-stage-output textarea { min-height: 90px; border: 1px solid var(--v9-line); background: #090907; color: var(--v9-ink); padding: 12px; }
+.v9-stage-output textarea { min-height: 90px; border: 1px solid var(--v9-line); background: var(--v9-bg); color: var(--v9-ink); padding: 12px; }
 .v9-job-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 18px; }
 .v9-job-actions button, #v9ScenarioEditForm > button { border: 1px solid var(--v9-line-strong); background: transparent; color: var(--v9-ink); padding: 10px 14px; cursor: pointer; }
-.v9-job-actions button:first-child { border-color: var(--v9-red); background: var(--v9-red); color: #fff; }
+.v9-job-actions button:first-child { border-color: var(--v9-accent); background: var(--v9-accent); color: var(--v9-on-accent); font-weight: 600; }
 .v9-inference-banner { margin: 20px 0 0; border-color: rgba(207,61,39,.55); color: var(--v9-red); }
 .v9-scenario-evidence { margin-top: 16px; color: var(--v9-muted); font: 9px var(--mono); overflow-wrap: anywhere; }
 .v9-scenario-branches, .v9-team-outputs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 18px; border: 1px solid var(--v9-line); }
@@ -454,12 +458,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 #v9ScenarioEditForm { margin-top: 24px; }
 .v9-scenario-common { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .v9-scenario-common label { display: grid; gap: 6px; color: var(--v9-muted); font: 9px var(--mono); }
-.v9-scenario-common input, .v9-branch-editor input, .v9-branch-editor textarea, .v9-team-editor input, .v9-team-editor textarea { min-width: 0; border: 1px solid var(--v9-line); background: #090907; color: var(--v9-ink); padding: 9px; }
+.v9-scenario-common input, .v9-branch-editor input, .v9-branch-editor textarea, .v9-team-editor input, .v9-team-editor textarea { min-width: 0; border: 1px solid var(--v9-line); background: var(--v9-bg); color: var(--v9-ink); padding: 9px; }
 .v9-branch-editor, .v9-team-editor { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
 .v9-branch-editor fieldset, .v9-team-editor fieldset { min-width: 0; display: grid; gap: 8px; padding: 13px; border: 1px solid var(--v9-line); }
 .v9-branch-editor legend, .v9-team-editor legend { padding: 0 6px; color: var(--v9-gold); font: 9px var(--mono); }
 .v9-branch-editor textarea, .v9-team-editor textarea { min-height: 84px; resize: vertical; }
-#v9ScenarioEditForm > button { margin-top: 13px; background: var(--v9-red); border-color: var(--v9-red); }
+#v9ScenarioEditForm > button { margin-top: 13px; background: var(--v9-accent); border-color: var(--v9-accent); color: var(--v9-on-accent); font-weight: 600; }
 
 .v9-delivery-board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 28px; }
 .v9-delivery-board > section { min-height: 360px; padding: 18px; border: 1px solid var(--v9-line); }
@@ -471,11 +475,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-onboarding { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; padding: 24px; }
 .v9-onboarding[hidden] { display: none; }
 .v9-onboarding-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.82); }
-.v9-onboarding-card { position: relative; width: min(1420px, 94vw); max-height: 92vh; overflow: auto; border: 1px solid #4a4338; background: #15120e; box-shadow: 0 28px 90px rgba(0,0,0,.55); }
+.v9-onboarding-card { position: relative; width: min(1420px, 94vw); max-height: 92vh; overflow: auto; border: 1px solid var(--v9-line-strong); background: var(--v9-panel); box-shadow: 0 28px 90px rgba(0,0,0,.55); }
 .v9-onboarding-card > header { padding: 48px 64px 38px; }
 .v9-onboarding-card > header > span { color: var(--v9-red); font-family: var(--mono); font-size: 11px; letter-spacing: 4px; }
 .v9-onboarding-card h2 { margin: 24px 0 17px; font-family: var(--serif); font-size: 41px; font-weight: 500; }
-.v9-onboarding-card > header p { max-width: 1050px; margin: 0; color: #aca18e; font-family: var(--serif); font-size: 17px; line-height: 1.85; }
+.v9-onboarding-card > header p { max-width: 1050px; margin: 0; color: var(--v9-muted); font-family: var(--serif); font-size: 17px; line-height: 1.85; }
 .v9-onboarding-steps { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--v9-line-strong); border-bottom: 1px solid var(--v9-line-strong); }
 .v9-onboarding-steps article { min-height: 260px; padding: 32px 36px; border-right: 1px solid var(--v9-line); border-top: 3px solid var(--v9-red); }
 .v9-onboarding-steps article:last-child { border-right: 0; }
@@ -487,7 +491,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-onboarding-steps .green em { color: var(--v9-green); }
 .v9-onboarding-steps .cyan em { color: var(--v9-cyan); }
 .v9-onboarding-steps h3 { margin: 24px 0 14px; font-family: var(--serif); font-size: 26px; font-weight: 500; }
-.v9-onboarding-steps p { color: #9e9482; font-family: var(--serif); line-height: 1.7; }
+.v9-onboarding-steps p { color: var(--v9-muted); font-family: var(--serif); line-height: 1.7; }
 .v9-onboarding-steps small { color: var(--v9-faint); font-family: var(--mono); font-size: 9px; letter-spacing: 1px; }
 .v9-onboarding-card > footer { min-height: 98px; padding: 20px 64px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .v9-onboarding-card > footer > span { color: var(--v9-faint); font-family: var(--mono); font-size: 10px; }
@@ -496,7 +500,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .footer { margin-left: 272px; }
 
 @media (max-width: 1260px) {
-  .topbar-right .v9-action:nth-of-type(-n+2), .v9-runtime-stats, .v9-date { display: none; }
+  /* K1:不再隐藏「收藏/队列」按钮(1024 下功能必须可达,紧凑化规则见本文件末 K4 合并的 §4 块);
+     仅隐藏次级信息:运行统计条与日期(时钟本身保留) */
+  .v9-runtime-stats, .v9-date { display: none; }
   .v9-workspace { grid-template-columns: 224px minmax(0, 1fr); }
   .footer { margin-left: 224px; }
   .v9-risk-grid { grid-template-columns: repeat(2, 1fr); }
@@ -591,7 +597,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-p5-list small{color:var(--v9-faint);font:9px var(--mono)}
 .v9-writing-workbench>main{min-width:0}.v9-document-form{padding:22px}.v9-document-form[hidden]{display:none!important}
 .v9-document-form label{display:grid;gap:7px;color:var(--v9-faint);font:9px var(--mono);letter-spacing:.8px;text-transform:uppercase}
-.v9-document-form input,.v9-document-form select,.v9-document-form textarea{min-width:0;border:1px solid var(--v9-line-strong);background:#090907;color:var(--v9-ink);padding:10px 11px;font:12px/1.5 var(--sans)}
+.v9-document-form input,.v9-document-form select,.v9-document-form textarea{min-width:0;border:1px solid var(--v9-line-strong);background:var(--v9-bg);color:var(--v9-ink);padding:10px 11px;font:12px/1.5 var(--sans)}
 .v9-document-form textarea{resize:vertical}.v9-document-meta{display:grid;grid-template-columns:minmax(220px,1fr) 150px 130px;gap:10px}
 .v9-document-outline{margin-top:12px}.v9-document-outline textarea{min-height:82px}
 .v9-paragraph-head{display:flex;align-items:end;justify-content:space-between;margin:24px 0 10px}
@@ -604,7 +610,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .v9-document-validation{margin-top:14px;padding:13px 15px;border:1px solid var(--v9-line);color:var(--v9-muted)}
 .v9-document-validation.ready{border-color:rgba(88,163,124,.55);box-shadow:inset 3px 0 0 var(--v9-green)}.v9-document-validation.blocked{border-color:rgba(207,61,39,.45);box-shadow:inset 3px 0 0 var(--v9-red)}
 .v9-document-validation strong{display:block;color:var(--v9-ink)}.v9-document-validation span{display:block;margin-top:5px;color:var(--v9-faint);font:9px var(--mono)}.v9-document-validation ul{margin:8px 0 0;padding-left:20px}
-.v9-document-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.v9-document-actions .v9-primary{border-color:var(--v9-red);background:var(--v9-red);color:#fff}
+.v9-document-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.v9-document-actions .v9-primary{border-color:var(--v9-accent);background:var(--v9-accent);color:var(--v9-on-accent);font-weight:600}
 .v9-p5-empty{min-height:520px;display:grid;place-content:center;gap:8px;padding:30px;text-align:center;color:var(--v9-muted)}.v9-p5-empty[hidden]{display:none!important}.v9-p5-empty strong{color:var(--v9-ink);font:24px var(--serif)}
 .v9-delivery-summary{padding:11px 15px;border:1px solid var(--v9-line);border-bottom:0;color:var(--v9-muted);font:10px var(--mono)}
 .v9-p5-board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--v9-line)}.v9-p5-board>section{min-width:0;min-height:330px;border-right:1px solid var(--v9-line)}.v9-p5-board>section:last-child{border-right:0}
@@ -615,3 +621,521 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 #v9RecalledList article,#v9AuditList article{display:grid;grid-template-columns:minmax(180px,1fr) minmax(220px,2fr) auto;gap:12px;padding:11px 16px;border-bottom:1px solid var(--v9-line)}#v9RecalledList strong,#v9AuditList strong{overflow-wrap:anywhere;color:var(--v9-ink)}#v9RecalledList span,#v9AuditList span{color:var(--v9-muted)}#v9RecalledList small,#v9AuditList small{color:var(--v9-faint);font:8px var(--mono)}
 @media(max-width:980px){.v9-writing-workbench{grid-template-columns:240px minmax(0,1fr)}.v9-document-meta,.v9-paragraph-controls{grid-template-columns:1fr 1fr}.v9-document-meta label:first-child,.v9-paragraph-controls label:first-child{grid-column:1/-1}.v9-p5-board{grid-template-columns:repeat(2,minmax(0,1fr))}.v9-p5-board>section:nth-child(2){border-right:0}.v9-p5-board>section:nth-child(-n+2){border-bottom:1px solid var(--v9-line)}}
 @media(max-width:620px){.v9-writing-workbench{grid-template-columns:1fr;min-height:0}.v9-p5-list{max-height:220px;border-right:0;border-bottom:1px solid var(--v9-line)}.v9-document-form{padding:14px}.v9-document-meta,.v9-paragraph-controls,.v9-p5-board{grid-template-columns:1fr}.v9-document-meta label:first-child,.v9-paragraph-controls label:first-child{grid-column:auto}.v9-p5-board>section{min-height:170px;border-right:0;border-bottom:1px solid var(--v9-line)}.v9-paragraph-head{align-items:center}#v9RecalledList article,#v9AuditList article{grid-template-columns:1fr;gap:5px}}
+
+/* ═══════════════════════════════════════════════════════════
+   K1 壳层升级 · 正式层(2026-08-30 自 k1-shell-upgrade.css §1-§3 并入;§4-§7 亦于 K4 合并至本文件末尾,原型层已删除)
+   本节规则位于本文件末尾,借助文件内后序位置覆盖上方旧值;
+   外部文件仅 v9-cloud.css 在本文件之后加载,
+   不含壳层选择器,无冲突。间距只用 4/8/12/16/24/32,颜色只消费 tokens。
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── 顶栏:收敛为单行 56px,主信息(产品名/检索/队列/账户)前置,
+        时钟/语言/刷新降次级但保持可访问 ─────────────────────── */
+.topbar {
+  min-height: 56px !important;
+  padding: 8px 24px !important;
+  gap: 16px;
+  flex-wrap: nowrap;
+}
+.topbar-left { min-width: 0 !important; flex-shrink: 1; overflow: hidden; }
+.ed-mark { width: 40px !important; height: 40px !important; }
+.ed-mark span { font-size: 20px !important; }
+.topbar .logo { font-size: 20px !important; white-space: nowrap; }
+.topbar .tagline { margin-top: 3px !important; letter-spacing: 2px !important; white-space: nowrap; }
+.topbar-right { gap: 8px !important; align-self: center; flex-shrink: 0; }
+
+/* 主操作组:统一 40px 目标、12px 字、不换行 */
+.topbar .v9-action {
+  min-height: 40px;
+  padding: 0 12px;
+  margin-right: 0;
+  font-size: 12px;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.v9-action-icon { font-size: 14px; margin-right: 0; }
+.v9-action-icon.accent { color: var(--info); }          /* 队列「+」不再用危险红 */
+.v9-action strong { color: var(--info); }               /* 计数徽章:信息色,数字本身表意 */
+/* 全局检索是顶栏唯一强调入口 */
+#v9SearchBtn { border-color: var(--accent); color: var(--accent); }
+#v9SearchBtn .v9-kbd { color: var(--accent); opacity: .75; }
+#v9SearchBtn:hover { background: var(--accentsoft); color: var(--accent); }
+
+/* 次级组:分隔线/时钟/状态/语言/刷新,全部降权重但保留可达 */
+.topbar .ed-vline { margin: 0 4px; height: 24px; }
+.v9-clock-wrap { min-width: 0; margin-right: 0; }
+.topbar .clock { font-size: 14px !important; letter-spacing: .5px !important; }
+.v9-date { font-size: 11px; letter-spacing: .5px; margin-top: 2px; }
+.status-pill { margin-right: 0; font-size: 12px !important; white-space: nowrap; }
+.topbar .lang-btn, .topbar .refresh-btn {
+  min-height: 40px; display: inline-flex; align-items: center;
+  padding: 4px 8px !important; font-size: 12px !important; white-space: nowrap;
+}
+
+/* ── WIRE 电讯条:有真实头条时 40px 整行;空/载入/失败时折叠为 30px 弱提示 ──
+        空态 DOM 为 <span> 纯文本,真实内容为 <a> 链接,用 :has 区分,不改 JS。
+        (:has 需 Chromium ≥105,本桌面端 WebView2/Edge 满足;不支持的旧内核
+         只会保持 40px 常显,属可接受回退)────────────────────────── */
+.v9-wire { height: auto; min-height: 40px; grid-template-columns: 150px minmax(0, 1fr) auto; }
+.v9-wire-label { padding-left: 24px; font-size: 11px; letter-spacing: 2px; }
+.v9-wire-label i { background: var(--info); }
+.v9-runtime-stats { font-size: 11px; gap: 12px; padding: 0 16px; letter-spacing: .5px; }
+.v9-wire:has(.v9-wire-track > span:only-child) { min-height: 30px; border-bottom-color: var(--line); }
+.v9-wire:has(.v9-wire-track > span:only-child) .v9-wire-label { color: var(--ink3); }
+.v9-wire:has(.v9-wire-track > span:only-child) .v9-wire-label i { background: var(--ink4); }
+.v9-wire:has(.v9-wire-track > span:only-child) .v9-wire-track {
+  color: var(--ink3); font-family: var(--sans); font-size: 12px;
+}
+
+/* ── 左侧导航:40px 目标、标签 11px、分组更紧凑;激活标记用主操作色 ── */
+.v9-workspace { grid-template-columns: 232px minmax(0, 1fr); min-height: calc(100vh - 125px); }
+.v9-rail .tab-nav { padding: 16px 8px 24px 0 !important; }
+.v9-nav-group { margin-bottom: 12px; }
+.v9-nav-label { padding: 6px 0 6px 24px; font-size: 11px; letter-spacing: 2px; }
+.v9-rail .tab-nav .tab-btn {
+  height: 40px !important;
+  padding: 0 12px 0 24px !important;
+  grid-template-columns: 32px 1fr auto;
+  font-size: 14px !important;
+}
+.v9-rail .tab-btn em { font-size: 11px; }
+.v9-rail .tab-nav .tab-btn.active { border-left-color: var(--accent) !important; }
+.v9-rail .tab-btn.active em { color: var(--accent); }
+.v9-rail .tab-btn b { font-size: 12px; }
+.footer { margin-left: 232px; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k1-shell-upgrade.css §4 态势总览首屏(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §4 态势总览首屏:页头压缩 → 下一动作前置 → 区域信号降级为查证型小指标 ── */
+#tab-content-overview .v9-overview {
+  display: flex; flex-direction: column;
+  min-height: calc(100vh - 125px);
+  padding: 24px 32px 32px;
+}
+#tab-content-overview .v9-page-head {
+  order: 1;
+  min-height: 0;
+  padding: 0 0 16px;
+  gap: 24px;
+}
+#tab-content-overview .v9-kicker { font-size: 11px; letter-spacing: 2px; }
+#tab-content-overview .v9-page-head h1 {
+  margin: 8px 0 0;
+  font-family: var(--sans);
+  font-size: 26px;
+  font-weight: 600;
+}
+#tab-content-overview .v9-page-head p { margin: 8px 0 0; font-size: 13px; color: var(--ink2); }
+#tab-content-overview .v9-page-actions { gap: 12px; }
+#tab-content-overview .v9-page-actions .v9-primary,
+#tab-content-overview .v9-page-actions .v9-secondary {
+  min-height: 44px; padding: 0 20px; font-size: 14px;
+}
+
+/* 下一动作:首屏第二顺位,行动导向(图标 + 文字双编码,不只靠颜色) */
+#tab-content-overview .v9-activity { order: 2; margin-top: 16px; border-color: var(--line2); }
+#tab-content-overview .v9-activity::before {
+  content: '下一动作 · NEXT ACTIONS';
+  display: block;
+  padding: 8px 24px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink3);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 2px;
+  background: var(--panel);
+}
+#tab-content-overview .v9-activity button { min-height: 48px; background: var(--panel); }
+#tab-content-overview .v9-activity button:hover { background: var(--card); }
+#tab-content-overview .v9-activity button span { color: var(--ink1); font-size: 14px; }
+#tab-content-overview .v9-activity strong { color: var(--accent); font-size: 12px; }
+
+/* 区域信号:指数降级为小字指标;证据计数与公式入口保留,诚实可查 */
+#tab-content-overview .v9-risk-grid {
+  order: 3;
+  margin-top: 24px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));  /* 1440/1366 单行 4 卡 */
+  gap: 12px;
+}
+#tab-content-overview .v9-risk-grid::before {
+  content: '区域信号指数 · 由公式与证据链计算(点击卡片底部展开查证),证据不足时显示 —';
+  grid-column: 1 / -1;
+  color: var(--ink3);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+}
+#tab-content-overview .v9-risk-card {
+  min-height: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+/* 旧 3 列布局把第 4 卡钉死在 grid-column:1;4 列布局下复位,否则第 4 卡被挤到第二行 */
+#tab-content-overview .v9-risk-card:nth-child(4) { grid-column: auto; }
+#tab-content-overview .v9-risk-title h2 { font-family: var(--sans); font-size: 15px; font-weight: 600; }
+#tab-content-overview .v9-risk-title span { font-size: 10px; letter-spacing: 1px; }
+#tab-content-overview .v9-risk-value { margin: 12px 0 8px; }
+#tab-content-overview .v9-risk-value strong {
+  font-family: var(--sans); font-size: 24px; font-weight: 600;
+}
+#tab-content-overview .v9-risk-value small { font-size: 11px; letter-spacing: 1px; }
+#tab-content-overview .v9-risk-card p {
+  margin: 12px 0 0;
+  font-family: var(--sans); font-size: 13px; line-height: 1.6;
+  color: var(--ink2);
+}
+#tab-content-overview .v9-risk-meta { margin-top: 12px; font-size: 11px; }
+#tab-content-overview .v9-risk-trace { margin-top: 12px; }
+#tab-content-overview .v9-risk-trace summary { font-size: 12px; color: var(--info); }
+#tab-content-overview .v9-formula { font-size: 11px; }
+#tab-content-overview .v9-risk-trace ol { font-size: 12px; }
+#tab-content-overview .v9-panel-loading { min-height: 120px; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k1-shell-upgrade.css §5 统一状态(.v9-panel-loading)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* 旧 3 列布局把第 4 卡钉死在 grid-column:1;4 列布局下复位,否则第 4 卡被挤到第二行 */
+#tab-content-overview .v9-risk-card:nth-child(4) { grid-column: auto; }
+#tab-content-overview .v9-risk-title h2 { font-family: var(--sans); font-size: 15px; font-weight: 600; }
+#tab-content-overview .v9-risk-title span { font-size: 10px; letter-spacing: 1px; }
+#tab-content-overview .v9-risk-value { margin: 12px 0 8px; }
+#tab-content-overview .v9-risk-value strong {
+  font-family: var(--sans); font-size: 24px; font-weight: 600;
+}
+#tab-content-overview .v9-risk-value small { font-size: 11px; letter-spacing: 1px; }
+#tab-content-overview .v9-risk-card p {
+  margin: 12px 0 0;
+  font-family: var(--sans); font-size: 13px; line-height: 1.6;
+  color: var(--ink2);
+}
+#tab-content-overview .v9-risk-meta { margin-top: 12px; font-size: 11px; }
+#tab-content-overview .v9-risk-trace { margin-top: 12px; }
+#tab-content-overview .v9-risk-trace summary { font-size: 12px; color: var(--info); }
+#tab-content-overview .v9-formula { font-size: 11px; }
+#tab-content-overview .v9-risk-trace ol { font-size: 12px; }
+#tab-content-overview .v9-panel-loading { min-height: 120px; }
+
+/* ── §5 统一状态外观:loading/empty/error/blocked/ready/offline 一套 token ──
+        状态必须「文字/图形 + 颜色」双编码;错误可见可定位,但不堆叠遮挡主操作 */
+.v9-panel-loading {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  font-family: var(--sans); font-size: 13px; color: var(--ink2);
+  letter-spacing: 0;
+}
+.v9-panel-loading::before { content: '…'; color: var(--ink3); }
+.v9-panel-loading.error {
+  justify-content: flex-start;
+  color: var(--danger);
+  background: rgba(222, 93, 93, .08);
+  border-left: 3px solid var(--danger);
+  padding: 16px 20px;
+  text-align: left;
+}
+.v9-panel-loading.error::before { content: '错误 ·'; font-weight: 600; white-space: nowrap; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k1-shell-upgrade.css §5 统一状态(.v9-document-validation)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* 待签发/被阻断/已就绪(V9 写作与版面):token 化双编码 */
+.v9-document-validation.ready { border-color: rgba(97, 181, 138, .55); box-shadow: inset 3px 0 0 var(--success); }
+.v9-document-validation.blocked { border-color: rgba(222, 93, 93, .45); box-shadow: inset 3px 0 0 var(--danger); }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k1-shell-upgrade.css §7 响应式(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §7 响应式:1366 / 1024 顶栏单行不失控;功能全部可达 ── */
+@media (max-width: 1260px) {
+  .topbar { padding: 8px 16px !important; gap: 12px; }
+  .topbar .v9-action { padding: 0 10px; }
+  .v9-workspace { grid-template-columns: 224px minmax(0, 1fr); }
+  .footer { margin-left: 224px; }
+  #tab-content-overview .v9-overview { padding: 16px 24px 24px; }
+  #tab-content-overview .v9-risk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 1100px) {
+  .topbar .tagline { display: none !important; }   /* 品牌副标题让位,产品名保留 */
+  #v9TourBtn { display: none; }                    /* 「引导」与「?」重复,帮助仍可访问 */
+  #v9SearchBtn .v9-kbd { display: none; }          /* ⌘K 提示让位,快捷键本身不变 */
+}
+/* ≤820px 的移动断点沿用 command-hub-v9.css 既有规则,本批不改移动布局 */
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k2-chain-upgrade.css §0 wb-stepper 页内步骤导航(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §0 共享:wb-stepper 页内二级步骤导航(ai/agent 屏)────────
+   此前 .wb-stepper/.wb-step/.wb-step-aux 全站无样式定义(裸按钮),
+   这里补为页内二级导航:步骤 Ⅰ→Ⅱ 主路径 + 右侧弱辅助入口。
+   command-hub-v9.css 的 .v9-p3-panel + .wb-stepper 有 opacity:.72
+   遗留,本导航是主路径指引,必须全可读 → opacity 复位。 */
+#tab-content-ai .wb-stepper, #tab-content-agent .wb-stepper {
+  opacity: 1;
+  display: flex; align-items: center; gap: var(--sp-2);
+  max-width: 1400px; margin: 0 auto; padding: var(--sp-3) var(--sp-5) 0;
+}
+#tab-content-ai .wb-step, #tab-content-agent .wb-step {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  min-height: 40px; padding: 0 var(--sp-4);
+  background: var(--panel); border: 1px solid var(--line2);
+  color: var(--ink2); font-family: var(--sans); font-size: 13px;
+  cursor: pointer; transition: border-color .15s, color .15s, background .15s;
+}
+#tab-content-ai .wb-step:hover, #tab-content-agent .wb-step:hover {
+  color: var(--ink1); border-color: var(--ink3); background: var(--card);
+}
+#tab-content-ai .wb-step .wb-step-num, #tab-content-agent .wb-step .wb-step-num {
+  display: inline-grid; place-items: center;
+  width: 22px; height: 22px;
+  border: 1px solid var(--line2); color: var(--ink3);
+  font-family: var(--mono); font-size: 11px;
+}
+/* 当前步骤:蓝边 + 序号实底,颜色与图形双编码 */
+#tab-content-ai .wb-step.active, #tab-content-agent .wb-step.active {
+  color: var(--ink1); border-color: var(--accent); background: var(--card);
+}
+#tab-content-ai .wb-step.active .wb-step-num, #tab-content-agent .wb-step.active .wb-step-num {
+  background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+}
+#tab-content-ai .wb-step-arrow, #tab-content-agent .wb-step-arrow { color: var(--ink4); }
+#tab-content-ai .wb-step-aux, #tab-content-agent .wb-step-aux {
+  margin-left: auto; min-height: 40px; padding: 0 var(--sp-3);
+  background: none; border: none; border-bottom: 1px solid transparent;
+  color: var(--ink3); font-size: 12px; cursor: pointer;
+}
+#tab-content-ai .wb-step-aux:hover, #tab-content-agent .wb-step-aux:hover { color: var(--ink1); border-bottom-color: var(--ink3); }
+#tab-content-ai .wb-step-aux.active, #tab-content-agent .wb-step-aux.active { color: var(--info); border-bottom-color: var(--info); }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k3-writing-upgrade.css §1 四屏共通(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §1 四屏共通:页头压缩 / 操作目标 / 输入件 ─────────────── */
+#tab-content-squad .v9-page-head,
+#tab-content-scenario .v9-page-head,
+#tab-content-brief .v9-page-head,
+#tab-content-delivery .v9-page-head { padding-bottom: 24px; }
+
+#tab-content-squad .v9-page-head h1,
+#tab-content-scenario .v9-page-head h1,
+#tab-content-brief .v9-page-head h1,
+#tab-content-delivery .v9-page-head h1 {
+  margin: 8px 0 0;
+  font-family: var(--sans); font-size: 26px; font-weight: 600;
+  line-height: 1.3; letter-spacing: .01em;
+}
+
+#tab-content-squad .v9-page-head p,
+#tab-content-scenario .v9-page-head p,
+#tab-content-brief .v9-page-head p,
+#tab-content-delivery .v9-page-head p { margin-top: 10px; font-size: 13px; line-height: 1.6; }
+
+#tab-content-squad .v9-primary, #tab-content-squad .v9-secondary,
+#tab-content-scenario .v9-primary, #tab-content-scenario .v9-secondary,
+#tab-content-brief .v9-primary, #tab-content-brief .v9-secondary,
+#tab-content-delivery .v9-primary, #tab-content-delivery .v9-secondary {
+  min-height: 44px; padding: 0 22px; font-size: 14px;
+}
+
+/* V9 表单族:输入件统一 40px 操作目标、13px 可读字号 */
+#tab-content-squad .v9-p3-form input, #tab-content-squad .v9-p3-form select,
+#tab-content-scenario .v9-p3-form input, #tab-content-scenario .v9-p3-form select,
+#tab-content-scenario .v9-scenario-common input,
+#tab-content-scenario .v9-branch-editor input, #tab-content-scenario .v9-team-editor input,
+#tab-content-brief .v9-document-form input, #tab-content-brief .v9-document-form select {
+  min-height: 40px; padding: 8px 12px; font-size: 13px;
+}
+#tab-content-squad .v9-p3-form textarea,
+#tab-content-scenario .v9-p3-form textarea,
+#tab-content-scenario .v9-branch-editor textarea, #tab-content-scenario .v9-team-editor textarea,
+#tab-content-brief .v9-document-form textarea { padding: 10px 12px; font-size: 14px; line-height: 1.7; }
+
+/* 创建/编辑表单展开态:面板卡,与列表分区 */
+#tab-content-squad .v9-p4-form,
+#tab-content-scenario #v9ScenarioCreateForm,
+#tab-content-scenario #v9ScenarioEditForm {
+  margin-top: 16px; padding: 16px; border: 1px solid var(--line); background: var(--panel);
+}
+#tab-content-squad .v9-p4-form button,
+#tab-content-scenario #v9ScenarioCreateForm button,
+#tab-content-scenario #v9ScenarioEditForm > button { min-height: 40px; }
+
+/* 任务/推演/稿件列表:选中态用主蓝,红色退出装饰位 */
+#tab-content-squad .v9-p4-list > button.active,
+#tab-content-scenario .v9-p4-list > button.active,
+#tab-content-brief .v9-p5-list button.active {
+  background: rgba(79,159,232,.07); box-shadow: inset 3px 0 0 var(--accent);
+}
+#tab-content-squad .v9-p4-list span,
+#tab-content-scenario .v9-p4-list span { color: var(--ink3); font-size: 10.5px; }
+#tab-content-squad .v9-p4-list strong,
+#tab-content-scenario .v9-p4-list strong { font-size: 15px; }
+#tab-content-squad .v9-p4-list small,
+#tab-content-scenario .v9-p4-list small,
+#tab-content-brief .v9-p5-list small { font-size: 11px; }
+#tab-content-brief .v9-p5-list span { color: var(--accent); font-size: 10.5px; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k3-writing-upgrade.css §2 squad 智能体编队(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §2 squad 智能体编队 ─────────────────────────────────── */
+#tab-content-squad .v9-task-grid { margin-top: 24px; }
+#tab-content-squad .v9-task-grid button { padding: 20px 24px; }
+#tab-content-squad .v9-task-grid button:hover { box-shadow: inset 3px 0 0 var(--accent); }
+#tab-content-squad .v9-task-grid span { color: var(--accent); font-size: 10.5px; }
+#tab-content-squad .v9-task-grid strong { font-size: 20px; }
+#tab-content-squad .v9-task-grid em { font-size: 12px; line-height: 1.6; }
+
+/* 阶段条:当前阶段主蓝、已完成绿,均有文字标签 */
+#tab-content-squad .v9-job-phases b { font-size: 10px; }
+#tab-content-squad .v9-job-phases li.active { box-shadow: inset 0 -3px 0 var(--accent); }
+
+/* 人工闸门:待人工 = 警告色边+文字(状态词已由 JS 渲染) */
+#tab-content-squad .v9-job-scope { color: var(--ink3); font-size: 11px; }
+#tab-content-squad .v9-job-gate { padding: 16px; }
+#tab-content-squad .v9-job-gate span { font-size: 10.5px; }
+#tab-content-squad .v9-job-gate strong { font-size: 14px; }
+#tab-content-squad .v9-job-gate small { font-size: 12px; line-height: 1.6; }
+#tab-content-squad .v9-job-gate.waiting {
+  border-color: var(--warning); background: rgba(215,164,71,.06);
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+#tab-content-squad .v9-job-gate.waiting strong { color: var(--warning); }
+#tab-content-squad .v9-job-error { padding: 14px 16px; }
+#tab-content-squad .v9-job-error strong { font-size: 11px; }
+#tab-content-squad .v9-job-error p { margin: 6px 0 0; font-size: 13px; line-height: 1.6; }
+#tab-content-squad .v9-job-actions button { min-height: 40px; padding: 8px 16px; font-size: 13px; }
+#tab-content-squad .v9-stage-output { margin-top: 16px; font-size: 12px; }
+#tab-content-squad .v9-stage-output textarea { margin-top: 8px; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k3-writing-upgrade.css §3 scenario 情景推演(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §3 scenario 情景推演 ────────────────────────────────── */
+/* 推断声明:警告色左边条 + 文字,双编码(⚠ + 声明文案) */
+#tab-content-scenario .v9-inference-banner {
+  margin-top: 20px; padding: 12px 16px;
+  border: 1px solid var(--line); border-left: 3px solid var(--warning);
+  background: rgba(215,164,71,.07); color: var(--warning);
+  font-size: 12px; letter-spacing: .5px; line-height: 1.6;
+}
+
+/* 三分支:基准=info、升级=danger、缓和=success,文字标签已在 */
+#tab-content-scenario .v9-scenario-branches article.baseline { box-shadow: inset 0 3px 0 var(--info); }
+#tab-content-scenario .v9-scenario-branches article.escalation { box-shadow: inset 0 3px 0 var(--danger); }
+#tab-content-scenario .v9-scenario-branches article.deescalation { box-shadow: inset 0 3px 0 var(--success); }
+#tab-content-scenario .v9-scenario-branches article.baseline > span { color: var(--info); }
+#tab-content-scenario .v9-scenario-branches article.escalation > span { color: var(--danger); }
+#tab-content-scenario .v9-scenario-branches article.deescalation > span { color: var(--success); }
+#tab-content-scenario .v9-scenario-branches span,
+#tab-content-scenario .v9-team-outputs span { font-size: 10.5px; }
+/* 详情视图队伍卡无 per-team class:统一中性色,红/蓝/裁判由文字标签区分(编辑表单 fieldset 已按队着色) */
+#tab-content-scenario .v9-team-outputs article > span { color: var(--ink3); }
+#tab-content-scenario .v9-scenario-branches small,
+#tab-content-scenario .v9-team-outputs small { color: var(--ink2); font-size: 11px; }
+#tab-content-scenario .v9-scenario-evidence { font-size: 11px; }
+
+/* 编辑表单:分支/队伍 fieldset 顶条与 legend 同色 */
+#tab-content-scenario .v9-branch-editor fieldset[data-branch="baseline"] { border-top: 2px solid var(--info); }
+#tab-content-scenario .v9-branch-editor fieldset[data-branch="escalation"] { border-top: 2px solid var(--danger); }
+#tab-content-scenario .v9-branch-editor fieldset[data-branch="deescalation"] { border-top: 2px solid var(--success); }
+#tab-content-scenario .v9-branch-editor fieldset[data-branch="baseline"] legend { color: var(--info); }
+#tab-content-scenario .v9-branch-editor fieldset[data-branch="escalation"] legend { color: var(--danger); }
+#tab-content-scenario .v9-branch-editor fieldset[data-branch="deescalation"] legend { color: var(--success); }
+#tab-content-scenario .v9-team-editor fieldset[data-team="red"] { border-top: 2px solid var(--danger); }
+#tab-content-scenario .v9-team-editor fieldset[data-team="blue"] { border-top: 2px solid var(--info); }
+#tab-content-scenario .v9-team-editor fieldset[data-team="judge"] { border-top: 2px solid var(--warning); }
+#tab-content-scenario .v9-team-editor fieldset[data-team="red"] legend { color: var(--danger); }
+#tab-content-scenario .v9-team-editor fieldset[data-team="blue"] legend { color: var(--info); }
+#tab-content-scenario .v9-team-editor fieldset[data-team="judge"] legend { color: var(--warning); }
+#tab-content-scenario .v9-branch-editor legend,
+#tab-content-scenario .v9-team-editor legend { font-size: 10.5px; }
+#tab-content-scenario .v9-scenario-common label { font-size: 10.5px; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k3-writing-upgrade.css §4.1 V9 版本化写作室(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §4 brief 写作室(最高优先级) ────────────────────────── */
+/* 4.1 V9 版本化写作室 */
+#tab-content-brief .v9-writing-workbench { margin-top: 24px; }
+#tab-content-brief .v9-document-form label { font-size: 11px; }
+#tab-content-brief .v9-document-outline textarea { min-height: 110px; }
+#tab-content-brief .v9-paragraph-head span { color: var(--accent); font-size: 10.5px; }
+#tab-content-brief .v9-paragraph-head h2 { font-family: var(--sans); font-size: 18px; font-weight: 600; }
+#tab-content-brief .v9-paragraph-head button { min-height: 36px; padding: 6px 14px; font-size: 12px; }
+#tab-content-brief .v9-paragraph-card { padding: 16px; }
+#tab-content-brief .v9-paragraph-card > header span { color: var(--ink2); font-size: 10.5px; }
+#tab-content-brief .v9-paragraph-card textarea { min-height: 110px; }
+/* 校验区:ready=绿边/blocked=红边已在底层,此处补字号与节奏 */
+#tab-content-brief .v9-document-validation { padding: 14px 16px; font-size: 13px; line-height: 1.6; }
+#tab-content-brief .v9-document-validation strong { font-size: 14px; }
+#tab-content-brief .v9-document-validation span { font-size: 11px; }
+#tab-content-brief .v9-document-validation ul { font-size: 13px; line-height: 1.7; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k3-writing-upgrade.css §5 delivery 版面计划(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §5 delivery 版面计划 ────────────────────────────────── */
+/* 汇总行:fail-closed 计数文案 */
+#tab-content-delivery .v9-delivery-summary { padding: 12px 16px; font-size: 12px; color: var(--ink2); }
+
+/* 四列双编码:列名文字已在,补语义顶条与计数色 */
+#tab-content-delivery section[data-publication-column="evidence_needed"] { box-shadow: inset 0 2px 0 var(--warning); }
+#tab-content-delivery section[data-publication-column="editing"] { box-shadow: inset 0 2px 0 var(--info); }
+#tab-content-delivery section[data-publication-column="pending_approval"] { box-shadow: inset 0 2px 0 var(--accent); }
+#tab-content-delivery section[data-publication-column="signed"] { box-shadow: inset 0 2px 0 var(--success); }
+#tab-content-delivery .v9-p5-board > section > header span,
+#tab-content-delivery .v9-p5-board > section > header em { font-size: 10.5px; }
+#tab-content-delivery section[data-publication-column="evidence_needed"] > header b { color: var(--warning); }
+#tab-content-delivery section[data-publication-column="editing"] > header b { color: var(--info); }
+#tab-content-delivery section[data-publication-column="pending_approval"] > header b { color: var(--accent); }
+#tab-content-delivery section[data-publication-column="signed"] > header b { color: var(--success); }
+
+/* 稿件卡:状态 kicker 随列语义,字号可读 */
+#tab-content-delivery .v9-publication-card > span { font-size: 10.5px; }
+#tab-content-delivery section[data-publication-column="evidence_needed"] .v9-publication-card > span { color: var(--warning); }
+#tab-content-delivery section[data-publication-column="editing"] .v9-publication-card > span { color: var(--info); }
+#tab-content-delivery section[data-publication-column="pending_approval"] .v9-publication-card > span { color: var(--accent); }
+#tab-content-delivery section[data-publication-column="signed"] .v9-publication-card > span { color: var(--success); }
+#tab-content-delivery .v9-publication-card p { font-size: 11px; line-height: 1.6; }
+#tab-content-delivery .v9-publication-card button { min-height: 36px; padding: 6px 12px; font-size: 12px; }
+
+/* 签发/撤回 = 门禁高危动作:危险红实体 + 白字(用户指定变体) */
+#tab-content-delivery .v9-publication-card button.approve,
+#tab-content-delivery .v9-publication-card button.danger {
+  background: var(--btn-danger-bg); border-color: transparent;
+  color: var(--on-danger); font-weight: 600;
+}
+#tab-content-delivery .v9-publication-card button.approve:hover,
+#tab-content-delivery .v9-publication-card button.danger:hover { filter: brightness(1.12); }
+#tab-content-delivery .v9-board-empty { font-size: 12px; }
+
+/* 返回写作室:导航降为描边次级,本页主蓝让给签发区语义 */
+#tab-content-delivery .v9-page-head [data-v9-target="brief"] {
+  background: transparent; border: 1px solid var(--line2);
+  color: var(--accent); font-weight: 500;
+}
+#tab-content-delivery .v9-page-head [data-v9-target="brief"]:hover {
+  background: rgba(79,159,232,.08); border-color: var(--accent); color: var(--accent);
+}
+
+/* 撤回/审计台账 */
+#tab-content-delivery .v9-recalled-ledger header span { color: var(--danger); font-size: 10.5px; }
+#tab-content-delivery .v9-audit-ledger header span { color: var(--ink3); font-size: 10.5px; }
+#tab-content-delivery .v9-recalled-ledger h2,
+#tab-content-delivery .v9-audit-ledger h2 { font-family: var(--sans); font-size: 18px; font-weight: 600; }
+#tab-content-delivery #v9RecalledList, #tab-content-delivery #v9AuditList { font-size: 12px; }
+#tab-content-delivery #v9RecalledList article small,
+#tab-content-delivery #v9AuditList article small { font-size: 11px; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k3-writing-upgrade.css §6 中间宽度降级(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* ── §6 中间宽度降级(1024–1280) ─────────────────────────── */
+@media (max-width: 1280px) {
+  #tab-content-squad .v9-job-workbench,
+  #tab-content-scenario .v9-scenario-workbench { grid-template-columns: 280px minmax(0, 1fr); }
+  #tab-content-brief .v9-writing-workbench { grid-template-columns: 260px minmax(0, 1fr); }
+  #tab-content-squad .v9-task-grid strong { font-size: 18px; }
+}

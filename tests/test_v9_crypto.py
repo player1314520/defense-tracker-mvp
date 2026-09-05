@@ -397,3 +397,41 @@ def test_vault_startup_hardens_matching_frozen_exe_adjacent_copy(
     assert vault_key.read_bytes().startswith(DPAPI_MASTER_KEY_MAGIC)
     assert exe_key.read_bytes().startswith(DPAPI_MASTER_KEY_MAGIC)
     assert legacy_key not in exe_key.read_bytes()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI is required")
+def test_controlled_recovery_hardens_matching_legacy_config_copy(tmp_path):
+    from v9.crypto import DPAPI_MASTER_KEY_MAGIC
+    from v9.service import V9Service
+
+    runtime = tmp_path / "runtime"
+    vault_key = runtime / "vault" / ".v9_local_master.key"
+    config_key = runtime / "config" / ".v9_local_master.key"
+    database_path = runtime / "data" / "v9.sqlite3"
+
+    service = V9Service(database_path, vault_key)
+    context = service.get_or_create_personal_context()
+    record = service.create_record(
+        context["organization_id"],
+        context["user_id"],
+        context["device_id"],
+        "document",
+        {"body": "recover without leaving a raw legacy key"},
+    )
+    correct_key = bytes(service._master_key)
+    config_key.parent.mkdir(parents=True)
+    config_key.write_bytes(correct_key)
+    vault_key.write_bytes(os.urandom(32))
+
+    locked = V9Service(database_path, vault_key)
+    assert locked.is_key_locked is True
+
+    locked.restore_local_master_key(correct_key)
+
+    assert vault_key.read_bytes().startswith(DPAPI_MASTER_KEY_MAGIC)
+    assert config_key.read_bytes().startswith(DPAPI_MASTER_KEY_MAGIC)
+    assert correct_key not in config_key.read_bytes()
+    restored = locked.read_record(
+        context["organization_id"], context["user_id"], record["record_id"]
+    )
+    assert restored["content"]["body"] == "recover without leaving a raw legacy key"

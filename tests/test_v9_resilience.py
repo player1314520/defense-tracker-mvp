@@ -62,9 +62,8 @@ def test_service_creates_integrity_checked_local_backup(tmp_path):
 
 
 def test_wrong_local_master_key_fails_closed(tmp_path):
-    from cryptography.exceptions import InvalidTag
     from v9.backup import backup_database
-    from v9.service import V9Service
+    from v9.service import V9KeyLocked, V9Service
 
     service, context = _service(tmp_path)
     service.create_record(
@@ -77,7 +76,8 @@ def test_wrong_local_master_key_fails_closed(tmp_path):
     copied = backup_database(service.database_path, tmp_path / "copied.sqlite3")
     locked = V9Service(copied, tmp_path / "wrong" / ".master")
 
-    with pytest.raises(InvalidTag):
+    assert locked.is_key_locked is True
+    with pytest.raises(V9KeyLocked):
         locked.read_record(
             context["organization_id"],
             context["user_id"],

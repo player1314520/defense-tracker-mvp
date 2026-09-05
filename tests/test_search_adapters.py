@@ -1,10 +1,34 @@
 import json
 import logging
+from io import BytesIO
+import zipfile
 
 import pytest
 import requests
 
 import search_adapters
+
+
+def _pdf_bytes(page_count: int) -> bytes:
+    from pypdf import PdfWriter
+
+    output = BytesIO()
+    writer = PdfWriter()
+    for _ in range(page_count):
+        writer.add_blank_page(width=72, height=72)
+    writer.write(output)
+    return output.getvalue()
+
+
+def _docx_bytes(*, extra_entries: dict[str, bytes] | None = None) -> bytes:
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", b"<Types/>")
+        archive.writestr("_rels/.rels", b"<Relationships/>")
+        archive.writestr("word/document.xml", b"<w:document/>")
+        for name, payload in (extra_entries or {}).items():
+            archive.writestr(name, payload)
+    return output.getvalue()
 
 
 def _clear_search_env(monkeypatch):
@@ -285,6 +309,195 @@ def test_extract_html_document_returns_citable_source_card():
     assert doc["is_fetched_original"] is True
     assert "unmanned systems" in doc["text"]
     assert doc["word_count"] >= 10
+
+
+def test_remote_pdf_rejects_spoofed_magic_before_pdfplumber(monkeypatch):
+    class _Response:
+        status_code = 200
+        headers = {"Content-Type": "application/pdf"}
+        encoding = "utf-8"
+
+        def __init__(self):
+            self.closed = False
+            self.cookies = requests.cookies.RequestsCookieJar()
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            assert chunk_size > 0
+            yield b"<html>not a PDF</html>"
+
+        def close(self):
+            self.closed = True
+
+    response = _Response()
+    monkeypatch.setattr(search_adapters, "pinned_get", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("isolated parser must not see bytes that failed PDF magic validation")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="PDF_MAGIC_MISMATCH"):
+        search_adapters.extract_url(
+            "https://example.test/spoofed.pdf",
+            ssrf_check=lambda _url: (True, ""),
+        )
+
+    assert response.closed is True
+
+
+def test_remote_pdf_defers_page_limit_validation_to_isolated_worker(monkeypatch):
+    observed = {}
+
+    def fake_isolated(kind, content, filename, **kwargs):
+        observed.update(kind=kind, content=content, filename=filename, kwargs=kwargs)
+        raise search_adapters.IsolatedDocumentParseError(
+            "PDF_PAGE_LIMIT_EXCEEDED", "too many pages"
+        )
+
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        fake_isolated,
+    )
+
+    with pytest.raises(RuntimeError, match="PDF_PAGE_LIMIT_EXCEEDED"):
+        search_adapters.extract_pdf_document(
+            "https://example.test/too-many-pages.pdf",
+            _pdf_bytes(3),
+            max_pages=2,
+        )
+
+    assert observed["kind"] == "pdf"
+    assert observed["kwargs"]["max_pages"] == 2
+
+
+def test_remote_pdf_reports_parse_deadline(monkeypatch):
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            search_adapters.IsolatedDocumentParseError(
+                "DOCUMENT_PARSE_TIMEOUT", "terminated"
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="REMOTE_PDF_PARSE_TIMEOUT"):
+        search_adapters.extract_pdf_document(
+            "https://example.test/slow.pdf",
+            _pdf_bytes(1),
+            max_parse_seconds=1.0,
+        )
+
+
+def test_remote_pdf_preserves_parser_isolation_failure_code(monkeypatch):
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            search_adapters.IsolatedDocumentParseError(
+                "DOCUMENT_PARSER_ISOLATION_FAILED", "isolation unavailable"
+            )
+        ),
+    )
+
+    with pytest.raises(
+        search_adapters.RemoteDocumentError,
+        match="DOCUMENT_PARSER_ISOLATION_FAILED",
+    ) as caught:
+        search_adapters.extract_pdf_document(
+            "https://example.test/report.pdf", _pdf_bytes(1)
+        )
+
+    assert caught.value.code == "DOCUMENT_PARSER_ISOLATION_FAILED"
+
+
+def test_remote_docx_rejects_spoofed_magic_before_python_docx(monkeypatch):
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("isolated parser must not see bytes that failed DOCX magic validation")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="DOCX_MAGIC_MISMATCH"):
+        search_adapters.extract_docx_document(
+            "https://example.test/spoofed.docx",
+            b"not a zip archive",
+        )
+
+
+def test_remote_docx_defers_zip_structure_validation_to_isolated_worker(monkeypatch):
+    payload = _docx_bytes(extra_entries={"word/media/bomb.bin": b"0" * 200_000})
+    observed = {}
+
+    def fake_isolated(kind, content, filename, **kwargs):
+        observed.update(kind=kind, content=content, filename=filename, kwargs=kwargs)
+        raise search_adapters.IsolatedDocumentParseError(
+            "DOCX_COMPRESSION_RATIO_EXCEEDED", "zip bomb"
+        )
+
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        fake_isolated,
+    )
+
+    with pytest.raises(RuntimeError, match="DOCX_COMPRESSION_RATIO_EXCEEDED"):
+        search_adapters.extract_docx_document(
+            "https://example.test/bomb.docx",
+            payload,
+        )
+
+    assert observed["kind"] == "docx"
+    assert observed["content"] is payload
+
+
+def test_remote_docx_reports_parse_deadline_before_python_docx(monkeypatch):
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            search_adapters.IsolatedDocumentParseError(
+                "DOCUMENT_PARSE_TIMEOUT", "terminated"
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="REMOTE_DOCX_PARSE_TIMEOUT"):
+        search_adapters.extract_docx_document(
+            "https://example.test/slow.docx",
+            _docx_bytes(),
+            max_parse_seconds=1.0,
+        )
+
+
+def test_remote_docx_preserves_parser_queue_full_code(monkeypatch):
+    monkeypatch.setattr(
+        search_adapters,
+        "parse_document_isolated",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            search_adapters.IsolatedDocumentParseError(
+                "DOCUMENT_PARSE_QUEUE_FULL", "queue full"
+            )
+        ),
+    )
+
+    with pytest.raises(
+        search_adapters.RemoteDocumentError,
+        match="DOCUMENT_PARSE_QUEUE_FULL",
+    ) as caught:
+        search_adapters.extract_docx_document(
+            "https://example.test/report.docx", _docx_bytes()
+        )
+
+    assert caught.value.code == "DOCUMENT_PARSE_QUEUE_FULL"
 
 
 def test_relevance_filter_gates_pure_chinese_narrow_topic(monkeypatch):

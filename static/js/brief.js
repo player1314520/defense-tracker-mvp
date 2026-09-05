@@ -17,36 +17,50 @@ const QUALITY_FEEDBACK_REASONS = {
 // 从localStorage加载历史要讯
 try {
   const saved = localStorage.getItem('briefResults');
-  if (saved) briefResults = JSON.parse(saved) || [];
+  if (saved) {
+    const parsed = JSON.parse(saved);
+    briefResults = Array.isArray(parsed) ? parsed.map(_briefCleanItem) : [];
+  }
 } catch(e) { briefResults = []; }
 
-function briefSave() {
-  const clean = briefResults.slice(0, 50).map(r => {
-    const {_editing, _editBuffer, sourceEvidence, ...rest} = r;
-    const evidenceOrigin = sourceEvidence?.payload?.origin || 'unknown';
-    const article = {...(rest.article || {})};
-    // 用户导入的原文及其证据只保留在当前页面内存，不写浏览器或用户状态库。
-    if (evidenceOrigin !== 'rss_cache') article.summary = '';
-    return {
-      ...rest,
-      article,
-      ...(evidenceOrigin === 'rss_cache' ? {sourceEvidence} : {}),
-    };
-  });
-  try {
-    localStorage.setItem('briefResults', JSON.stringify(clean));
-  } catch(e) {
-    console.warn('要讯历史未能写入浏览器存储', e);
-    if (typeof showToast === 'function') showToast('浏览器存储空间不足；本次要讯仍保留在当前页面', 7000);
+const BRIEF_PENDING_DELETE_KEY = 'briefPendingDeletes';
+const BRIEF_PENDING_UPSERT_KEY = 'briefPendingUpserts';
+let _briefSyncTail = Promise.resolve();
+let _briefPendingDeletes = new Set();
+let _briefPendingUpserts = new Map();
+try {
+  const pending = JSON.parse(localStorage.getItem(BRIEF_PENDING_DELETE_KEY) || '[]');
+  if (Array.isArray(pending)) {
+    _briefPendingDeletes = new Set(pending.filter(id => typeof id === 'string' && id));
   }
-  // 浏览器配额失败不能阻断服务端 write-through。
-  try {
-    if (typeof udSync === 'function') {
-      udSync('/api/userdata/kv/briefResults', { _method: 'PUT', value: clean });
-    }
-  } catch(e) {
-    console.warn('要讯历史未能同步到服务端', e);
+} catch (e) { _briefPendingDeletes = new Set(); }
+try {
+  const pending = JSON.parse(localStorage.getItem(BRIEF_PENDING_UPSERT_KEY) || '[]');
+  if (Array.isArray(pending)) {
+    _briefPendingUpserts = new Map(
+      pending.filter(item => item && typeof item.id === 'string' && item.id)
+        .map(item => [item.id, item])
+    );
   }
+} catch (e) { _briefPendingUpserts = new Map(); }
+// 若上次退出发生在删除队列落盘之间，删除意图优先，避免旧 upsert 复活条目。
+for (const id of _briefPendingDeletes) _briefPendingUpserts.delete(id);
+
+function _briefCleanItem(item) {
+  const {_editing, _editBuffer, sourceEvidence, ...rest} = item || {};
+  const evidenceOrigin = sourceEvidence?.payload?.origin || 'unknown';
+  const clean = {...rest};
+  // 用户导入的原文及其证据只保留在当前页面内存，不写浏览器或用户状态库。
+  if (rest.article && typeof rest.article === 'object') {
+    clean.article = {...rest.article};
+    if (evidenceOrigin !== 'rss_cache') clean.article.summary = '';
+  }
+  if (evidenceOrigin === 'rss_cache') clean.sourceEvidence = sourceEvidence;
+  return clean;
+}
+
+function _briefNeedsCleanup(item) {
+  return JSON.stringify(_briefCleanItem(item)) !== JSON.stringify(item);
 }
 
 function _briefArticleRef(article) {
@@ -57,19 +71,205 @@ function _briefArticleRef(article) {
   };
 }
 
-// ☁ 启动合并：服务端要讯历史与本地按 id 并集（服务端优先），合并后回推
-window.addEventListener('userdata-ready', (e) => {
-  const server = e.detail && e.detail.brief_results;
-  if (Array.isArray(server) && server.length) {
-    const seen = new Set(server.map(r => r.id));
-    const merged = server.concat(briefResults.filter(r => !seen.has(r.id)));
-    merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    briefResults = merged.slice(0, 50);
-    briefSave();
-    if (typeof briefRenderResults === 'function') briefRenderResults();
-  } else if (briefResults.length) {
-    briefSave();  // 服务端为空、本地有存量 → 首次推上去
+function briefWasSaved(data) {
+  return Boolean(data && (data.saved === true || data.saved_to));
+}
+
+function _briefPersistLocal() {
+  const clean = briefResults.slice(0, 50).map(_briefCleanItem);
+  try {
+    localStorage.setItem('briefResults', JSON.stringify(clean));
+  } catch (e) {
+    console.warn('要讯历史未能写入浏览器存储', e);
+    if (typeof showToast === 'function') showToast('浏览器存储空间不足；本次要讯仍保留在当前页面', 7000);
   }
+  return clean;
+}
+
+function _briefPersistPendingDeletes() {
+  try {
+    localStorage.setItem(BRIEF_PENDING_DELETE_KEY, JSON.stringify([..._briefPendingDeletes]));
+  } catch (e) {
+    console.warn('待同步删除项未能写入浏览器存储', e);
+  }
+}
+
+function _briefPersistPendingUpserts() {
+  try {
+    localStorage.setItem(BRIEF_PENDING_UPSERT_KEY, JSON.stringify([..._briefPendingUpserts.values()]));
+  } catch (e) {
+    console.warn('待同步要讯未能写入浏览器存储', e);
+  }
+}
+
+function _briefApplyStateMeta(state) {
+  if (typeof userdataApplyMeta === 'function') {
+    userdataApplyMeta(state);
+    return;
+  }
+  const revision = Number(state && state.revision);
+  if (Number.isInteger(revision) && revision >= 0) window.__USERDATA_REVISION__ = revision;
+}
+
+function _briefMergeServerState(serverItems, additionallySuppressed = []) {
+  const suppressed = new Set([..._briefPendingDeletes, ...additionallySuppressed]);
+  const localById = new Map(
+    briefResults.filter(item => item && item.id && !suppressed.has(item.id))
+      .map(item => [item.id, item])
+  );
+  const merged = [];
+  const seen = new Set();
+  for (const serverItem of (Array.isArray(serverItems) ? serverItems : [])) {
+    if (!serverItem || !serverItem.id || suppressed.has(serverItem.id) || seen.has(serverItem.id)) continue;
+    merged.push(localById.get(serverItem.id) || serverItem);
+    seen.add(serverItem.id);
+  }
+  for (const localItem of localById.values()) {
+    if (!seen.has(localItem.id)) merged.push(localItem);
+  }
+  merged.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
+  briefResults = merged.slice(0, 50);
+  _briefPersistLocal();
+  if (typeof briefRenderResults === 'function') briefRenderResults();
+}
+
+async function _briefRefreshState(suppressedIds = []) {
+  const response = await fetch('/api/userdata/brief-results', {credentials: 'same-origin'});
+  if (!response.ok) throw new Error(`刷新用户状态失败（HTTP ${response.status}）`);
+  const state = await response.json();
+  _briefApplyStateMeta(state);
+  _briefMergeServerState(state.brief_results, suppressedIds);
+  return state;
+}
+
+async function _briefMutate(method, path, body, suppressedIds = []) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!Number.isInteger(window.__USERDATA_REVISION__)) {
+      await _briefRefreshState(suppressedIds);
+    }
+    const revision = window.__USERDATA_REVISION__;
+    const response = await fetch(path, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'If-Match': `"${revision}"`,
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify(body || {}),
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch (e) { payload = {}; }
+    if (response.status === 409 && payload.code === 'REVISION_CONFLICT') {
+      await _briefRefreshState(suppressedIds);
+      continue;
+    }
+    if (!response.ok) {
+      throw new Error(payload.error || `用户状态同步失败（HTTP ${response.status}）`);
+    }
+    _briefApplyStateMeta(payload);
+    _briefMergeServerState(payload.brief_results, suppressedIds);
+    return payload;
+  }
+  throw new Error('用户状态持续发生并发冲突，请稍后重试');
+}
+
+function _briefEnqueue(task) {
+  const run = _briefSyncTail.then(task, task);
+  _briefSyncTail = run.catch(() => {});
+  return run;
+}
+
+function _briefQueueUpserts(items) {
+  const cleanItems = (Array.isArray(items) ? items : [items])
+    .filter(item => item && item.id)
+    .map(_briefCleanItem);
+  const unique = [...new Map(cleanItems.map(item => [item.id, item])).values()];
+  for (const item of unique) {
+    _briefPendingDeletes.delete(item.id);
+    _briefPersistPendingDeletes();
+    _briefPendingUpserts.set(item.id, item);
+    _briefPersistPendingUpserts();
+    _briefEnqueue(() => _briefMutate(
+      'PUT',
+      '/api/userdata/brief-results/' + encodeURIComponent(item.id),
+      {item},
+    )).then(() => {
+      const current = _briefPendingUpserts.get(item.id);
+      if (current && JSON.stringify(current) === JSON.stringify(item)) {
+        _briefPendingUpserts.delete(item.id);
+        _briefPersistPendingUpserts();
+      }
+    }).catch(error => console.warn('[brief sync upsert]', item.id, error.message));
+  }
+}
+
+function _briefQueueDelete(itemIds) {
+  const ids = [...new Set((Array.isArray(itemIds) ? itemIds : [itemIds]).filter(Boolean))];
+  if (!ids.length) return;
+  ids.forEach(id => _briefPendingDeletes.add(id));
+  ids.forEach(id => _briefPendingUpserts.delete(id));
+  _briefPersistPendingDeletes();
+  _briefPersistPendingUpserts();
+  const one = ids.length === 1;
+  const path = one
+    ? '/api/userdata/brief-results/' + encodeURIComponent(ids[0])
+    : '/api/userdata/brief-results';
+  const body = one ? {} : {item_ids: ids};
+  _briefEnqueue(() => _briefMutate('DELETE', path, body, ids))
+    .then(() => {
+      ids.forEach(id => _briefPendingDeletes.delete(id));
+      _briefPersistPendingDeletes();
+    })
+    .catch(error => console.warn('[brief sync delete]', error.message));
+}
+
+function briefSave(changedItems = []) {
+  try {
+    _briefPersistLocal();
+    const items = Array.isArray(changedItems) ? changedItems : [changedItems];
+    if (items.length) _briefQueueUpserts(items);
+  } catch(e) {
+    console.warn('[brief local save]', e.message);
+  }
+}
+
+// ☁ 启动合并：服务端优先；仅把服务端缺少的本地条目逐条 upsert。
+window.addEventListener('userdata-ready', (e) => {
+  const detail = (e && e.detail) || {};
+  _briefApplyStateMeta(detail);
+  const rawServer = Array.isArray(detail.brief_results) ? detail.brief_results : [];
+  const cleanupUpserts = rawServer
+    .filter(item => item && item.id && !_briefPendingDeletes.has(item.id))
+    .filter(_briefNeedsCleanup)
+    .map(_briefCleanItem);
+  const server = rawServer.map(_briefCleanItem);
+  const localMap = new Map(
+    briefResults.filter(item => item && item.id && !_briefPendingDeletes.has(item.id))
+      .map(item => [item.id, item])
+  );
+  for (const item of _briefPendingUpserts.values()) {
+    if (!_briefPendingDeletes.has(item.id)) localMap.set(item.id, item);
+  }
+  const local = [...localMap.values()];
+  const serverIds = new Set(server.map(item => item && item.id).filter(Boolean));
+  const localOnly = local.filter(item => !serverIds.has(item.id));
+  const localById = new Map(local.map(item => [item.id, item]));
+  const merged = server
+    .filter(item => item && item.id && !_briefPendingDeletes.has(item.id))
+    .map(item => _briefPendingUpserts.get(item.id) || item);
+  const seen = new Set(merged.map(item => item.id));
+  for (const item of localById.values()) {
+    if (!seen.has(item.id)) merged.push(item);
+  }
+  merged.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
+  briefResults = merged.slice(0, 50);
+  _briefPersistLocal();
+  if (typeof briefRenderResults === 'function') briefRenderResults();
+  const pendingUpserts = [...new Map(
+    [...cleanupUpserts, ...localOnly, ..._briefPendingUpserts.values()].map(item => [item.id, item])
+  ).values()];
+  if (pendingUpserts.length) _briefQueueUpserts(pendingUpserts);
+  if (_briefPendingDeletes.size) _briefQueueDelete([..._briefPendingDeletes]);
 });
 
 // 加载候选文章
@@ -188,7 +388,7 @@ async function briefGenerateSingle(idx) {
     if (data.error) { showToast('❌ ' + data.error); return; }
     if (data.article_id) article.article_id = data.article_id;
     briefAddResult(data.brief, {...article, ...(data.source_article || {})}, data.source_evidence);
-    showToast(data.saved_to ? '✅ 已生成1篇要讯 · 已存档到 素材库/每日新闻/' : '✅ 已生成1篇要讯');
+    showToast(briefWasSaved(data) ? '✅ 已生成1篇要讯 · 已安全存档' : '✅ 已生成1篇要讯');
   } catch(e) {
     showToast('❌ 生成失败: ' + e.message);
   } finally {
@@ -214,7 +414,7 @@ async function oneClickBrief(idx, btn) {
     if (data.error) { showToast('生成失败：' + data.error); return; }
     briefAddResult(data.brief, {...item, ...(data.source_article || {})}, data.source_evidence);
     showTab('brief');
-    showToast(data.saved_to ? '要讯已生成并存档到 素材库/每日新闻/' : '要讯已生成');
+    showToast(briefWasSaved(data) ? '要讯已生成并安全存档' : '要讯已生成');
   } catch(e) {
     showToast('生成失败: ' + e.message);
   } finally {
@@ -316,7 +516,7 @@ function briefAddResult(brief, article, sourceEvidence) {
     timestamp: new Date().toISOString(),
   });
   briefResults = briefResults.slice(0, 50);
-  briefSave();
+  briefSave(briefResults[0]);
   briefRenderResults();
 }
 
@@ -537,6 +737,10 @@ async function briefEditSave(id) {
   if (!r) return;
   const newText = (r._editBuffer != null) ? r._editBuffer : r.brief;
   if (!await _briefValidateForRelease(r, newText)) return;
+  if (briefResults.find(x => x.id === id) !== r) {
+    showToast('校验期间该要讯已删除或替换，未保存', 5000);
+    return;
+  }
   const currentText = (r._editBuffer != null) ? r._editBuffer : r.brief;
   if (currentText !== newText) {
     showToast('校验期间内容已变化，请再次保存', 5000);
@@ -545,7 +749,7 @@ async function briefEditSave(id) {
   r.brief = newText;
   r._editing = false;
   delete r._editBuffer;
-  briefSave();
+  briefSave(r);
   briefRenderResults();
   showToast('已保存修改');
 }
@@ -568,6 +772,12 @@ function _briefFlushEdit(r) {
     return true;
   }
   return false;
+}
+
+function _briefFlushAllEdits() {
+  const changed = [];
+  briefResults.forEach(item => { if (_briefFlushEdit(item)) changed.push(item); });
+  return changed;
 }
 
 function _briefReleaseReady(r, text) {
@@ -603,6 +813,10 @@ async function briefCopyOne(id) {
   if (!r) return;
   const candidate = (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief;
   if (!await _briefValidateForRelease(r, candidate)) return;
+  if (briefResults.find(x => x.id === id) !== r) {
+    showToast('校验期间该要讯已删除或替换，未复制', 5000);
+    return;
+  }
   const current = (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief;
   if (current !== candidate) {
     showToast('校验期间内容已变化，请重新复制', 5000);
@@ -612,7 +826,7 @@ async function briefCopyOne(id) {
     r.brief = candidate;
     r._editing = false;
     delete r._editBuffer;
-    briefSave();
+    briefSave(r);
     briefRenderResults();
   }
   navigator.clipboard.writeText(candidate).then(() => showToast('已复制要讯'));
@@ -623,7 +837,7 @@ async function briefDownloadDocx(id) {
   if (!r) return;
   const candidate = (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief;
   if (!_briefReleaseReady(r, candidate)) return;
-  if (_briefFlushEdit(r)) { briefSave(); briefRenderResults(); }
+  if (_briefFlushEdit(r)) { briefSave(r); briefRenderResults(); }
   showToast('生成Word文件…');
   try {
     const resp = await apiFetch('/api/brief/export_docx', {
@@ -645,9 +859,8 @@ async function briefDownloadCompiledDocx() {
   ));
   if (invalid) return;
   // 把所有编辑态未保存的修改 flush 到 r.brief
-  let _flushed = 0;
-  briefResults.forEach(r => { if (_briefFlushEdit(r)) _flushed++; });
-  if (_flushed) { briefSave(); briefRenderResults(); }
+  const flushed = _briefFlushAllEdits();
+  if (flushed.length) { briefSave(flushed); briefRenderResults(); }
   showToast(`汇编 ${briefResults.length} 篇要讯…`);
   try {
     const resp = await apiFetch('/api/brief/export_docx_compiled', {
@@ -670,9 +883,8 @@ async function briefDownloadAllDocx() {
     r, (r._editing && r._editBuffer != null) ? r._editBuffer : r.brief
   ));
   if (invalid) return;
-  let _flushed = 0;
-  briefResults.forEach(r => { if (_briefFlushEdit(r)) _flushed++; });
-  if (_flushed) { briefSave(); briefRenderResults(); }
+  const flushed = _briefFlushAllEdits();
+  if (flushed.length) { briefSave(flushed); briefRenderResults(); }
   showToast(`批量生成 ${briefResults.length} 个Word文件…`);
   for (const r of briefResults) {
     try {
@@ -690,7 +902,8 @@ async function briefDownloadAllDocx() {
 
 function briefDeleteOne(id) {
   briefResults = briefResults.filter(x => x.id !== id);
-  briefSave();
+  _briefPersistLocal();
+  _briefQueueDelete(id);
   briefRenderResults();
   showToast('已删除');
 }
@@ -700,7 +913,8 @@ async function briefDiscardResult(id) {
   if (!r) return;
   if (r.article?.region === '导入') {
     briefResults = briefResults.filter(x => x.id !== id);
-    briefSave();
+    _briefPersistLocal();
+    _briefQueueDelete(id);
     briefRenderResults();
     showToast('已废弃并删除；导入内容未写入质量样本库');
     return;
@@ -787,9 +1001,9 @@ async function briefRegenerate(id) {
     }
     r.timestamp = new Date().toISOString();
     if (data.validation) r.validation = data.validation;
-    briefSave();
+    briefSave(r);
     briefRenderResults();
-    showToast(data.saved_to ? '已重新生成 · 已存档到 素材库/每日新闻/' : '已重新生成');
+    showToast(briefWasSaved(data) ? '已重新生成并安全存档' : '已重新生成');
   } catch(e) {
     showToast('重写失败: ' + e.message, 5000);
   } finally {
@@ -804,8 +1018,10 @@ async function briefRegenerate(id) {
 function briefClearResults() {
   if (!briefResults.length) return;
   if (!confirm(`确定清空全部 ${briefResults.length} 篇已生成要讯吗？`)) return;
+  const clearedIds = briefResults.map(item => item.id).filter(Boolean);
   briefResults = [];
-  briefSave();
+  _briefPersistLocal();
+  _briefQueueDelete(clearedIds);
   briefRenderResults();
   showToast('已清空');
 }
@@ -831,17 +1047,20 @@ async function briefExportAll() {
     showToast('校验期间要讯集合或内容已变化，请重新导出', 5000);
     return;
   }
-  let _flushed = 0;
+  const changed = [];
+  let closedEditor = false;
   snapshots.forEach(item => {
     const r = item.result;
     if (r._editing) {
+      if (r.brief !== item.text) changed.push(r);
       r.brief = item.text;
       r._editing = false;
       delete r._editBuffer;
-      _flushed++;
+      closedEditor = true;
     }
   });
-  if (_flushed) { briefSave(); briefRenderResults(); }
+  if (changed.length) briefSave(changed);
+  if (closedEditor) briefRenderResults();
   const today = new Date().toISOString().slice(0, 10);
   const content = snapshots.map((item, i) => {
     const r = item.result;
@@ -984,7 +1203,7 @@ function _importAddResult(data) {
     model: data.model,
   };
   briefResults.unshift(result);
-  briefSave();
+  briefSave(result);
   briefRenderResults();
   document.getElementById('briefDoneCount').textContent = briefResults.length;
   showToast('要讯已生成（导入素材）');
@@ -1004,7 +1223,7 @@ async function importFromUrl() {
       body: JSON.stringify({url}),
     }, {toast: false});
     const data = await resp.json();
-    _importShowStatus('✅', `生成成功！提取 ${data.source_info.body_length} 字 · 来源: ${data.source_info.source}${data.saved_to ? ' · 已存档到 素材库/每日新闻/' : ''}`);
+    _importShowStatus('✅', `生成成功！提取 ${data.source_info.body_length} 字 · 来源: ${data.source_info.source}${briefWasSaved(data) ? ' · 已安全存档' : ''}`);
     _importAddResult(data);
     urlInput.value = '';
   } catch (e) {
@@ -1047,7 +1266,7 @@ async function importFromFile() {
     formData.append('pub_date', pubDate);
     const resp = await apiFetch('/api/brief/import_file', {method: 'POST', body: formData}, {toast: false});
     const data = await resp.json();
-    _importShowStatus('✅', `生成成功！提取 ${data.source_info.body_length} 字 · 文件: ${data.source_info.source}${data.saved_to ? ' · 已存档到 素材库/每日新闻/' : ''}`);
+    _importShowStatus('✅', `生成成功！提取 ${data.source_info.body_length} 字 · 文件: ${data.source_info.source}${briefWasSaved(data) ? ' · 已安全存档' : ''}`);
     _importAddResult(data);
     input.value = '';
     document.getElementById('importFileText').textContent = '点击选择文件或拖拽至此';
@@ -1079,7 +1298,7 @@ async function importFromText() {
       body: JSON.stringify({text, title, source, pub_date: pubDate}),
     }, {toast: false});
     const data = await resp.json();
-    _importShowStatus('✅', `生成成功！来源: ${data.source_info.source}${data.saved_to ? ' · 已存档到 素材库/每日新闻/' : ''}`);
+    _importShowStatus('✅', `生成成功！来源: ${data.source_info.source}${briefWasSaved(data) ? ' · 已安全存档' : ''}`);
     _importAddResult(data);
     textArea.value = '';
     document.getElementById('importTextTitle').value = '';

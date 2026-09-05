@@ -26,6 +26,14 @@ BOARD_STATUSES = {
     "signed",
     "recalled",
 }
+LOCAL_SIGNING_NOTICE = (
+    "签发仅表示本地批准并冻结快照，"
+    "不代表已向外部渠道发布"
+)
+
+
+class PublicationRecalled(ValueError):
+    code = "PUBLICATION_RECALLED"
 
 
 def _now() -> str:
@@ -210,6 +218,11 @@ def new_publication_item(document: dict, actor_user_id: str) -> dict:
         "document_version": document["version"],
         "document_content_hash": document["content_hash"],
         "signed_snapshot": None,
+        "publication_semantics": {
+            "scope": "local_approval_snapshot",
+            "external_published": False,
+            "notice": LOCAL_SIGNING_NOTICE,
+        },
         "created_by": actor_user_id,
         "created_at": now,
         "updated_at": now,
@@ -272,6 +285,11 @@ def signed_publication_content(
     result["signed_snapshot"] = {
         "document": copy.deepcopy(document["content"]),
         "source_index": copy.deepcopy(source_index),
+        "publication_semantics": {
+            "scope": "local_approval_snapshot",
+            "external_published": False,
+            "notice": LOCAL_SIGNING_NOTICE,
+        },
         "receipt": {
             "document_id": document["record_id"],
             "document_version": document["version"],
@@ -283,24 +301,80 @@ def signed_publication_content(
     return result
 
 
+def build_recall_audit_notice(publication: dict) -> dict:
+    if publication.get("status") != "recalled":
+        raise ValueError("只有已撤回材料可生成撤回审计件")
+    snapshot = publication.get("signed_snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(
+        snapshot.get("receipt"), dict
+    ):
+        raise ValueError("已撤回材料缺少原签发回执")
+    return {
+        "status": "recalled",
+        "recalled_at": _text(publication.get("recalled_at"), limit=100),
+        "recalled_by": _text(publication.get("recalled_by"), limit=200),
+        "reason": _text(publication.get("recall_reason"), limit=2000),
+        "signed_receipt": copy.deepcopy(snapshot["receipt"]),
+        "publication_semantics": copy.deepcopy(
+            snapshot.get("publication_semantics")
+            or publication.get("publication_semantics")
+            or {
+                "scope": "local_approval_snapshot",
+                "external_published": False,
+                "notice": LOCAL_SIGNING_NOTICE,
+            }
+        ),
+    }
+
+
 def safe_filename(title: str, suffix: str) -> str:
     base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", _text(title, limit=120))
     return f"{base or 'V9稿件'}.{suffix}"
 
 
 def build_document_docx(
-    document_content: dict, source_index: list[dict]
+    document_content: dict,
+    source_index: list[dict],
+    *,
+    recall_audit: dict | None = None,
 ) -> bytes:
     from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, RGBColor
 
     if not validate_document(document_content).get("ready"):
         raise ValueError("稿件校验未通过，禁止生成DOCX")
     document = Document()
+    if recall_audit:
+        for section in document.sections:
+            watermark = section.header.paragraphs[0]
+            watermark.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = watermark.add_run("已撤回 · 审计件")
+            run.bold = True
+            run.font.size = Pt(24)
+            run.font.color.rgb = RGBColor(0xB0, 0x20, 0x20)
     document.add_heading(document_content.get("title") or "V9 稿件", 0)
     document.add_paragraph(
         f"类型：{document_content.get('kind', 'report')}　"
         f"修订：V{document_content.get('revision', 1)}"
     )
+    if recall_audit:
+        receipt = recall_audit.get("signed_receipt") or {}
+        document.add_heading("已撤回 · 仅供审计", level=1)
+        document.add_paragraph(LOCAL_SIGNING_NOTICE)
+        document.add_heading("撤回回执", level=2)
+        document.add_paragraph(
+            f"撤回时间：{recall_audit.get('recalled_at') or '未记录'}；"
+            f"撤回操作人：{recall_audit.get('recalled_by') or '未记录'}；"
+            f"撤回原因：{recall_audit.get('reason') or '未记录'}"
+        )
+        document.add_paragraph(
+            f"原签发回执：稿件ID={receipt.get('document_id') or '未记录'}；"
+            f"版本={receipt.get('document_version') or '未记录'}；"
+            f"内容哈希={receipt.get('document_content_hash') or '未记录'}；"
+            f"签发时间={receipt.get('signed_at') or '未记录'}；"
+            f"签发人={receipt.get('signed_by') or '未记录'}"
+        )
     if document_content.get("outline"):
         document.add_heading("大纲", level=1)
         document.add_paragraph(document_content["outline"])
@@ -338,7 +412,10 @@ def build_document_docx(
 
 
 def build_document_pdf(
-    document_content: dict, source_index: list[dict]
+    document_content: dict,
+    source_index: list[dict],
+    *,
+    recall_audit: dict | None = None,
 ) -> bytes:
     if not validate_document(document_content).get("ready"):
         raise ValueError("稿件校验未通过，禁止生成PDF")
@@ -386,6 +463,47 @@ def build_document_pdf(
         ),
         Spacer(1, 12),
     ]
+    if recall_audit:
+        receipt = recall_audit.get("signed_receipt") or {}
+        story.extend(
+            [
+                Paragraph("已撤回 · 仅供审计", heading_style),
+                Paragraph(html.escape(LOCAL_SIGNING_NOTICE), body_style),
+                Paragraph("撤回回执", heading_style),
+                Paragraph(
+                    html.escape(f"撤回时间：{recall_audit.get('recalled_at') or '未记录'}"),
+                    body_style,
+                ),
+                Paragraph(
+                    html.escape(f"撤回操作人：{recall_audit.get('recalled_by') or '未记录'}"),
+                    body_style,
+                ),
+                Paragraph(
+                    html.escape(f"撤回原因：{recall_audit.get('reason') or '未记录'}"),
+                    body_style,
+                ),
+                Paragraph(
+                    html.escape(f"原签发稿件ID：{receipt.get('document_id') or '未记录'}"),
+                    body_style,
+                ),
+                Paragraph(
+                    html.escape(f"原签发版本：{receipt.get('document_version') or '未记录'}"),
+                    body_style,
+                ),
+                Paragraph(
+                    html.escape(f"原签发内容哈希：{receipt.get('document_content_hash') or '未记录'}"),
+                    body_style,
+                ),
+                Paragraph(
+                    html.escape(f"原签发时间：{receipt.get('signed_at') or '未记录'}"),
+                    body_style,
+                ),
+                Paragraph(
+                    html.escape(f"原签发人：{receipt.get('signed_by') or '未记录'}"),
+                    body_style,
+                ),
+            ]
+        )
     for paragraph in document_content.get("paragraphs", []):
         if paragraph.get("heading"):
             story.append(
@@ -420,10 +538,34 @@ def build_document_pdf(
             )
         )
     output = BytesIO()
-    SimpleDocTemplate(
+    pdf_title = document_content.get("title") or "V9 稿件"
+    if recall_audit:
+        pdf_title = f"{pdf_title}-已撤回-审计件"
+    pdf = SimpleDocTemplate(
         output,
         pagesize=A4,
-        title=document_content.get("title") or "V9 稿件",
+        title=pdf_title,
         author="DefenseTracker V9",
-    ).build(story)
+    )
+
+    def draw_recall_watermark(canvas, _document):
+        if not recall_audit:
+            return
+        canvas.saveState()
+        try:
+            canvas.setFillAlpha(0.18)
+        except AttributeError:
+            pass
+        canvas.setFillColorRGB(0.7, 0.12, 0.12)
+        canvas.setFont("STSong-Light", 38)
+        canvas.translate(A4[0] / 2, A4[1] / 2)
+        canvas.rotate(35)
+        canvas.drawCentredString(0, 0, "已撤回 · 审计件")
+        canvas.restoreState()
+
+    pdf.build(
+        story,
+        onFirstPage=draw_recall_watermark,
+        onLaterPages=draw_recall_watermark,
+    )
     return output.getvalue()

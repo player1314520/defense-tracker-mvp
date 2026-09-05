@@ -985,6 +985,8 @@ def test_full_stack_server_uses_a_reproducible_hash_lock():
         "wechat_runtime.py",
         "product_version.py",
         "document_safety.py",
+        "isolated_document_parser.py",
+        "upload_safety.py",
         "feishu_webhook_security.py",
         "version.json",
         "v9/",
