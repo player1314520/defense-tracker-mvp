@@ -25,6 +25,8 @@ param(
 
     [switch]$PrepareUnsignedApplicationBundle,
 
+    [switch]$UnsignedMvpPreview,
+
     [string]$CredentiallessOutputRoot,
 
     [string]$PublisherPolicyPath = (Join-Path $PSScriptRoot '..\release\publisher-policy.json'),
@@ -71,6 +73,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 . (Join-Path $PSScriptRoot 'ReleaseCertificatePolicy.ps1')
+if ($UnsignedMvpPreview -and ($RequireSignedInstaller -or $CandidateOnly -or $PrepareUnsignedApplicationBundle)) {
+    throw "Unsigned MVP preview cannot be combined with signed release or signing preparation modes."
+}
 if ($RequireSignedInstaller -or $CandidateOnly) {
     throw "Legacy in-process signing is removed. Use Prepare-UnsignedApplicationBundle.ps1, the isolated signing workflows, Prepare-UnsignedInstaller.ps1, and Finalize-SignedCandidate.ps1."
 }
@@ -708,7 +713,8 @@ function Write-DevelopmentBuildManifest {
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)]$Version,
         [Parameter(Mandatory = $true)]$GitFacts,
-        [Parameter(Mandatory = $true)][string]$VersionInfoCompanyName
+        [Parameter(Mandatory = $true)][string]$VersionInfoCompanyName,
+        [switch]$MvpPreview
     )
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd("\") + "\"
     $files = @(
@@ -721,7 +727,7 @@ function Write-DevelopmentBuildManifest {
                 }
             }
     )
-    [ordered]@{
+    $manifest = [ordered]@{
         schema = 2
         kind = "unsigned-development-candidate"
         artifact = [ordered]@{
@@ -743,7 +749,19 @@ function Write-DevelopmentBuildManifest {
             version_info_company_name = $VersionInfoCompanyName
         }
         files = $files
-    } | ConvertTo-Json -Depth 8 |
+    }
+    if ($MvpPreview) {
+        if ($Version.semantic_version -cne '9.0.0') {
+            throw 'The approved MVP preview channel is limited to version 9.0.0.'
+        }
+        $manifest.kind = 'unsigned-mvp-preview'
+        $manifest.artifact.channel = 'mvp-preview'
+        $manifest.artifact.stability = 'preview'
+        $manifest.artifact.public_release_eligible = $true
+        $manifest.artifact.preview_tag = 'v9.0.0-mvp.1'
+        $manifest.artifact.github_prerelease = $true
+    }
+    $manifest | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath (Join-Path $Root "release-manifest.json") -Encoding UTF8
 }
 
@@ -751,6 +769,9 @@ $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $versionFile = Join-Path $projectRoot "version.json"
 if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) { throw "version.json is missing." }
 $version = Get-Content -LiteralPath $versionFile -Raw | ConvertFrom-Json
+if ($UnsignedMvpPreview -and $version.semantic_version -cne '9.0.0') {
+    throw 'The approved MVP preview channel is limited to version 9.0.0.'
+}
 if ($version.semantic_version -notmatch '^\d+\.\d+\.\d+$' -or
     $version.windows_file_version -notmatch '^\d+\.\d+\.\d+\.\d+$' -or
     $version.release_tag -ne "v$($version.semantic_version)") {
@@ -854,6 +875,13 @@ if (([DateTime]::UtcNow - $exe.LastWriteTimeUtc).TotalMinutes -gt $MaxArtifactAg
 }
 Assert-WindowsPeFile $stagedExe -RequireX64
 Assert-VersionInfo $stagedExe $version $versionInfoCompanyName
+if ($UnsignedMvpPreview) {
+    foreach ($notice in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) {
+        Copy-Item -LiteralPath (Join-Path $sourceRoot $notice) -Destination (Join-Path $stagingRoot $notice)
+    }
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'THIRD_PARTY_LICENSES') `
+        -Destination (Join-Path $stagingRoot 'THIRD_PARTY_LICENSES') -Recurse
+}
 $artifactFindings = @(Get-ArtifactSafetyFindings $stagingRoot)
 if ($artifactFindings.Count -gt 0) { throw "Artifact safety scan failed:`n - $($artifactFindings -join "`n - ")" }
 $packagesFile = Join-Path $venvRoot ".installed-packages.txt"
@@ -1396,7 +1424,7 @@ if ($RequireSignedInstaller) {
     if ($developmentSignature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
         throw "Unsigned development executable must be Authenticode NotSigned; got $($developmentSignature.Status)."
     }
-    Write-DevelopmentBuildManifest $stagingRoot $version $gitFacts $versionInfoCompanyName
+    Write-DevelopmentBuildManifest $stagingRoot $version $gitFacts $versionInfoCompanyName -MvpPreview:$UnsignedMvpPreview
 }
 
 $postStatus = Invoke-Git $projectRoot @("status", "--porcelain", "--untracked-files=all")
@@ -1492,7 +1520,11 @@ if ($RequireSignedInstaller -and $CandidateOnly) {
     Write-Host "     SHA-256: $(Get-Sha256 $releasedExe.FullName)"
     Write-Host "     Stable assets: $publishedAssetRoot"
 } else {
-    $candidateParent = Join-Path $distRoot ("unsigned-development\" + $version.release_tag)
+    $candidateParent = if ($UnsignedMvpPreview) {
+        Join-Path $distRoot 'mvp-preview\v9.0.0-mvp.1'
+    } else {
+        Join-Path $distRoot ("unsigned-development\" + $version.release_tag)
+    }
     $candidateRoot = Join-Path $candidateParent $ExpectedReleaseSha
     if (Test-Path -LiteralPath $candidateRoot) {
         throw "Unsigned development candidate directory already exists: $candidateRoot"
@@ -1500,7 +1532,16 @@ if ($RequireSignedInstaller -and $CandidateOnly) {
     New-Item -ItemType Directory -Path $candidateParent -Force | Out-Null
     Move-Item -LiteralPath $stagingRoot -Destination $candidateRoot
     $candidateExe = Get-Item -LiteralPath (Join-Path $candidateRoot "DefenseTracker.exe")
-    Write-Host "[UNSIGNED-DEVELOPMENT] NotSigned development candidate retained without changing dist\DefenseTracker."
+    if ($UnsignedMvpPreview) {
+        $previewAssetRoot = Join-Path $candidateParent ($ExpectedReleaseSha + '-assets')
+        & $venvPython (Join-Path $sourceRoot 'scripts\package_mvp_preview.py') `
+            --candidate $candidateRoot --output $previewAssetRoot --expected-commit $ExpectedReleaseSha
+        if ($LASTEXITCODE -ne 0) { throw 'MVP preview packaging or payload verification failed.' }
+        Write-Host '[MVP-PREVIEW] NotSigned portable preview prepared for a GitHub Pre-release only.'
+        Write-Host "            Assets: $previewAssetRoot"
+    } else {
+        Write-Host "[UNSIGNED-DEVELOPMENT] NotSigned development candidate retained without changing dist\DefenseTracker."
+    }
     Write-Host "            EXE: $($candidateExe.FullName)"
     Write-Host "            SHA-256: $(Get-Sha256 $candidateExe.FullName)"
 }

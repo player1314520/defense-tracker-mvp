@@ -43,6 +43,16 @@ def _cloud_headers(organization_id):
     }
 
 
+def _assert_error_contract(response, code, status, *, retryable=False):
+    assert response.status_code == status
+    payload = response.get_json()
+    assert payload["code"] == code
+    assert payload["retryable"] is retryable
+    assert payload["error"]
+    assert payload["request_id"]
+    assert response.headers["X-Request-ID"] == payload["request_id"]
+
+
 def _ready_personal_context(service):
     context = service.get_or_create_personal_context()
     service.acknowledge_personal_recovery(context["organization_id"])
@@ -384,8 +394,45 @@ def test_publication_api_rejects_forged_signed_generic_record(tmp_path):
         },
     )
 
-    assert response.status_code == 403
+    _assert_error_contract(response, "PERMISSION_DENIED", 403)
     assert "工作流" in response.get_json()["error"]
+
+
+def test_record_errors_use_stable_contract_for_not_found_and_version_conflict(
+    tmp_path,
+):
+    client, service = _client(tmp_path)
+    context = _ready_personal_context(service)
+    headers = _personal_headers(context)
+
+    missing = client.get(
+        "/api/v9/records/missing-record",
+        headers=headers,
+        query_string={"organization_id": context["organization_id"]},
+    )
+    _assert_error_contract(missing, "NOT_FOUND", 404)
+
+    created = client.post(
+        "/api/v9/records",
+        headers=headers,
+        json={
+            "organization_id": context["organization_id"],
+            "device_id": context["device_id"],
+            "record_type": "evidence",
+            "content": {"body": "contract test"},
+        },
+    ).get_json()
+    conflict = client.put(
+        f"/api/v9/records/{created['record_id']}",
+        headers=headers,
+        json={
+            "organization_id": context["organization_id"],
+            "device_id": context["device_id"],
+            "expected_version": 0,
+            "content": {"body": "stale update"},
+        },
+    )
+    _assert_error_contract(conflict, "VERSION_CONFLICT", 409, retryable=True)
 
 
 def test_main_application_registers_v9_routes():

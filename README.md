@@ -12,6 +12,16 @@ The public project is licensed under **GNU AGPL v3 only
 > official GitHub Release and pass the published signature and checksum
 > checks.
 
+An explicitly labeled **unsigned MVP preview** may be downloaded from a GitHub
+Pre-release tagged `v9.0.0-mvp.1`. It is a portable Windows x64 ZIP: extract the
+whole archive, keep `_internal` beside `DefenseTracker.exe`, and read
+`START-HERE.txt`. Verify `SHA256SUMS` first. This preview has no trusted
+publisher signature or SmartScreen reputation and makes no Portal production
+or multi-user readiness claim. The signed stable release gates remain unchanged.
+Maintainers build this separate channel with
+`scripts/Build-AndShip.ps1 -ExpectedReleaseSha <exact-main-sha> -UnsignedMvpPreview`;
+it emits a dedicated preview manifest and ZIP, never a stable installer.
+
 ## Product boundary
 
 | Surface | Purpose | Public boundary |

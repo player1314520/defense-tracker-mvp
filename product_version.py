@@ -159,5 +159,17 @@ def current_build_commit() -> str:
     return metadata.commit if metadata is not None else "development"
 
 
+def current_build_id() -> str:
+    """Return one display-safe identity derived from canonical build metadata."""
+    metadata = load_build_metadata()
+    if metadata is None:
+        return f"{PRODUCT_VERSION.semantic_version}+development"
+    timestamp = re.sub(r"[^0-9]", "", metadata.source_date_epoch_utc)[:14]
+    return (
+        f"{PRODUCT_VERSION.semantic_version}+{metadata.commit[:12]}."
+        f"{metadata.source_tree[:12]}.{timestamp or 'unknown'}Z"
+    )
+
+
 if __name__ == "__main__":
     print(json.dumps(PRODUCT_VERSION.as_dict(), ensure_ascii=False, sort_keys=True))

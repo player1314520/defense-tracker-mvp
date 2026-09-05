@@ -41,6 +41,8 @@ def test_untrusted_peer_cannot_rotate_forwarded_for_to_bypass_login_limit(
     monkeypatch,
 ):
     monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-only-access-token")
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "server")
     monkeypatch.setenv("DEFENSE_TRACKER_TRUSTED_PROXIES", "10.0.0.0/8")
     client = tracker.app.test_client()
 
@@ -68,6 +70,8 @@ def test_trusted_proxy_keeps_legitimate_clients_in_separate_login_buckets(
     monkeypatch,
 ):
     monkeypatch.setattr(tracker, "AUTH_REQUIRED", True)
+    monkeypatch.setattr(tracker, "ACCESS_TOKEN", "test-only-access-token")
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "server")
     monkeypatch.setenv("DEFENSE_TRACKER_TRUSTED_PROXIES", "10.1.2.3")
     client = tracker.app.test_client()
 
@@ -98,19 +102,16 @@ def test_trusted_proxy_keeps_legitimate_clients_in_separate_login_buckets(
     assert first_client_limited.status_code == 429
 
 
-def test_trusted_proxy_walk_stops_at_rightmost_untrusted_hop(monkeypatch):
+def test_trusted_proxy_rejects_forwarded_chain_beyond_one_hop(monkeypatch):
     monkeypatch.setenv(
         "DEFENSE_TRACKER_TRUSTED_PROXIES",
         "10.0.0.0/8, 192.0.2.0/24",
     )
 
-    assert (
-        _request_ip(
-            "10.1.2.3",
-            "1.2.3.4, 198.51.100.40, 192.0.2.25",
-        )
-        == "198.51.100.40"
-    )
+    assert _request_ip(
+        "10.1.2.3",
+        "1.2.3.4, 198.51.100.40, 192.0.2.25",
+    ) == "10.1.2.3"
 
 
 def test_trusted_proxy_allowlist_accepts_mixed_linear_delimiters(monkeypatch):

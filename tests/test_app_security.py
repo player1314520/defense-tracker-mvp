@@ -1,6 +1,9 @@
+import ast
 import json
 import os
 import stat
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -339,23 +342,28 @@ def test_uploaded_pdf_uses_bounded_isolated_document_parser(monkeypatch):
     payload = b"%PDF-1.7\n1 0 obj <<>> endobj\n%%EOF"
     captured = {}
 
-    def extract(content, **kwargs):
-        captured["content"] = content
-        captured["kwargs"] = kwargs
-        return "受控PDF标题\n受控PDF正文"
+    def parse(kind, content, filename, **kwargs):
+        captured.update(
+            kind=kind,
+            content=content,
+            filename=filename,
+            kwargs=kwargs,
+        )
+        return {"title": "受控PDF标题", "text": "受控PDF标题\n受控PDF正文"}
 
-    monkeypatch.setattr(
-        tracker.document_safety,
-        "extract_pdf_text_isolated",
-        extract,
-    )
+    monkeypatch.setattr(tracker, "parse_document_isolated", parse)
     upload = FileStorage(stream=BytesIO(payload), filename="report.pdf")
 
     result = tracker._extract_file_text(upload)
 
-    assert captured == {
-        "content": payload,
-        "kwargs": {"max_pages": 20, "max_chars": 8000},
+    assert captured["kind"] == "pdf"
+    assert captured["content"] == payload
+    assert captured["filename"] == "report.pdf"
+    assert captured["kwargs"] == {
+        "timeout": tracker.UPLOAD_PARSE_TIMEOUT_SECONDS,
+        "max_chars": 8000,
+        "max_pages": 20,
+        "max_file_size": tracker.app.config["MAX_CONTENT_LENGTH"],
     }
     assert result == {"title": "受控PDF标题", "body": "受控PDF标题\n受控PDF正文"}
     assert "import pdfplumber" not in (PROJECT_ROOT / "app.py").read_text(encoding="utf-8")
@@ -365,48 +373,54 @@ def test_uploaded_docx_uses_validated_bounded_document_parser(monkeypatch):
     payload = b"PK\x03\x04bounded-test-container"
     captured = {}
 
-    def extract(content, **kwargs):
-        captured["content"] = content
-        captured["kwargs"] = kwargs
-        return "受控DOCX标题\n表格内容"
+    def parse(kind, content, filename, **kwargs):
+        captured.update(
+            kind=kind,
+            content=content,
+            filename=filename,
+            kwargs=kwargs,
+        )
+        return {"title": "受控DOCX标题", "text": "受控DOCX标题\n表格内容"}
 
-    monkeypatch.setattr(
-        tracker.document_safety,
-        "extract_docx_text_safe",
-        extract,
-    )
+    monkeypatch.setattr(tracker, "parse_document_isolated", parse)
     upload = FileStorage(stream=BytesIO(payload), filename="report.docx")
 
     result = tracker._extract_file_text(upload)
 
-    assert captured == {
-        "content": payload,
-        "kwargs": {"max_chars": 8000, "include_tables": True},
+    assert captured["kind"] == "docx"
+    assert captured["content"] == payload
+    assert captured["filename"] == "report.docx"
+    assert captured["kwargs"] == {
+        "timeout": tracker.UPLOAD_PARSE_TIMEOUT_SECONDS,
+        "max_chars": 8000,
+        "max_pages": 20,
+        "max_file_size": tracker.app.config["MAX_CONTENT_LENGTH"],
     }
     assert result == {"title": "受控DOCX标题", "body": "受控DOCX标题\n表格内容"}
 
 
 @pytest.mark.parametrize(
-    ("filename", "extractor_name", "code"),
+    ("filename", "payload", "code"),
     (
-        ("active.pdf", "extract_pdf_text_isolated", "PDF_ACTIVE_CONTENT"),
-        ("bomb.docx", "extract_docx_text_safe", "DOCX_COMPRESSION_RATIO"),
+        ("active.pdf", b"%PDF-unsafe", "PDF_ACTIVE_CONTENT"),
+        ("bomb.docx", b"PK\x03\x04unsafe", "DOCX_COMPRESSION_RATIO"),
     ),
 )
 def test_unsafe_uploaded_documents_fail_with_stable_error(
     monkeypatch,
     filename,
-    extractor_name,
+    payload,
     code,
 ):
     def reject(*_args, **_kwargs):
-        raise tracker.document_safety.DocumentSafetyError(code)
+        raise tracker.IsolatedDocumentParseError(code, "文档无法安全解析")
 
-    monkeypatch.setattr(tracker.document_safety, extractor_name, reject)
-    upload = FileStorage(stream=BytesIO(b"unsafe"), filename=filename)
+    monkeypatch.setattr(tracker, "parse_document_isolated", reject)
+    upload = FileStorage(stream=BytesIO(payload), filename=filename)
 
-    with pytest.raises(ValueError, match=rf"安全检查：{code}$"):
+    with pytest.raises(tracker.UploadValidationError) as exc_info:
         tracker._extract_file_text(upload)
+    assert exc_info.value.code == code
 
 
 def test_bare_loopback_client_cannot_reach_sensitive_api(monkeypatch):
@@ -417,7 +431,11 @@ def test_bare_loopback_client_cannot_reach_sensitive_api(monkeypatch):
     response = protected.get("/api/status")
 
     assert response.status_code == 401
-    assert response.get_json()["error"] == "未授权"
+    payload = response.get_json()
+    assert payload["error"] == "未授权"
+    assert payload["code"] == "AUTH_REQUIRED"
+    assert payload["retryable"] is False
+    assert payload["request_id"] == response.headers["X-Request-ID"]
 
 
 def test_favicon_is_empty_and_public_without_console_noise():
@@ -528,24 +546,53 @@ def test_static_mjs_uses_javascript_mime_type(client):
 
 def test_runtime_bind_defaults_to_loopback(monkeypatch):
     monkeypatch.delenv("DEFENSE_TRACKER_BIND_HOST", raising=False)
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "desktop")
 
     assert tracker._resolve_bind_host(auth_required=False) == "127.0.0.1"
 
 
 @pytest.mark.parametrize("host", ("0.0.0.0", "192.0.2.10", "example.test"))
-def test_runtime_bind_rejects_non_loopback_without_access_token(host):
+def test_desktop_runtime_forces_non_loopback_bind_to_loopback(monkeypatch, host):
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "desktop")
+
+    assert tracker._resolve_bind_host(host, auth_required=True) == "127.0.0.1"
+
+
+@pytest.mark.parametrize("host", ("0.0.0.0", "192.0.2.10", "example.test"))
+def test_server_runtime_rejects_non_loopback_without_auth(monkeypatch, host):
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "server")
+
     with pytest.raises(RuntimeError, match="ACCESS_TOKEN_REQUIRED"):
-        tracker._resolve_bind_host(host, auth_required=False)
+        tracker._resolve_bind_host(host, auth_required=False, access_token="")
 
 
 @pytest.mark.parametrize("host", ("127.0.0.1", "::1", "localhost"))
-def test_runtime_bind_allows_loopback_without_access_token(host):
+def test_server_runtime_allows_loopback_without_access_token(monkeypatch, host):
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "server")
+
     assert tracker._resolve_bind_host(host, auth_required=False) == host
 
 
-def test_runtime_bind_allows_explicit_remote_host_with_access_token():
+def test_server_runtime_rejects_empty_access_token_for_remote_bind(monkeypatch):
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "server")
+
+    with pytest.raises(RuntimeError, match="ACCESS_TOKEN is non-empty"):
+        tracker._resolve_bind_host(
+            "0.0.0.0",
+            auth_required=True,
+            access_token="",
+        )
+
+
+def test_server_runtime_allows_explicit_remote_host_with_access_token(monkeypatch):
+    monkeypatch.setattr(tracker, "RUNTIME_MODE", "server")
+
     assert (
-        tracker._resolve_bind_host("0.0.0.0", auth_required=True)
+        tracker._resolve_bind_host(
+            "0.0.0.0",
+            auth_required=True,
+            access_token="test-only-access-token",
+        )
         == "0.0.0.0"
     )
 
@@ -720,6 +767,260 @@ def test_full_stack_container_declares_remote_bind_and_mandatory_auth():
     assert "DEFENSE_TRACKER_ACCESS_TOKEN:?" in compose
 
 
+def test_health_endpoints_distinguish_liveness_and_readiness(client):
+    live = client.get("/health/live")
+    ready = client.get("/health/ready")
+
+    assert live.status_code == 200
+    assert live.get_json() == {"status": "alive"}
+    assert ready.status_code in {200, 503}
+    body = ready.get_json()
+    assert body["version"] == tracker.PRODUCT_VERSION.semantic_version
+    assert isinstance(body["ready"], bool)
+    assert {"user_state", "v9", "executors", "scheduler"} <= set(body["components"])
+
+
+def test_missing_tracking_core_module_fails_startup(tmp_path):
+    code = """
+import builtins
+original_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name == 'tracking':
+        raise ModuleNotFoundError("blocked tracking core module", name='tracking')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+import app
+"""
+    env = os.environ.copy()
+    env["DEFENSE_TRACKER_HOME"] = str(tmp_path / "runtime")
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "required tracking module could not be loaded" in (
+        completed.stdout + completed.stderr
+    )
+
+
+def test_required_access_token_is_never_written_to_startup_logs(tmp_path):
+    token = "sentinel-access-token-that-must-not-be-logged"
+    source = (Path(__file__).resolve().parents[1] / "app.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'logger.info(f"  ACCESS_TOKEN: {ACCESS_TOKEN}")' not in source
+    env = os.environ.copy()
+    env.update(
+        {
+            "DEFENSE_TRACKER_HOME": str(tmp_path / "runtime"),
+            "DEFENSE_TRACKER_MODE": "server",
+            "ACCESS_TOKEN_REQUIRED": "1",
+            "ACCESS_TOKEN": token,
+            "RUN_SCHEDULER": "0",
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", "import app; print('IMPORT_OK')"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+
+    combined = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined
+    assert "IMPORT_OK" in combined
+    assert token not in combined
+
+
+def test_api_error_contract_includes_request_id_and_retryability():
+    with tracker.app.test_request_context("/api/test"):
+        tracker.g.request_id = "req-test-1"
+        response, status = tracker._api_error(
+            "队列已满",
+            "QUEUE_FULL",
+            503,
+            retryable=True,
+            details={"capacity": 4},
+        )
+
+    assert status == 503
+    assert response.get_json() == {
+        "error": "队列已满",
+        "code": "QUEUE_FULL",
+        "request_id": "req-test-1",
+        "retryable": True,
+        "details": {"capacity": 4},
+    }
+
+
+@pytest.mark.parametrize(
+    ("exception_text", "forbidden"),
+    [
+        (r"读取 Z:\workspace\example-user\private\secrets.txt 失败", "example-user"),
+        ("读取 /home/local-user/private/secrets.txt 失败", "local-user"),
+    ],
+)
+def test_safe_exception_text_redacts_host_paths(exception_text, forbidden):
+    sanitized = tracker._safe_exception_text(RuntimeError(exception_text))
+
+    assert forbidden not in sanitized
+    assert "secrets.txt" not in sanitized
+    assert "本地路径已隐藏" in sanitized
+
+
+@pytest.mark.parametrize(
+    ("exception_text", "forbidden"),
+    [
+        ("FileNotFoundError: '/home/local-user/private/secrets.txt'", "local-user"),
+        (r"open \\server-name\private-share\secrets.txt failed", "server-name"),
+        (r"open \\?\Z:\workspace\example-user\private\secrets.txt failed", "example-user"),
+        (
+            "GET https://provider.example/search?api_key=provider-secret-value&q=test failed",
+            "provider-secret-value",
+        ),
+        ("Authorization: Bearer bearer-secret-value-123456", "bearer-secret-value"),
+    ],
+)
+def test_safe_exception_text_redacts_quoted_paths_urls_and_bearer_tokens(
+    exception_text,
+    forbidden,
+):
+    sanitized = tracker._safe_exception_text(RuntimeError(exception_text))
+
+    assert forbidden not in sanitized
+
+
+def test_ai_error_response_never_exposes_host_path(monkeypatch, client):
+    csrf = _csrf_cookie(client, "ai-path-redaction-csrf")
+    monkeypatch.setitem(tracker.AI_CONFIG, "api_key", "test-only-key")
+
+    def fail_with_host_path(*_args, **_kwargs):
+        raise RuntimeError(r"open Z:\workspace\example-user\private\secrets.txt failed")
+
+    monkeypatch.setattr(tracker, "_call_ai", fail_with_host_path)
+    response = client.post(
+        "/api/ai/analyze",
+        json={"mode": "analyze", "articles": [{"title": "test"}]},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 500
+    payload = response.get_json()
+    assert payload["code"] == "AI_ANALYZE_FAILED"
+    assert payload["request_id"] == response.headers["X-Request-ID"]
+    assert payload["retryable"] is False
+    assert "example-user" not in response.get_data(as_text=True)
+    assert "secrets.txt" not in response.get_data(as_text=True)
+
+
+def test_ai_upstream_error_does_not_relay_response_body(monkeypatch, client):
+    csrf = _csrf_cookie(client, "ai-upstream-redaction-csrf")
+    monkeypatch.setitem(tracker.AI_CONFIG, "api_key", "test-only-key")
+    upstream = _response(
+        status=401,
+        body=b'provider detail: api_key=super-secret; C:\\Users\\local\\config.json',
+    )
+
+    def fail_upstream(*_args, **_kwargs):
+        raise requests.HTTPError("provider rejected request", response=upstream)
+
+    monkeypatch.setattr(tracker, "_call_ai", fail_upstream)
+    response = client.post(
+        "/api/ai/analyze",
+        json={"mode": "analyze", "articles": [{"title": "test"}]},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 502
+    payload = response.get_json()
+    assert payload["code"] == "AI_UPSTREAM_ERROR"
+    assert payload["details"] == {"upstream_status": 401}
+    assert payload["retryable"] is True
+    assert "super-secret" not in response.get_data(as_text=True)
+    assert "config.json" not in response.get_data(as_text=True)
+
+
+def test_status_keeps_legacy_fields_and_reports_build_readiness(client):
+    resp = client.get("/api/status")
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["version"] == tracker.PRODUCT_VERSION.semantic_version
+    assert {"ready", "degraded", "components", "build_id"} <= set(body)
+    assert "cached_articles" in body
+
+
+def test_readiness_reports_v9_key_lock_as_503(monkeypatch, client):
+    class LockedService:
+        is_key_locked = True
+
+        @staticmethod
+        def key_status():
+            return {
+                "status": "locked",
+                "code": "V9_KEY_LOCKED",
+                "reason": "master_key_validation_failed",
+                "writable": False,
+            }
+
+    monkeypatch.setattr(tracker, "_V9_SERVICE", LockedService())
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    component = response.get_json()["components"]["v9"]
+    assert component["status"] == "locked"
+    assert component["code"] == "V9_KEY_LOCKED"
+
+
+def test_static_mjs_is_served_as_javascript(client):
+    resp = client.get("/static/js/vendor/v9-supabase-auth.mjs")
+
+    assert resp.status_code == 200
+    assert resp.mimetype == "application/javascript"
+
+
+def test_required_user_state_and_v9_imports_do_not_fail_silently():
+    tree = ast.parse(Path(tracker.__file__).read_text(encoding="utf-8"))
+    silent_required_imports = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        imported = {
+            alias.name
+            for child in node.body
+            if isinstance(child, ast.Import)
+            for alias in child.names
+        }
+        imported.update(
+            child.module or ""
+            for child in node.body
+            if isinstance(child, ast.ImportFrom)
+        )
+        if not ({"user_state", "v9.api", "v9.service"} & imported):
+            continue
+        for handler in node.handlers:
+            if (
+                isinstance(handler.type, ast.Name)
+                and handler.type.id == "ImportError"
+                and any(isinstance(statement, ast.Pass) for statement in handler.body)
+            ):
+                silent_required_imports.extend(sorted(imported))
+
+    assert silent_required_imports == []
+
+
 def test_page_opens_without_login_redirect_and_sets_csrf(client):
     resp = client.get("/")
     assert resp.status_code == 200
@@ -883,7 +1184,7 @@ def test_post_requires_csrf_with_cookie_auth(client):
 def test_post_accepts_valid_csrf(monkeypatch, client):
     csrf = _csrf_cookie(client)
     old_config = dict(tracker.AI_CONFIG)
-    monkeypatch.setattr(tracker, "_save_ai_config", lambda: True)
+    monkeypatch.setattr(tracker, "_save_ai_config", lambda config=None: True)
     try:
         resp = client.post(
             "/api/ai/config",
@@ -904,7 +1205,6 @@ def test_ai_ssl_verify_never_allows_certificate_bypass():
     assert tracker._ai_ssl_verify("https://key.simpleai.com.cn") is True
     # 子串伪域名不得通过子串匹配绕过证书校验（必须仍校验 → True）
     assert tracker._ai_ssl_verify("https://simpleai.com.cn.attacker.com/v1") is True
-    # 可信端点：正常校验证书
     assert tracker._ai_ssl_verify("https://api.anthropic.com") is True
 
 
@@ -930,7 +1230,7 @@ def test_ai_config_rejects_unknown_provider_and_model(client):
     )
 
     assert response.status_code == 400
-    assert "provider" in response.get_json()["error"].lower()
+    assert response.get_json()["code"] == "UNSUPPORTED_AI_PROVIDER"
 
 
 def test_ai_settings_ui_exposes_only_the_fixed_mvp_registry():
@@ -1022,7 +1322,8 @@ def test_main_ai_call_uses_leased_fixed_endpoint_without_returning_key(
     selection = tracker.resolve_provider("deepseek", "deepseek-v4-flash")
     captured = {}
 
-    def fake_post(url, **kwargs):
+    def fake_post(method, url, **kwargs):
+        assert method == "POST"
         captured.update(url=url, **kwargs)
         response = requests.Response()
         response.status_code = 200
@@ -1041,7 +1342,7 @@ def test_main_ai_call_uses_leased_fixed_endpoint_without_returning_key(
             "source": "cloud",
         }),
     )
-    monkeypatch.setattr(tracker.requests, "post", fake_post)
+    monkeypatch.setattr(tracker.search_adapters, "safe_request", fake_post)
 
     result = tracker._call_ai([{"role": "user", "content": "ping"}])
 
@@ -1317,7 +1618,11 @@ def test_ai_analyze_does_not_reflect_unknown_value_error(monkeypatch, client):
     body = response.get_data(as_text=True)
 
     assert response.status_code == 400
-    assert response.get_json() == {"error": "AI 请求参数无效"}
+    payload = response.get_json()
+    assert payload["error"] == "AI 请求参数无效"
+    assert payload["code"] == "AI_REQUEST_INVALID"
+    assert payload["retryable"] is False
+    assert payload["request_id"] == response.headers["X-Request-ID"]
     for private_fragment in (
         "private-user",
         "secret.example",
@@ -1332,7 +1637,7 @@ def test_ai_config_rolls_back_when_secure_persistence_fails(
 ):
     csrf = _csrf_cookie(client)
     original = dict(tracker.AI_CONFIG)
-    monkeypatch.setattr(tracker, "_save_ai_config", lambda: False)
+    monkeypatch.setattr(tracker, "_save_ai_config", lambda config=None: False)
     response = client.post(
         "/api/ai/config",
         json={"provider": "zhipu", "model": "glm-5.2", "api_key": "secret"},
@@ -1341,6 +1646,144 @@ def test_ai_config_rolls_back_when_secure_persistence_fails(
 
     assert response.status_code == 503
     assert tracker.AI_CONFIG == original
+
+
+@pytest.fixture()
+def local_ai_switch(monkeypatch):
+    config = dict(tracker.AI_CONFIG)
+    config.update(
+        provider="deepseek", model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        api_key="synthetic-old-provider-key",
+    )
+    monkeypatch.setattr(tracker, "AI_CONFIG", config)
+    monkeypatch.setattr(tracker, "_authenticated_v9_cloud_session", lambda: None)
+    monkeypatch.setattr(tracker, "_active_cloud_ai_binding", lambda **kwargs: None)
+    monkeypatch.setattr(tracker, "_encrypt_ai_secret", lambda key: "encrypted:" + key)
+    persisted = []
+    monkeypatch.setattr(
+        tracker, "write_private_json_atomic",
+        lambda path, payload: persisted.append(dict(payload)),
+    )
+    return persisted
+
+
+def test_ai_provider_switch_without_key_clears_old_secret(
+    monkeypatch, client, local_ai_switch
+):
+    calls = []
+    monkeypatch.setattr(
+        tracker.search_adapters, "safe_request",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    response = client.post(
+        "/api/ai/config", json={"provider": "zhipu", "model": "glm-5.2"},
+        headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["enabled"] is False
+    assert tracker.AI_CONFIG["api_key"] == ""
+    assert local_ai_switch == [{"provider": "zhipu", "model": "glm-5.2"}]
+    with pytest.raises(ValueError, match="API Key 未配置"):
+        tracker._call_ai([{"role": "user", "content": "test"}])
+    assert calls == []
+    with pytest.raises(RuntimeError, match="凭据已变更"):
+        tracker._assert_current_ai_request(
+            tracker.resolve_provider("zhipu", "glm-5.2").endpoint,
+            {"Authorization": "Bearer synthetic-old-provider-key"},
+        )
+
+
+def test_ai_same_origin_model_switch_keeps_key(client, local_ai_switch):
+    response = client.post(
+        "/api/ai/config", json={"model": "deepseek-v4-pro"},
+        headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["enabled"] is True
+    assert tracker.AI_CONFIG["api_key"] == "synthetic-old-provider-key"
+    assert local_ai_switch[0]["api_key"] == "encrypted:synthetic-old-provider-key"
+
+
+def test_ai_same_provider_origin_change_clears_key(client, local_ai_switch):
+    tracker.AI_CONFIG["base_url"] = "https://previous-endpoint.example/v1"
+    response = client.post(
+        "/api/ai/config", json={"model": "deepseek-v4-pro"},
+        headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code == 200
+    assert tracker.AI_CONFIG["api_key"] == ""
+    assert "api_key" not in local_ai_switch[0]
+
+
+def test_ai_provider_switch_accepts_explicit_new_key(client, local_ai_switch):
+    response = client.post(
+        "/api/ai/config",
+        json={"provider": "zhipu", "model": "glm-5.2", "api_key": "synthetic-new-key"},
+        headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code == 200
+    assert tracker.AI_CONFIG["api_key"] == "synthetic-new-key"
+    assert local_ai_switch[0]["api_key"] == "encrypted:synthetic-new-key"
+    with pytest.raises(RuntimeError, match="端点已变更"):
+        tracker._assert_current_ai_request(
+            "https://api.deepseek.com/chat/completions",
+            {"Authorization": "Bearer synthetic-old-provider-key"},
+        )
+
+
+def test_ai_provider_switch_persistence_failure_never_exposes_mixed_config(
+    monkeypatch, client, local_ai_switch
+):
+    before = dict(tracker.AI_CONFIG)
+    observed = []
+
+    def fail_write(path, payload):
+        observed.append((dict(tracker.AI_CONFIG), dict(payload)))
+        with tracker._lease_ai_runtime() as runtime:
+            assert runtime["provider"] == "deepseek"
+            assert runtime["api_key"] == "synthetic-old-provider-key"
+        raise OSError("synthetic persistence failure")
+
+    monkeypatch.setattr(tracker, "write_private_json_atomic", fail_write)
+    response = client.post(
+        "/api/ai/config", json={"provider": "zhipu", "model": "glm-5.2"},
+        headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code == 503
+    assert observed == [(before, {"provider": "zhipu", "model": "glm-5.2"})]
+    assert tracker.AI_CONFIG == before
+
+
+def test_draft_retry_accepts_active_runtime_without_legacy_local_key(
+    monkeypatch, client, local_ai_switch
+):
+    tracker.AI_CONFIG["api_key"] = ""
+    monkeypatch.setattr(tracker, "_ai_is_enabled", lambda: True)
+    retried = []
+    job = {"job_id": "job-1", "project_id": "project-1", "status": "queued"}
+    monkeypatch.setattr(
+        tracker.report_agent, "retry_draft_job",
+        lambda project_id, job_id: retried.append((project_id, job_id)) or job,
+    )
+    monkeypatch.setattr(tracker, "_run_agent_draft_job", lambda *args: None)
+    monkeypatch.setattr(tracker.report_agent, "get_draft_job", lambda *args: job)
+    monkeypatch.setattr(
+        tracker, "_agent_draft_job_response",
+        lambda project_id, value: tracker.jsonify({"job": value}),
+    )
+    response = client.post(
+        "/api/agent/projects/project-1/draft_jobs/job-1/retry",
+        headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code == 200
+    assert retried == [("project-1", "job-1")]
 
 
 def test_auth_rate_limit_applies_to_authenticated_endpoint(monkeypatch, client):
@@ -1353,6 +1796,92 @@ def test_auth_rate_limit_applies_to_authenticated_endpoint(monkeypatch, client):
     resp = client.get("/api/status")
     assert resp.status_code == 429
     assert "请求过于频繁" in resp.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("route", "function_name", "error", "data", "expected_code"),
+    [
+        ("/api/ai/config", "resolve_provider", tracker.UnsupportedAiProvider,
+         {"provider": "deepseek", "model": "deepseek-v4-flash"}, "UNSUPPORTED_AI_PROVIDER"),
+        ("/api/quality/feedback", "record_quality_feedback", ValueError,
+         {"label": "accepted", "article_id": "test"}, "INVALID_ARGUMENT"),
+        ("/api/translate", "_call_ai", tracker.AIBudgetExceeded,
+         {"text": "test"}, "AI_BUDGET_EXCEEDED"),
+    ],
+)
+def test_api_error_does_not_expose_arbitrary_exception_text(
+    monkeypatch, client, route, function_name, error, data, expected_code
+):
+    secret = "TRACEBACK internal-record-unsafe-token@example.invalid"
+
+    def fail(*args, **kwargs):
+        raise error(secret)
+
+    monkeypatch.setattr(tracker, function_name, fail)
+    monkeypatch.setattr(tracker, "_ai_is_enabled", lambda: True)
+    response = client.post(
+        route, json=data, headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code in (400, 429)
+    assert response.get_json()["code"] == expected_code
+    assert secret not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize("agent", [tracker.consulting_agent, tracker.report_agent])
+@pytest.mark.parametrize(
+    ("error_type", "args", "message"),
+    [
+        ("ActiveTaskExistsError", ("job-1",), "已有活跃任务，请等待当前任务完成"),
+        ("TaskQueueFullError", (5,), "后台任务队列已满，请稍后重试"),
+        ("TaskNotRetryableError", ("job-1", "done"), "任务当前状态不可重试"),
+        ("InvalidTaskTransitionError", ("job-1", "done", "running"), "任务状态转换无效"),
+    ],
+)
+def test_task_api_error_uses_fixed_business_message(agent, error_type, args, message):
+    error = getattr(agent, error_type)(*args)
+    error.args = ("TRACEBACK internal-record-unsafe-token@example.invalid",)
+    handler = (
+        tracker._consult_error_response
+        if agent is tracker.consulting_agent else tracker._agent_error_response
+    )
+    with tracker.app.test_request_context():
+        response, status = handler(error)
+    assert status in (409, 503)
+    assert response.get_json()["error"] == message
+    assert "TRACEBACK" not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("DOCUMENT_PARSER_ISOLATION_FAILED", "文档隔离解析环境不可用"),
+        ("DOCUMENT_PARSE_QUEUE_FULL", "文档解析队列已满，请稍后重试"),
+    ],
+)
+def test_consult_parser_failure_uses_fixed_business_message(code, message):
+    error = tracker.search_adapters.RemoteDocumentError(
+        code, "TRACEBACK internal-record-unsafe-token@example.invalid",
+        details={"retry_after": 5},
+    )
+    with tracker.app.test_request_context():
+        response, status = tracker._consult_error_response(error)
+    assert status == 503
+    assert response.get_json()["error"] == message
+    assert response.headers["Retry-After"] == "5"
+
+
+def test_draft_failure_log_never_interpolates_untrusted_job_id(monkeypatch, caplog):
+    job_id = "job-1\r\nFORGED_LOG_ENTRY"
+    monkeypatch.setattr(
+        tracker.report_agent, "get_draft_job",
+        lambda *args: (_ for _ in ()).throw(ValueError("synthetic error")),
+    )
+    monkeypatch.setattr(tracker.report_agent, "update_draft_job", lambda *args, **kwargs: None)
+    with caplog.at_level("ERROR"):
+        tracker._run_agent_draft_job("project-1", job_id)
+    assert "error_type=ValueError" in caplog.text
+    assert "FORGED_LOG_ENTRY" not in caplog.text
 
 
 def test_ssrf_rejects_private_ip():
@@ -1500,11 +2029,12 @@ def test_call_ai_rejects_missing_choices(monkeypatch):
     })
     calls = []
 
-    def fake_post(url, **kwargs):
+    def fake_post(method, url, **kwargs):
+        assert method == "POST"
         calls.append((url, kwargs))
         return FakeAIResponse()
 
-    monkeypatch.setattr(tracker.requests, "post", fake_post)
+    monkeypatch.setattr(tracker.search_adapters, "safe_request", fake_post)
     try:
         with pytest.raises(ValueError, match="缺少 choices"):
             tracker._call_ai([{"role": "user", "content": "ping"}])
@@ -1539,12 +2069,13 @@ def test_call_ai_uses_moonshot_model_specific_wire_payload(
         "temperature": 0.2,
     })
 
-    def fake_post(url, **kwargs):
+    def fake_post(method, url, **kwargs):
+        assert method == "POST"
         captured["url"] = url
         captured["kwargs"] = kwargs
         return FakeAIResponse()
 
-    monkeypatch.setattr(tracker.requests, "post", fake_post)
+    monkeypatch.setattr(tracker.search_adapters, "safe_request", fake_post)
     monkeypatch.setattr(tracker, "_ai_budget_reserve", lambda _tokens: None)
     try:
         assert tracker._call_ai(

@@ -22,6 +22,8 @@ from .ai_credentials import (
     InMemoryAiCredential,
 )
 from .ai_providers import provider_catalog, resolve_provider
+from .publication import PublicationRecalled
+from .service import V9KeyLocked
 from .supabase_client import SupabaseRequestError
 
 
@@ -319,20 +321,90 @@ def create_blueprint(
             auth_response = auth_check()
             if auth_response is not None:
                 return auth_response
+        service = service_provider()
+        if getattr(service, "is_key_locked", False):
+            endpoint = str(request.endpoint or "").rsplit(".", 1)[-1]
+            if endpoint not in {
+                "restore_local_master_key",
+                "personal_diagnostics",
+                "personal_backup",
+            }:
+                raise V9KeyLocked("master_key_validation_failed")
+            return None
         _require_explicit_business_context()
         return None
 
+    def _request_id() -> str:
+        request_id = str(getattr(g, "request_id", "") or "").strip()
+        if not request_id:
+            request_id = str(uuid.uuid4())
+            g.request_id = request_id
+        return request_id
+
+    def _structured_error(
+        *,
+        error: str,
+        code: str,
+        status: int,
+        action: str | None = None,
+        retryable: bool = False,
+    ):
+        request_id = _request_id()
+        payload = {
+            "error": error,
+            "code": code,
+            "request_id": request_id,
+            "retryable": bool(retryable),
+        }
+        if action:
+            payload["action"] = action
+        response = jsonify(payload)
+        response.status_code = status
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @bp.errorhandler(V9KeyLocked)
+    def _key_locked(_error):
+        return _structured_error(
+            error="本地数据密钥不可用",
+            code="V9_KEY_LOCKED",
+            status=423,
+            action="restore_key_or_backup",
+        )
+
+    @bp.errorhandler(PublicationRecalled)
+    def _publication_recalled(error):
+        return _structured_error(
+            error=str(error),
+            code="PUBLICATION_RECALLED",
+            status=409,
+            action="export_with_mode_audit",
+        )
+
     @bp.errorhandler(PermissionDenied)
     def _permission(error):
-        return jsonify({"error": str(error)}), 403
+        return _structured_error(
+            error=str(error), code="PERMISSION_DENIED", status=403
+        )
 
     @bp.errorhandler(NotFound)
     def _not_found(error):
-        return jsonify({"error": str(error)}), 404
+        return _structured_error(error=str(error), code="NOT_FOUND", status=404)
 
     def _bad_request(error):
-        status = 409 if isinstance(error, VersionConflict) else 400
-        return jsonify({"error": str(error)}), status
+        if isinstance(error, VersionConflict):
+            return _structured_error(
+                error=str(error),
+                code="VERSION_CONFLICT",
+                status=409,
+                retryable=True,
+            )
+        code = (
+            "INVALID_RECORD_TYPE"
+            if isinstance(error, InvalidRecordType)
+            else "INVALID_REQUEST"
+        )
+        return _structured_error(error=str(error), code=code, status=400)
 
     for error_type in (VersionConflict, InvalidRecordType, ValueError):
         bp.register_error_handler(error_type, _bad_request)
@@ -944,6 +1016,12 @@ def create_blueprint(
         )
         g.v9_resolved_context_mode = "cloud"
         g.v9_resolved_organization_id = requested_org
+        return context
+
+    def _locked_recovery_artifact_context(service) -> dict:
+        context = service.get_personal_context()
+        if not isinstance(context, dict):
+            raise V9KeyLocked("personal_context_unavailable")
         return context
 
     @bp.after_request
@@ -2373,7 +2451,10 @@ def create_blueprint(
             create=True,
         )
         payload, filename = service.export_document(
-            context, record_id, output_format
+            context,
+            record_id,
+            output_format,
+            mode=str(request.args.get("mode") or ""),
         )
         mimetype = (
             "application/vnd.openxmlformats-officedocument."
@@ -2473,7 +2554,10 @@ def create_blueprint(
             create=True,
         )
         payload, filename = service.export_publication(
-            context, record_id, output_format
+            context,
+            record_id,
+            output_format,
+            mode=str(request.args.get("mode") or ""),
         )
         mimetype = (
             "application/vnd.openxmlformats-officedocument."
@@ -2633,6 +2717,22 @@ def create_blueprint(
             str(data.get("recovery_code", "")),
         )), 201
 
+    @bp.post("/recovery/local-master-key")
+    def restore_local_master_key():
+        data = request.get_json(silent=True) or {}
+        encoded = str(data.get("key_payload_base64") or "").strip()
+        if not encoded or len(encoded) > 8192:
+            raise ValueError("key_payload_base64 必填且长度受限")
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise ValueError("key_payload_base64 格式无效") from None
+        if base64.b64encode(payload).decode("ascii") != encoded:
+            raise ValueError("key_payload_base64 必须使用规范 Base64 编码")
+        return jsonify(
+            service_provider().restore_local_master_key(payload)
+        )
+
     @bp.delete("/organizations/<org_id>/devices/<device_id>")
     def revoke_device(org_id, device_id):
         context = _personal_context(org_id)
@@ -2670,11 +2770,15 @@ def create_blueprint(
 
     @bp.get("/diagnostics/export")
     def personal_diagnostics():
-        context = _business_context(
-            str(request.args.get("organization_id") or ""),
-            create=True,
-        )
-        payload = service_provider().export_diagnostic_bundle(
+        service = service_provider()
+        if service.is_key_locked:
+            context = _locked_recovery_artifact_context(service)
+        else:
+            context = _business_context(
+                str(request.args.get("organization_id") or ""),
+                create=True,
+            )
+        payload = service.export_diagnostic_bundle(
             context["organization_id"], context["user_id"]
         )
         return send_file(
@@ -2686,12 +2790,16 @@ def create_blueprint(
 
     @bp.post("/backups")
     def personal_backup():
-        data = request.get_json(silent=True) or {}
-        context = _business_context(
-            str(data.get("organization_id") or ""),
-            create=True,
-        )
-        return jsonify(service_provider().create_local_backup(
+        service = service_provider()
+        if service.is_key_locked:
+            context = _locked_recovery_artifact_context(service)
+        else:
+            data = request.get_json(silent=True) or {}
+            context = _business_context(
+                str(data.get("organization_id") or ""),
+                create=True,
+            )
+        return jsonify(service.create_local_backup(
             context["organization_id"], context["user_id"]
         )), 201
 

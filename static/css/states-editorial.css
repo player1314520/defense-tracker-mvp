@@ -22,7 +22,7 @@
 }
 .consult-asset-empty span {
   font-style: normal; font-family: var(--mono); font-size: 11px;
-  letter-spacing: .3px; color: var(--ink4);
+  letter-spacing: .3px; color: var(--ink2);
 }
 
 /* ── 加载态容器：居中 + mono 提示 ── */
@@ -62,3 +62,17 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 textarea:focus-visible, [role="tab"]:focus-visible, [tabindex]:focus-visible {
   outline: 2px solid var(--accent) !important; outline-offset: 2px !important;
 }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k1-shell-upgrade.css §5 统一状态(空态字号)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* 旧工作台通用空态/加载态(states-editorial 已统一容器,这里补状态色) */
+.loading-state p, .trk-empty, .brief-empty, .agent-empty { font-size: 14px; }
+
+/* ═══════════════════════════════════════════════════════════
+   K4 正式合并(2026-08-31)· 以下来自 k1-shell-upgrade.css §5 统一状态(在线/离线 pill)(逐行搬移,选择器/顺序/!important 未改写)
+   ═══════════════════════════════════════════════════════════ */
+/* 在线/离线状态 pill:圆点 + 文字双编码(文字由 JS 供给,这里只统一色) */
+.status-pill .dot { background: var(--success) !important; }
+.status-pill.error .dot { background: var(--danger) !important; }
+.status-pill.error { color: var(--danger) !important; }

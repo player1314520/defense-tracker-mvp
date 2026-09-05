@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import sys
 import threading
@@ -68,9 +69,12 @@ from .orchestration import (
 )
 from .publication import (
     BOARD_STATUSES,
+    LOCAL_SIGNING_NOTICE,
+    PublicationRecalled,
     apply_document_changes,
     build_document_docx,
     build_document_pdf,
+    build_recall_audit_notice,
     build_source_index,
     evidence_ids_for_document,
     new_document,
@@ -165,16 +169,219 @@ def _exclusive_file_lock(
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+class V9KeyLocked(RuntimeError):
+    """Stable fail-closed state for unavailable local encryption keys."""
+
+    code = "V9_KEY_LOCKED"
+
+    def __init__(self, reason: str = "key_unavailable"):
+        super().__init__("本地数据密钥不可用")
+        self.reason = str(reason or "key_unavailable")
+
+
 class V9Service:
     def __init__(self, database_path: Path, local_master_key_path: Path):
         self.database_path = Path(database_path)
         self.local_master_key_path = Path(local_master_key_path)
-        self.repository = V9Repository(self.database_path)
-        self._master_key = self._load_or_create_master_key()
         self._personal_context_lock = threading.Lock()
         self._cloud_context_lock = threading.Lock()
         self._evidence_archive_lock = threading.Lock()
         self._workflow_lock = threading.Lock()
+        self._key_lock_reason = ""
+        encrypted_data_exists = self._database_has_encrypted_data()
+        try:
+            master_key, legacy_payload = self._load_master_key_candidate(
+                allow_create=not encrypted_data_exists
+            )
+            if encrypted_data_exists:
+                self._validate_master_key_candidate(master_key)
+        except (
+            FileNotFoundError,
+            InvalidTag,
+            OSError,
+            ValueError,
+            sqlite3.DatabaseError,
+        ):
+            if not encrypted_data_exists:
+                raise
+            self._master_key = None
+            self._key_lock_reason = "master_key_validation_failed"
+            self.repository = V9Repository(
+                self.database_path,
+                initialize=False,
+                read_only=True,
+            )
+            return
+
+        self._master_key = master_key
+        self.repository = V9Repository(self.database_path)
+        if os.name == "nt":
+            protected = (
+                protect_local_master_key(master_key)
+                if legacy_payload
+                else self.local_master_key_path.read_bytes()
+            )
+            if legacy_payload:
+                self._write_master_key_payload(
+                    self.local_master_key_path, protected
+                )
+            self._harden_matching_legacy_master_keys(master_key, protected)
+
+    @property
+    def is_key_locked(self) -> bool:
+        return self._master_key is None
+
+    def key_status(self) -> dict:
+        if self.is_key_locked:
+            return {
+                "status": "locked",
+                "code": V9KeyLocked.code,
+                "reason": self._key_lock_reason,
+                "writable": False,
+            }
+        return {
+            "status": "ready",
+            "code": "V9_KEY_READY",
+            "reason": "",
+            "writable": True,
+        }
+
+    def _require_unlocked(self) -> bytes:
+        if self._master_key is None:
+            raise V9KeyLocked(self._key_lock_reason)
+        return self._master_key
+
+    def _database_has_encrypted_data(self) -> bool:
+        if not self.database_path.is_file() or not self.database_path.stat().st_size:
+            return False
+        uri = f"file:{self.database_path.resolve().as_posix()}?mode=ro"
+        try:
+            with sqlite3.connect(uri, uri=True) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                for table in ("local_secrets", "encrypted_records"):
+                    if table in tables and conn.execute(
+                        f"SELECT 1 FROM {table} LIMIT 1"
+                    ).fetchone():
+                        return True
+        except sqlite3.DatabaseError:
+            return True
+        return False
+
+    def _load_master_key_candidate(
+        self, *, allow_create: bool
+    ) -> tuple[bytes, bool]:
+        path = self.local_master_key_path
+
+        def load_existing() -> tuple[bytes, bool]:
+            payload = path.read_bytes()
+            if os.name == "nt" and payload.startswith(DPAPI_MASTER_KEY_MAGIC):
+                key = unprotect_local_master_key(payload)
+                if len(key) != 32:
+                    raise ValueError("invalid local V9 master key")
+                return key, False
+            if len(payload) != 32:
+                raise ValueError("invalid local V9 master key")
+            return payload, os.name == "nt"
+
+        if not allow_create:
+            if not path.exists():
+                raise FileNotFoundError(path)
+            return load_existing()
+        with _exclusive_file_lock(
+            Path(f"{path}.init.lock"),
+            error_message="local master key lock unavailable",
+        ):
+            if path.exists():
+                return load_existing()
+            key = os.urandom(32)
+            payload = protect_local_master_key(key) if os.name == "nt" else key
+            self._write_master_key_payload(path, payload)
+            return key, False
+
+    def _validate_master_key_candidate(self, master_key: bytes) -> None:
+        if len(master_key) != 32:
+            raise ValueError("invalid local V9 master key")
+        uri = f"file:{self.database_path.resolve().as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            secret_rows = (
+                conn.execute(
+                    """
+                    SELECT organization_id,secret_kind,secret_id,key_version,
+                           nonce,ciphertext
+                    FROM local_secrets
+                    """
+                ).fetchall()
+                if "local_secrets" in tables
+                else []
+            )
+            record_rows = (
+                conn.execute("SELECT * FROM encrypted_records").fetchall()
+                if "encrypted_records" in tables
+                else []
+            )
+        if record_rows and not secret_rows:
+            raise InvalidTag
+        org_keys: dict[tuple[str, int], bytes] = {}
+        for row in secret_rows:
+            organization_id = str(row["organization_id"])
+            secret_kind = str(row["secret_kind"])
+            secret_id = str(row["secret_id"])
+            key_version = int(row["key_version"])
+            if secret_kind == "org_key":
+                aad = self._org_secret_aad(organization_id, key_version)
+            elif secret_kind == "device_private_key":
+                aad = self._device_secret_aad(organization_id, secret_id)
+            else:
+                raise InvalidTag
+            plaintext = decrypt_local_secret(
+                master_key,
+                bytes(row["nonce"]),
+                bytes(row["ciphertext"]),
+                aad,
+            )
+            if len(plaintext) != 32:
+                raise InvalidTag
+            if secret_kind == "org_key":
+                org_keys[(organization_id, key_version)] = plaintext
+        for row in record_rows:
+            envelope = RecordEnvelope.from_mapping(dict(row))
+            org_key = org_keys.get((envelope.org_id, envelope.key_version))
+            if org_key is None:
+                raise InvalidTag
+            decrypt_record(org_key, envelope)
+
+    def restore_local_master_key(self, payload: bytes) -> dict:
+        if not self.is_key_locked:
+            raise ValueError("本地数据密钥当前已可用")
+        payload = bytes(payload)
+        try:
+            if os.name == "nt" and payload.startswith(DPAPI_MASTER_KEY_MAGIC):
+                candidate = unprotect_local_master_key(payload)
+            else:
+                candidate = payload
+            self._validate_master_key_candidate(candidate)
+        except (InvalidTag, OSError, ValueError, sqlite3.DatabaseError):
+            raise V9KeyLocked("restored_key_validation_failed") from None
+        stored = protect_local_master_key(candidate) if os.name == "nt" else candidate
+        self.local_master_key_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_master_key_payload(self.local_master_key_path, stored)
+        self._harden_matching_legacy_master_keys(candidate, stored)
+        self.repository = V9Repository(self.database_path)
+        self._master_key = candidate
+        self._key_lock_reason = ""
+        return {"status": "ready", "code": "V9_KEY_RESTORED"}
 
     @contextmanager
     def _personal_recovery_guard(self):
@@ -319,7 +526,7 @@ class V9Service:
 
     def _store_org_key(self, org_id: str, key_version: int, org_key: bytes) -> None:
         nonce, ciphertext = encrypt_local_secret(
-            self._master_key,
+            self._require_unlocked(),
             org_key,
             self._org_secret_aad(org_id, key_version),
         )
@@ -334,7 +541,7 @@ class V9Service:
         if row is None:
             raise PermissionDenied("organization key is not unlocked on this device")
         return decrypt_local_secret(
-            self._master_key,
+            self._require_unlocked(),
             row["nonce"],
             row["ciphertext"],
             self._org_secret_aad(org_id, key_version),
@@ -344,7 +551,7 @@ class V9Service:
         self, org_id: str, device_id: str, private_key: bytes
     ) -> None:
         nonce, ciphertext = encrypt_local_secret(
-            self._master_key,
+            self._require_unlocked(),
             private_key,
             self._device_secret_aad(org_id, device_id),
         )
@@ -611,7 +818,7 @@ class V9Service:
                 "device private key is not unlocked on this device"
             )
         private_key = decrypt_local_secret(
-            self._master_key,
+            self._require_unlocked(),
             row["nonce"],
             row["ciphertext"],
             self._device_secret_aad(organization_id, device_id),
@@ -689,7 +896,7 @@ class V9Service:
             device_id = str(uuid.uuid4())
             public_key, private_key = create_desktop_credential_keypair()
             private_nonce, private_ciphertext = encrypt_local_secret(
-                self._master_key,
+                self._require_unlocked(),
                 private_key,
                 self._device_secret_aad(organization_id, device_id),
             )
@@ -846,7 +1053,7 @@ class V9Service:
                     raise PermissionDenied("organization key mismatch")
             else:
                 encrypted_secret = encrypt_local_secret(
-                    self._master_key,
+                    self._require_unlocked(),
                     org_key,
                     self._org_secret_aad(organization_id, key_version),
                 )
@@ -2182,9 +2389,50 @@ class V9Service:
         ]
         return build_source_index(document_content, records)
 
+    def _recalled_publication_for_document(
+        self, context: dict, document_id: str
+    ) -> dict | None:
+        # Public API contexts always carry organization/user/device identity.
+        # Keep the pure document-export validator usable in isolated tooling
+        # that intentionally supplies no repository identity.
+        if not isinstance(context, dict) or "organization_id" not in context:
+            return None
+        for publication in self._list_decrypted_records(
+            context, "publication_item"
+        ):
+            content = publication.get("content") or {}
+            snapshot = content.get("signed_snapshot") or {}
+            receipt = snapshot.get("receipt") or {}
+            if (
+                content.get("status") == "recalled"
+                and str(receipt.get("document_id") or "") == document_id
+            ):
+                return publication
+        return None
+
     def export_document(
-        self, context: dict, record_id: str, output_format: str
+        self,
+        context: dict,
+        record_id: str,
+        output_format: str,
+        *,
+        mode: str = "",
     ) -> tuple[bytes, str]:
+        mode = str(mode or "").strip().lower()
+        if mode not in {"", "audit"}:
+            raise ValueError("导出 mode 仅支持 audit")
+        recalled_publication = self._recalled_publication_for_document(
+            context, record_id
+        )
+        if recalled_publication is not None:
+            if mode != "audit":
+                raise PublicationRecalled("已撤回材料禁止普通导出")
+            return self.export_publication(
+                context,
+                recalled_publication["record_id"],
+                output_format,
+                mode="audit",
+            )
         document = self._record_with_hash(context, record_id, "document")
         validation = validate_document(document["content"])
         if not validation.get("ready"):
@@ -2216,15 +2464,87 @@ class V9Service:
             str(context["user_id"]),
             str(context["device_id"]),
             "audit_event",
-            {
-                "action": action,
-                "target_id": target_id,
-                "actor_user_id": str(context["user_id"]),
-                "occurred_at": datetime.now(timezone.utc).isoformat(),
-                "details": details or {},
-            },
+            self._audit_event_content(
+                context,
+                action=action,
+                target_id=target_id,
+                details=details,
+            ),
             _workflow=True,
         )
+
+    @staticmethod
+    def _audit_event_content(
+        context: dict,
+        *,
+        action: str,
+        target_id: str,
+        details: dict | None = None,
+    ) -> dict:
+        return {
+            "action": action,
+            "target_id": target_id,
+            "actor_user_id": str(context["user_id"]),
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "details": details or {},
+        }
+
+    def _commit_publication_transition(
+        self,
+        context: dict,
+        record_id: str,
+        *,
+        expected_version: int,
+        content: dict,
+        permission: str,
+        audit_action: str,
+        audit_details: dict,
+    ) -> dict:
+        organization_id = str(context["organization_id"])
+        user_id = str(context["user_id"])
+        device_id = str(context["device_id"])
+        publication_envelope, _ = self._prepare_record_update(
+            organization_id,
+            user_id,
+            device_id,
+            record_id,
+            expected_version=expected_version,
+            content=content,
+            _workflow=True,
+            _permission=permission,
+        )
+        audit_envelope = self._prepare_new_record(
+            organization_id,
+            user_id,
+            device_id,
+            "audit_event",
+            self._audit_event_content(
+                context,
+                action=audit_action,
+                target_id=record_id,
+                details=audit_details,
+            ),
+            _workflow=True,
+        )
+        self.repository.put_records_atomically(
+            [
+                {
+                    "envelope": publication_envelope,
+                    "device_id": device_id,
+                    "expected_current_version": expected_version,
+                },
+                {
+                    "envelope": audit_envelope,
+                    "device_id": device_id,
+                    "expected_current_version": 0,
+                },
+            ]
+        )
+        return {
+            "record_id": publication_envelope.record_id,
+            "version": publication_envelope.version,
+            "content_hash": publication_envelope.content_hash,
+        }
 
     def create_publication_item(
         self, context: dict, document_id: str
@@ -2320,43 +2640,43 @@ class V9Service:
         *,
         expected_version: int,
     ) -> dict:
-        self._require(
-            str(context["organization_id"]),
-            str(context["user_id"]),
-            "publication.approve",
-        )
-        publication = self._record_with_hash(
-            context, record_id, "publication_item"
-        )
-        document = self._record_with_hash(
-            context,
-            str(publication["content"].get("document_id")),
-            "document",
-        )
-        source_index = self._source_index(context, document["content"])
-        content = signed_publication_content(
-            publication["content"],
-            document,
-            source_index,
-            str(context["user_id"]),
-        )
-        updated = self.update_record(
-            str(context["organization_id"]),
-            str(context["user_id"]),
-            str(context["device_id"]),
-            record_id,
-            expected_version=expected_version,
-            content=content,
-            _workflow=True,
-            _permission="publication.approve",
-        )
-        self._create_audit_event(
-            context,
-            action="publication.signed",
-            target_id=record_id,
-            details=content["signed_snapshot"]["receipt"],
-        )
-        return {**updated, "status": "signed"}
+        with self._workflow_lock:
+            self._require(
+                str(context["organization_id"]),
+                str(context["user_id"]),
+                "publication.approve",
+            )
+            publication = self._record_with_hash(
+                context, record_id, "publication_item"
+            )
+            document = self._record_with_hash(
+                context,
+                str(publication["content"].get("document_id")),
+                "document",
+            )
+            source_index = self._source_index(context, document["content"])
+            content = signed_publication_content(
+                publication["content"],
+                document,
+                source_index,
+                str(context["user_id"]),
+            )
+            updated = self._commit_publication_transition(
+                context,
+                record_id,
+                expected_version=expected_version,
+                content=content,
+                permission="publication.approve",
+                audit_action="publication.signed",
+                audit_details=content["signed_snapshot"]["receipt"],
+            )
+        return {
+            **updated,
+            "status": "signed",
+            "publication_scope": "local_approval_snapshot",
+            "external_published": False,
+            "message": LOCAL_SIGNING_NOTICE,
+        }
 
     def recall_publication_item(
         self,
@@ -2366,45 +2686,39 @@ class V9Service:
         expected_version: int,
         reason: str,
     ) -> dict:
-        self._require(
-            str(context["organization_id"]),
-            str(context["user_id"]),
-            "publication.recall",
-        )
-        reason = str(reason or "").strip()
-        if not reason:
-            raise ValueError("撤回原因必填")
-        publication = self._record_with_hash(
-            context, record_id, "publication_item"
-        )
-        content = dict(publication["content"])
-        if content.get("status") != "signed":
-            raise ValueError("只有已签发稿件可以撤回")
-        content.update(
-            {
-                "status": "recalled",
-                "recalled_at": datetime.now(timezone.utc).isoformat(),
-                "recalled_by": str(context["user_id"]),
-                "recall_reason": reason[:2000],
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        updated = self.update_record(
-            str(context["organization_id"]),
-            str(context["user_id"]),
-            str(context["device_id"]),
-            record_id,
-            expected_version=expected_version,
-            content=content,
-            _workflow=True,
-            _permission="publication.recall",
-        )
-        self._create_audit_event(
-            context,
-            action="publication.recalled",
-            target_id=record_id,
-            details={"reason": reason[:2000]},
-        )
+        with self._workflow_lock:
+            self._require(
+                str(context["organization_id"]),
+                str(context["user_id"]),
+                "publication.recall",
+            )
+            reason = str(reason or "").strip()
+            if not reason:
+                raise ValueError("撤回原因必填")
+            publication = self._record_with_hash(
+                context, record_id, "publication_item"
+            )
+            content = dict(publication["content"])
+            if content.get("status") != "signed":
+                raise ValueError("只有已签发稿件可以撤回")
+            content.update(
+                {
+                    "status": "recalled",
+                    "recalled_at": datetime.now(timezone.utc).isoformat(),
+                    "recalled_by": str(context["user_id"]),
+                    "recall_reason": reason[:2000],
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            updated = self._commit_publication_transition(
+                context,
+                record_id,
+                expected_version=expected_version,
+                content=content,
+                permission="publication.recall",
+                audit_action="publication.recalled",
+                audit_details={"reason": reason[:2000]},
+            )
         return {**updated, "status": "recalled"}
 
     def list_audit_events(self, context: dict) -> list[dict]:
@@ -2416,26 +2730,53 @@ class V9Service:
         return list(reversed(self._list_decrypted_records(context, "audit_event")))
 
     def export_publication(
-        self, context: dict, record_id: str, output_format: str
+        self,
+        context: dict,
+        record_id: str,
+        output_format: str,
+        *,
+        mode: str = "",
     ) -> tuple[bytes, str]:
         publication = self._record_with_hash(
             context, record_id, "publication_item"
         )
-        snapshot = publication["content"].get("signed_snapshot")
+        content = publication["content"]
+        mode = str(mode or "").strip().lower()
+        if mode not in {"", "audit"}:
+            raise ValueError("导出 mode 仅支持 audit")
+        if content.get("status") == "recalled" and mode != "audit":
+            raise PublicationRecalled("已撤回材料禁止普通导出")
+        snapshot = content.get("signed_snapshot")
         if not snapshot:
             raise ValueError("版面尚未生成签发快照")
         document_content = snapshot["document"]
         source_index = snapshot["source_index"]
+        recall_audit = (
+            build_recall_audit_notice(content)
+            if content.get("status") == "recalled"
+            else None
+        )
+        export_title = document_content["title"]
+        if recall_audit:
+            export_title = f"{export_title}-已撤回-审计件"
         output_format = str(output_format or "").lower()
         if output_format == "docx":
             return (
-                build_document_docx(document_content, source_index),
-                safe_filename(document_content["title"], "docx"),
+                build_document_docx(
+                    document_content,
+                    source_index,
+                    recall_audit=recall_audit,
+                ),
+                safe_filename(export_title, "docx"),
             )
         if output_format == "pdf":
             return (
-                build_document_pdf(document_content, source_index),
-                safe_filename(document_content["title"], "pdf"),
+                build_document_pdf(
+                    document_content,
+                    source_index,
+                    recall_audit=recall_audit,
+                ),
+                safe_filename(export_title, "pdf"),
             )
         raise ValueError("仅支持 docx 或 pdf")
 
@@ -2491,6 +2832,37 @@ class V9Service:
         *,
         _workflow: bool = False,
     ) -> dict:
+        envelope = self._prepare_new_record(
+            organization_id,
+            user_id,
+            device_id,
+            record_type,
+            content,
+            _workflow=_workflow,
+        )
+        self.repository.put_record(envelope, device_id)
+        return self._record_result(envelope)
+
+    @staticmethod
+    def _record_result(envelope: RecordEnvelope) -> dict:
+        return {
+            "record_id": envelope.record_id,
+            "record_type": envelope.record_type,
+            "version": envelope.version,
+            "content_hash": envelope.content_hash,
+        }
+
+    def _prepare_new_record(
+        self,
+        organization_id: str,
+        user_id: str,
+        device_id: str,
+        record_type: str,
+        content: Any,
+        *,
+        _workflow: bool = False,
+    ) -> RecordEnvelope:
+        self._require_unlocked()
         record_type = self._validate_type(record_type)
         if record_type in _WORKFLOW_RECORD_TYPES and not _workflow:
             raise PermissionDenied(
@@ -2512,7 +2884,7 @@ class V9Service:
         record_id = str(uuid.uuid4())
         key_version = int(org["key_version"])
         org_key = self._load_org_key(organization_id, key_version)
-        envelope = encrypt_record(
+        return encrypt_record(
             org_key=org_key,
             org_id=organization_id,
             record_id=record_id,
@@ -2521,13 +2893,6 @@ class V9Service:
             key_version=key_version,
             content=content,
         )
-        self.repository.put_record(envelope, device_id)
-        return {
-            "record_id": record_id,
-            "record_type": record_type,
-            "version": 1,
-            "content_hash": envelope.content_hash,
-        }
 
     def read_record(
         self, organization_id: str, user_id: str, record_id: str
@@ -2560,6 +2925,36 @@ class V9Service:
         _workflow: bool = False,
         _permission: str | None = None,
     ) -> dict:
+        candidate, _ = self._prepare_record_update(
+            organization_id,
+            user_id,
+            device_id,
+            record_id,
+            expected_version=expected_version,
+            content=content,
+            _workflow=_workflow,
+            _permission=_permission,
+        )
+        self.repository.put_record(candidate, device_id)
+        return {
+            "record_id": candidate.record_id,
+            "version": candidate.version,
+            "content_hash": candidate.content_hash,
+        }
+
+    def _prepare_record_update(
+        self,
+        organization_id: str,
+        user_id: str,
+        device_id: str,
+        record_id: str,
+        *,
+        expected_version: int,
+        content: Any,
+        _workflow: bool = False,
+        _permission: str | None = None,
+    ) -> tuple[RecordEnvelope, Any]:
+        self._require_unlocked()
         current = self.repository.get_record(record_id)
         if current is None:
             raise NotFound(record_id)
@@ -2611,12 +3006,7 @@ class V9Service:
             raise VersionConflict(
                 f"expected {expected_version}, current {current['version']}"
             )
-        self.repository.put_record(candidate, device_id)
-        return {
-            "record_id": record_id,
-            "version": proposed_version,
-            "content_hash": candidate.content_hash,
-        }
+        return candidate, current_content
 
     def add_device(
         self,

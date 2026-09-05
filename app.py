@@ -43,13 +43,22 @@ import report_agent
 import search_adapters
 import auth_devices
 import document_safety
+from upload_safety import UploadValidationError, validate_upload_envelope
+from isolated_document_parser import (
+    DOCUMENT_PARSE_MAX_WORKERS,
+    IsolatedDocumentParseError,
+    parse_document_isolated,
+)
 from pinned_http import UnsafeTargetError, pinned_get
-from product_version import PRODUCT_VERSION, current_build_commit
+from product_version import PRODUCT_VERSION, current_build_commit, current_build_id
 from v9.ai_providers import (
     UnsupportedAiProvider,
     provider_catalog,
     resolve_provider,
 )
+
+APP_VERSION = PRODUCT_VERSION.semantic_version
+BUILD_ID = current_build_id()
 
 # python-docx for brief export
 try:
@@ -102,13 +111,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from v9.redaction import install_redaction_filter
 install_redaction_filter(logger)
-mimetypes.add_type("text/javascript", ".mjs", strict=True)
-mimetypes.add_type("text/javascript", ".mjs", strict=False)
+mimetypes.add_type("application/javascript", ".mjs", strict=True)
+mimetypes.add_type("application/javascript", ".mjs", strict=False)
 app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024   # 修复7：最大16MB上传
 CAPTURE_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 REPORT_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=2)   # 报告草稿/扩写 AI 生成后台队列（阻塞式 AI 移出请求线程）
+CAPTURE_SUBMISSION_GUARD = consulting_agent.BoundedSubmissionGuard(
+    capacity=8, retry_after=5
+)
+REPORT_SUBMISSION_GUARD = report_agent.BoundedSubmissionGuard(
+    capacity=4, retry_after=5
+)
+# Desktop MVP runs one Flask process. A fixed set of per-task stripes closes
+# the control-vs-external-call TOCTOU window without an unbounded lock registry:
+# cancel/block and each externally visible step use the same stripe.
+_TASK_EXTERNAL_STEP_LOCKS = tuple(threading.RLock() for _ in range(64))
+
+
+def _task_external_step_lock(task_kind: str, job_id: str) -> threading.RLock:
+    key = f"{task_kind}:{job_id}".encode("utf-8", errors="replace")
+    index = int.from_bytes(hashlib.sha256(key).digest()[:4], "big") % len(
+        _TASK_EXTERNAL_STEP_LOCKS
+    )
+    return _TASK_EXTERNAL_STEP_LOCKS[index]
+
+
+UPLOAD_PARSE_TIMEOUT_SECONDS = 12
 MIN_CITABLE_WORDS = 8
 # 判定来源为"已归档可引用"的最低正文字数门槛。8 太低（导航壳/cookie 提示/错误占位页
 # 凑够 8 字即被当可引用来源转交报告 Agent，污染情报来源闭环），提到与情报来源相称的量级。
@@ -125,6 +155,13 @@ from urllib.parse import urlparse, urljoin
 # 访问令牌：默认强制启用。仅本地开发/测试可显式设置
 # ACCESS_TOKEN_REQUIRED=0；回环网络是共享传输边界，不等于身份认证。
 _TOKEN_FILE = os.path.join(CONFIG_DIR, ".access_token")
+RUNTIME_MODE = os.environ.get("DEFENSE_TRACKER_MODE", "desktop").strip().lower()
+if RUNTIME_MODE not in {"desktop", "server"}:
+    raise RuntimeError("DEFENSE_TRACKER_MODE must be 'desktop' or 'server'")
+BROWSER_RENDER_SANDBOXED = (
+    os.environ.get("DEFENSE_TRACKER_BROWSER_RENDER_SANDBOXED", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 def _parse_access_token_required(value) -> bool:
@@ -153,14 +190,17 @@ def _resolve_bind_host(
     bind_host: str | None = None,
     *,
     auth_required: bool | None = None,
+    access_token: str | None = None,
 ) -> str:
-    """Resolve the listener and fail closed for unauthenticated remote binds."""
+    """Resolve the listener and fail closed outside the desktop boundary."""
     host = (
         bind_host
         if bind_host is not None
         else os.environ.get("DEFENSE_TRACKER_BIND_HOST", "127.0.0.1")
     )
     host = str(host or "").strip() or "127.0.0.1"
+    if RUNTIME_MODE == "desktop":
+        return "127.0.0.1"
     required = AUTH_REQUIRED if auth_required is None else auth_required
     normalized = host[1:-1] if host.startswith("[") and host.endswith("]") else host
     is_loopback = normalized.lower() == "localhost"
@@ -173,6 +213,16 @@ def _resolve_bind_host(
         raise RuntimeError(
             "DEFENSE_TRACKER_BIND_HOST may leave loopback only when "
             "ACCESS_TOKEN_REQUIRED=1"
+        )
+    configured_token = (
+        globals().get("ACCESS_TOKEN", "")
+        if access_token is None
+        else access_token
+    )
+    if not is_loopback and not str(configured_token or "").strip():
+        raise RuntimeError(
+            "DEFENSE_TRACKER_BIND_HOST may leave loopback only when "
+            "ACCESS_TOKEN_REQUIRED=1 and ACCESS_TOKEN is non-empty"
         )
     return host
 
@@ -210,7 +260,9 @@ AUTH_RATE_LIMIT = 120
 AUTH_RATE_WINDOW = 60
 TRUSTED_PROXIES_ENV = "DEFENSE_TRACKER_TRUSTED_PROXIES"
 MAX_FORWARDED_FOR_LENGTH = 1024
-MAX_FORWARDED_FOR_HOPS = 16
+# The supported topology has exactly one explicitly trusted reverse proxy.
+# Reject chains rather than trying to infer which intermediary to trust.
+MAX_FORWARDED_FOR_HOPS = 1
 MAX_RATE_IP_LENGTH = 45
 MAX_TRUSTED_PROXY_CONFIG_LENGTH = 2048
 MAX_TRUSTED_PROXY_NETWORKS = 64
@@ -327,6 +379,25 @@ def _get_ip() -> str:
             break
         client = hop
     return str(client)
+
+
+def _request_is_loopback_only() -> bool:
+    remote = _canonical_rate_address(request.remote_addr)
+    remote_ok = remote is None or remote.is_loopback
+    try:
+        host = (urlparse("//" + (request.host or "")).hostname or "").lower()
+        host_ok = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        host_ok = False
+    return remote_ok and host_ok
+
+
+def _desktop_request_is_loopback() -> bool:
+    return RUNTIME_MODE != "desktop" or _request_is_loopback_only()
+
+
+def _server_request_is_external() -> bool:
+    return RUNTIME_MODE == "server" and not _request_is_loopback_only()
 
 def _is_api_request() -> bool:
     return request.path.startswith("/api/")
@@ -460,7 +531,88 @@ def _csrf_is_valid() -> bool:
     return bool(header_token and cookie_token) and secrets.compare_digest(header_token, cookie_token)
 
 def csrf_error_response():
-    return jsonify({"error": "CSRF校验失败，请刷新页面后重试"}), 403
+    return _api_error(
+        "CSRF校验失败，请刷新页面后重试",
+        "CSRF_INVALID",
+        403,
+        retryable=True,
+    )
+
+
+def _api_error(
+    message: str,
+    code: str,
+    status: int,
+    *,
+    retryable: bool = False,
+    details=None,
+    action: str | None = None,
+):
+    payload = {
+        "error": message,
+        "code": code,
+        "request_id": getattr(g, "request_id", ""),
+        "retryable": bool(retryable),
+    }
+    if details is not None:
+        payload["details"] = details
+    if action:
+        payload["action"] = action
+    return jsonify(payload), status
+
+
+def _safe_exception_text(exc, fallback: str = "请求处理失败") -> str:
+    """Return a short diagnostic without host paths or control characters."""
+    text = str(exc or "").strip() or fallback
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    text = re.sub(
+        r"(?i)(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/=-]{8,}",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key)=)[^&#\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r'''(?ix)(["']?(?:api[_-]?key|app[_-]?secret|access[_-]?token|refresh[_-]?token|password|private[_-]?key)["']?\s*[:=]\s*["']?)([^"'\s,;}\]&#]+)''',
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r'''(?i)\\\\[?.]\\[A-Z]:[\\/][^\r\n\t'",;)}\]]*''',
+        "[本地路径已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r'''\\\\[^\\/\s'",;)}\]]+[\\/][^\r\n\t'",;)}\]]*''',
+        "[本地路径已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r'''(?i)\b[A-Z]:[\\/][^\r\n\t'",;)}\]]*''',
+        "[本地路径已隐藏]",
+        text,
+    )
+    text = re.sub(
+        r'''(?i)/(?:Users|home|var|tmp|opt|mnt|Volumes|etc|root|srv|proc|sys|dev)(?:/[^\s'",;)}\]]*)*''',
+        "[本地路径已隐藏]",
+        text,
+    )
+    return text[:300]
+
+
+def _upstream_http_error(exc, message: str, code: str):
+    """Return an upstream failure without relaying an untrusted response body."""
+    upstream_status = getattr(getattr(exc, "response", None), "status_code", None)
+    return _api_error(
+        message,
+        code,
+        502,
+        retryable=True,
+        details={"upstream_status": upstream_status},
+    )
 
 def validate_csrf_request() -> bool:
     return _csrf_is_valid()
@@ -470,14 +622,21 @@ def _workspace_auth_error_response():
     """Return the shared auth/rate/CSRF rejection, or None when allowed."""
     if not _is_authenticated():
         if _is_api_request():
-            return jsonify({"error": "未授权"}), 401
+            return _api_error("未授权", "AUTH_REQUIRED", 401)
         return redirect(url_for("login"))
     if not _check_rate(
         "auth:" + _get_ip(),
         limit=AUTH_RATE_LIMIT,
         window=AUTH_RATE_WINDOW,
     ):
-        return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
+        response, status = _api_error(
+            "请求过于频繁，请稍后再试",
+            "AUTH_RATE_LIMITED",
+            429,
+            retryable=True,
+        )
+        response.headers["Retry-After"] = str(AUTH_RATE_WINDOW)
+        return response, status
     if not _csrf_is_valid():
         return csrf_error_response()
     return None
@@ -499,7 +658,14 @@ def require_ai_rate(f):
     def wrapper(*args, **kwargs):
         ip = _get_ip()
         if not _check_rate(ip, limit=10, window=60):
-            return jsonify({"error": "请求过于频繁，请稍后再试（每分钟最多10次AI请求）"}), 429
+            response, status = _api_error(
+                "请求过于频繁，请稍后再试（每分钟最多10次AI请求）",
+                "AI_RATE_LIMITED",
+                429,
+                retryable=True,
+            )
+            response.headers["Retry-After"] = "60"
+            return response, status
         return f(*args, **kwargs)
     return wrapper
 
@@ -568,6 +734,33 @@ search_adapters.set_ssrf_check(_is_ssrf_safe)
 def prepare_request_security():
     g.csp_nonce = secrets.token_urlsafe(16)
     g.csrf_token = request.cookies.get(CSRF_COOKIE) or secrets.token_urlsafe(32)
+    g.request_id = (request.headers.get("X-Request-ID") or secrets.token_hex(16))[:128]
+    if not _desktop_request_is_loopback():
+        return _api_error(
+            "桌面模式仅接受本机回环连接",
+            "DESKTOP_LOOPBACK_ONLY",
+            403,
+        )
+    if _server_request_is_external():
+        if not AUTH_REQUIRED or not ACCESS_TOKEN:
+            return _api_error(
+                "服务端外部访问必须配置访问令牌",
+                "SERVER_AUTH_REQUIRED",
+                503,
+            )
+        public_server_paths = {
+            "/favicon.ico",
+            "/health",
+            "/health/live",
+            "/health/ready",
+            "/login",
+        }
+        if request.path not in public_server_paths and not _is_authenticated():
+            return _api_error(
+                "需要有效访问令牌",
+                "AUTH_REQUIRED",
+                401,
+            )
 
 @app.after_request
 def add_security_headers(resp):
@@ -577,6 +770,7 @@ def add_security_headers(resp):
                         httponly=False, samesite="Strict", max_age=86400 * 7,
                         secure=_is_https)
     resp.headers["X-Content-Type-Options"]  = "nosniff"
+    resp.headers["X-Request-ID"]            = getattr(g, "request_id", "")
     resp.headers["X-Frame-Options"]         = "SAMEORIGIN"
     resp.headers["X-XSS-Protection"]        = "1; mode=block"
     resp.headers["Referrer-Policy"]         = "strict-origin-when-cross-origin"
@@ -601,40 +795,55 @@ def add_security_headers(resp):
         "form-action 'self'; "
         f"frame-ancestors {frame_ancestors}"
     )
+    if request.endpoint == "api_consult_asset_file":
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'none'; script-src-attr 'none'; "
+            "object-src 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox"
+        )
     return resp
 
 # ── 飞书机器人（可选，需配置 FEISHU_APP_ID / FEISHU_APP_SECRET）──
+FEISHU_BLUEPRINT_ENABLED = False
 try:
     from feishu_bot import feishu_bp
     app.register_blueprint(feishu_bp)
+    FEISHU_BLUEPRINT_ENABLED = True
     logger.info("飞书机器人模块已加载 → /api/feishu/webhook")
-except ImportError:
-    pass
+except ImportError as exc:
+    logger.info("飞书机器人模块未启用: %s", exc)
 
 # ── 追踪清单（Supabase 持久化 watchlist）→ /api/tracking/* ──
 # tracking.py 绝不 import app（避免循环 import），鉴权用注入回调：
 # 复用本文件已定义的 _is_authenticated/_check_rate/_csrf_is_valid，零逻辑重复。
+def _tracking_auth_check():
+    """Return a response to block the request, or None to allow it."""
+    if not _is_authenticated():
+        if _is_api_request():
+            return _api_error("未授权", "AUTH_REQUIRED", 401)
+        return redirect(url_for("login"))
+    if not _check_rate("auth:" + _get_ip(), limit=AUTH_RATE_LIMIT, window=AUTH_RATE_WINDOW):
+        response, status = _api_error(
+            "请求过于频繁，请稍后再试",
+            "RATE_LIMITED",
+            429,
+            retryable=True,
+        )
+        response.headers["Retry-After"] = str(AUTH_RATE_WINDOW)
+        return response, status
+    if not _csrf_is_valid():
+        return csrf_error_response()
+    return None
+
+
 try:
     import tracking
-
-    def _tracking_auth_check():
-        """返回 Response 表示拦截、None 表示放行；语义与 require_auth 一致。"""
-        if not _is_authenticated():
-            if _is_api_request():
-                return jsonify({"error": "未授权"}), 401
-            return redirect(url_for("login"))
-        if not _check_rate("auth:" + _get_ip(), limit=AUTH_RATE_LIMIT, window=AUTH_RATE_WINDOW):
-            return jsonify({"error": "请求过于频繁，请稍后再试"}), 429
-        if not _csrf_is_valid():
-            return csrf_error_response()
-        return None
 
     tracking._auth_check = _tracking_auth_check
     app.register_blueprint(tracking.tracking_bp)
     logger.info("追踪清单模块已加载 → /api/tracking/*（Supabase 配置：%s）",
                 "已就绪" if tracking._sb_ready() else "未配置")
-except ImportError:
-    pass
+except ImportError as exc:
+    raise RuntimeError("required tracking module could not be loaded") from exc
 
 # ── 用户状态上收（三端联动地基）→ /api/userdata/* ──
 # 书签/已读/预警词/要讯历史从 localStorage 收到服务端 SQLite，鉴权复用同一注入回调。
@@ -642,10 +851,19 @@ try:
     import user_state
 
     user_state._auth_check = _tracking_auth_check
+    user_state._bootstrap_config_provider = lambda: {
+        "version": APP_VERSION,
+        "build_id": BUILD_ID,
+        "mode": RUNTIME_MODE,
+        "ai": {
+            "enabled": bool(globals().get("AI_CONFIG", {}).get("api_key")),
+            "model": globals().get("AI_CONFIG", {}).get("model", ""),
+        },
+    }
     app.register_blueprint(user_state.user_state_bp)
     logger.info("用户状态模块已加载 → /api/userdata/*（%s）", user_state.USER_STATE_DB_FILE)
-except ImportError:
-    pass
+except ImportError as exc:
+    raise RuntimeError("required user_state module could not be loaded") from exc
 
 # ── V9 零知识本地记录层 → /api/v9/* ─────────────────────────
 # 明文业务路由只允许 loopback；同步路由仅接受密文载荷。
@@ -677,7 +895,9 @@ try:
                         os.path.join(DATA_DIR, "v9.sqlite3"),
                         os.path.join(VAULT_DIR, ".v9_local_master.key"),
                     )
-                if not _V9_MIGRATION_DONE:
+                if not _V9_MIGRATION_DONE and not bool(
+                    getattr(_V9_SERVICE, "is_key_locked", False)
+                ):
                     from v9.migration import migrate_default_legacy_databases
 
                     _v9_context = _V9_SERVICE.get_personal_context()
@@ -747,9 +967,10 @@ try:
             cloud_provider=_get_v9_cloud_session,
         )
     )
+    _get_v9_service()
     logger.info("V9 零知识记录层已加载 → /api/v9/*")
-except ImportError:
-    pass
+except ImportError as exc:
+    raise RuntimeError("required V9 modules could not be loaded") from exc
 
 # ══════════════════════════════════════════════════════════════
 # AI 配置（支持 OpenAI 兼容 API：OpenAI / DeepSeek / Ollama 等）
@@ -764,6 +985,47 @@ _AI_CONFIG_FILE = os.path.join(CONFIG_DIR, ".ai_config.json")
 _AI_CONFIG_KEY_FILE = os.path.join(CONFIG_DIR, ".ai_config.key")
 _AI_CONFIG_KEY_PURPOSE = "local-config-fernet-root"
 _AI_CIPHER = None
+_AI_CONFIG_LOCK = threading.RLock()
+
+
+class LegacySecretScrubError(RuntimeError):
+    """A legacy plaintext secret could not be removed from its config file."""
+
+
+def _scrub_legacy_secret_fields(
+    path: str, payload: dict, secret_fields: tuple[str, ...], label: str
+) -> bool:
+    """Atomically remove known legacy secret fields while preserving all other JSON."""
+    if not isinstance(payload, dict) or not any(field in payload for field in secret_fields):
+        return False
+    scrubbed = dict(payload)
+    for field in secret_fields:
+        scrubbed.pop(field, None)
+    temporary = path + ".secret-scrub.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(scrubbed, f, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    except Exception as exc:
+        logger.critical("%s旧版明文秘密清理失败，已中止加载: %s", label, exc)
+        raise LegacySecretScrubError(f"{label}旧版明文秘密清理失败: {exc}") from exc
+    logger.info("%s旧版配置中的秘密字段已清理", label)
+    return True
+
+
+def _ai_key_origin(value: str) -> str:
+    """Return the canonical origin a persisted AI key is allowed to reach."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        if scheme not in {"http", "https"} or not host:
+            return ""
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return ""
+    authority = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{authority}:{port}"
 
 
 def _is_valid_fernet_key(value: bytes) -> bool:
@@ -896,6 +1158,7 @@ def _load_ai_config() -> dict:
         "max_tokens": 1024,
         "temperature": 0.7,
     }
+    legacy_secret = ""
     if os.path.exists(_AI_CONFIG_FILE):
         try:
             saved = read_private_json(_AI_CONFIG_FILE)
@@ -939,18 +1202,20 @@ def _load_ai_config() -> dict:
             logger.warning("AI configuration was ignored because it is invalid")
     return base
 
-def _save_ai_config() -> bool:
-    """将当前 AI 配置持久化到文件"""
+def _save_ai_config(config: dict | None = None) -> bool:
+    """Persist a candidate before making its provider/key pair visible."""
     try:
+        with _AI_CONFIG_LOCK:
+            config = dict(AI_CONFIG if config is None else config)
         selection = resolve_provider(
-            AI_CONFIG.get("provider"), AI_CONFIG.get("model")
+            config.get("provider"), config.get("model")
         )
         payload = {
             "provider": selection.provider,
             "model": selection.model_id,
         }
-        if AI_CONFIG.get("api_key"):
-            payload["api_key"] = _encrypt_ai_secret(AI_CONFIG["api_key"])
+        if config.get("api_key"):
+            payload["api_key"] = _encrypt_ai_secret(config["api_key"])
         write_private_json_atomic(_AI_CONFIG_FILE, payload)
         return True
     except Exception:
@@ -1072,10 +1337,11 @@ def _lease_ai_runtime():
         return
     if _authenticated_v9_cloud_session() is not None:
         raise ValueError("云端 AI 凭据尚未在当前设备激活")
-    selection = resolve_provider(
-        AI_CONFIG.get("provider"), AI_CONFIG.get("model")
-    )
-    api_key = str(AI_CONFIG.get("api_key") or "")
+    with _AI_CONFIG_LOCK:
+        selection = resolve_provider(
+            AI_CONFIG.get("provider"), AI_CONFIG.get("model")
+        )
+        api_key = str(AI_CONFIG.get("api_key") or "")
     if not api_key:
         raise ValueError("AI API Key 未配置")
     yield {
@@ -1101,6 +1367,7 @@ def _load_search_config() -> dict:
         "serpapi_api_key": os.environ.get("SERPAPI_API_KEY", ""),
         "default_providers": ["tavily", "brave", "serpapi"],
     }
+    legacy_secrets = {}
     if os.path.exists(SEARCH_CONFIG_FILE):
         try:
             saved = read_private_json(SEARCH_CONFIG_FILE)
@@ -1182,7 +1449,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on", "y")
 
 def _load_email_config() -> dict:
-    """Load SMTP config from env/file. Password may be encrypted with the AI Fernet key."""
+    """Load SMTP config while keeping the persisted password in the DPAPI vault."""
     smtp_user = os.environ.get("EMAIL_SMTP_USER") or os.environ.get("GMAIL_SMTP_USER", "")
     smtp_password = os.environ.get("EMAIL_SMTP_PASSWORD") or os.environ.get("GMAIL_APP_PASSWORD", "")
     to_addrs = _split_email_addrs(os.environ.get("EMAIL_TO") or os.environ.get("DAILY_BRIEF_EMAIL_TO", ""))
@@ -1197,6 +1464,7 @@ def _load_email_config() -> dict:
         "use_ssl": _env_bool("EMAIL_SMTP_SSL", True),
         "starttls": _env_bool("EMAIL_SMTP_STARTTLS", False),
     }
+    legacy_password = ""
     if os.path.exists(_EMAIL_CONFIG_FILE):
         try:
             saved = read_private_json(_EMAIL_CONFIG_FILE)
@@ -1229,6 +1497,24 @@ def _load_email_config() -> dict:
         except Exception:
             logger.warning("加载邮件配置失败；已忽略无效的本地邮件配置")
     return base
+
+
+def _write_nonsecret_email_config(config: dict) -> None:
+    payload = {
+        "enabled": bool(config.get("enabled")),
+        "smtp_host": config.get("smtp_host", "smtp.gmail.com"),
+        "smtp_port": int(config.get("smtp_port", 465)),
+        "smtp_user": config.get("smtp_user", ""),
+        "from_addr": config.get("from_addr", ""),
+        "to_addrs": _split_email_addrs(config.get("to_addrs", [])),
+        "use_ssl": bool(config.get("use_ssl", True)),
+        "starttls": bool(config.get("starttls", False)),
+    }
+    temporary = _EMAIL_CONFIG_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temporary, _EMAIL_CONFIG_FILE)
+
 
 def _save_email_config(config: dict | None = None):
     """Persist email config without writing the app password in clear text when crypto is available."""
@@ -1973,14 +2259,71 @@ def refresh_news():
     before = len(all_arts)
     all_arts, dup_count = _dedup_articles(all_arts)
     all_arts = _prune_news_cache(all_arts)
+    refreshed_at = datetime.now(timezone.utc).isoformat()
+    if not all_arts:
+        with cache_lock:
+            cache["fetch_errors"] = errors
+            cache["fetch_stats"] = stats
+            cache["freshness"] = "stale" if cache.get("news") else "offline"
+        try:
+            user_state.record_rss_failure(
+                "aggregate", "RSS_REFRESH_EMPTY", failed_at=refreshed_at
+            )
+        except Exception as exc:
+            logger.warning("RSS 失败状态持久化失败: %s", exc)
+        logger.warning("RSS refresh returned no articles; retained last-good snapshot")
+        return
     with cache_lock:
         cache["news"]         = all_arts
-        cache["last_update"]  = datetime.now(timezone.utc).isoformat()
+        cache["last_update"]  = refreshed_at
         cache["fetch_errors"] = errors
         cache["fetch_stats"]  = stats
         cache["dup_removed"]  = dup_count
+        cache["freshness"]    = "fresh"
+    try:
+        user_state.save_rss_last_good(
+            "aggregate",
+            {
+                "news": all_arts,
+                "last_update": refreshed_at,
+                "fetch_errors": errors,
+                "fetch_stats": stats,
+                "dup_removed": dup_count,
+            },
+            fetched_at=refreshed_at,
+        )
+    except Exception as exc:
+        logger.warning("RSS 最后成功快照持久化失败: %s", exc)
     logger.info("Refreshed legacy scoring schema: %d articles (deduped %d from %d raw), failed: %s",
                 len(all_arts), dup_count, before, errors)
+
+
+def _load_persisted_news_snapshot() -> bool:
+    """Warm the EXE cache from the last successful refresh before networking."""
+    try:
+        stored = user_state.get_rss_runtime_status("aggregate")
+    except Exception as exc:
+        logger.warning("读取 RSS 最后成功快照失败: %s", exc)
+        return False
+    snapshot = stored.get("snapshot") if isinstance(stored, dict) else None
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("news"), list):
+        return False
+    with cache_lock:
+        cache["news"] = snapshot["news"][:NEWS_CACHE_MAX]
+        cache["last_update"] = snapshot.get("last_update") or stored.get("fetched_at")
+        cache["fetch_errors"] = list(snapshot.get("fetch_errors") or [])
+        cache["fetch_stats"] = dict(snapshot.get("fetch_stats") or {})
+        cache["dup_removed"] = int(snapshot.get("dup_removed") or 0)
+        cache["freshness"] = stored.get("status") or "stale"
+    logger.info(
+        "已加载 RSS 最后成功快照：%d 篇，状态 %s",
+        len(snapshot["news"]),
+        stored.get("status") or "stale",
+    )
+    return True
+
+
+_load_persisted_news_snapshot()
 
 # ══════════════════════════════════════════════════════════════
 # API 路由
@@ -2090,12 +2433,14 @@ def api_news():
         last_update = cache["last_update"]
         errors = list(cache["fetch_errors"])
         stats = dict(cache["fetch_stats"])
+        freshness = cache.get("freshness") or ("fresh" if last_update else "offline")
     page = request.args.get("page", type=int)
     size = request.args.get("size", type=int)
     items, page_info = _paginate_items(news, page, size)
     return jsonify({"news": items, "last_update": last_update,
                     "total": len(news), "errors": errors,
                     "stats": stats, "days_window": NEWS_DAYS,
+                    "freshness": freshness,
                     "cache_ttl_hours": NEWS_CACHE_TTL_HOURS,
                     **page_info})
 
@@ -2169,9 +2514,11 @@ def workspace_health():
 @app.route("/api/status")
 @require_auth
 def api_status():
+    readiness = _readiness_snapshot()
     with cache_lock:
         return jsonify({"status": "online",
                         "version": PRODUCT_VERSION.semantic_version,
+                        "build_id": BUILD_ID,
                         "display_version": PRODUCT_VERSION.display_version,
                         "release_tag": PRODUCT_VERSION.release_tag,
                         "release_baseline": PRODUCT_VERSION.release_baseline,
@@ -2184,7 +2531,106 @@ def api_status():
                         "thinktank_sites": sum(len(c["sites"]) for c in THINK_TANK_DIRECTORY),
                         "days_window": NEWS_DAYS,
                         "ai_enabled": _ai_is_enabled(),
-                        "csrf_token": request.cookies.get(CSRF_COOKIE, "")})
+                        "csrf_token": request.cookies.get(CSRF_COOKIE, ""),
+                        **readiness})
+
+
+def _component(
+    status: str,
+    *,
+    required: bool,
+    detail: str = "",
+    code: str = "",
+) -> dict:
+    return {
+        "status": status,
+        "required": required,
+        "detail": detail,
+        "code": code,
+    }
+
+
+def _readiness_snapshot() -> dict:
+    components = {}
+    try:
+        user_state_ready = (
+            user_state.get_server_migration_version()
+            == user_state.USER_STATE_SCHEMA_VERSION
+        )
+        user_state_detail = ""
+    except Exception as exc:
+        user_state_ready = False
+        user_state_detail = type(exc).__name__
+    components["user_state"] = _component(
+        "ready" if user_state_ready else "unavailable",
+        required=True,
+        detail=user_state_detail,
+        code="" if user_state_ready else "USER_STATE_UNAVAILABLE",
+    )
+    v9_ready = False
+    v9_detail = ""
+    v9_code = ""
+    try:
+        service = _get_v9_service()
+        status_provider = getattr(service, "key_status", None)
+        status = status_provider() if callable(status_provider) else {}
+        if bool(getattr(service, "is_key_locked", False)):
+            v9_detail = str(status.get("reason") or "key_unavailable")
+            v9_code = str(status.get("code") or "V9_KEY_LOCKED")
+        else:
+            v9_ready = True
+    except Exception as exc:
+        v9_detail = type(exc).__name__
+        v9_code = "V9_UNAVAILABLE"
+    components["v9"] = _component(
+        "ready" if v9_ready else ("locked" if v9_code == "V9_KEY_LOCKED" else "unavailable"),
+        required=True,
+        detail=v9_detail,
+        code=v9_code,
+    )
+    executors_ready = not any(
+        getattr(executor, "_shutdown", False)
+        for executor in (CAPTURE_EXECUTOR, REPORT_JOB_EXECUTOR)
+    )
+    components["executors"] = _component(
+        "ready" if executors_ready else "stopped", required=True
+    )
+    scheduler_started = _scheduler_is_running()
+    components["scheduler"] = _component(
+        "ready" if scheduler_started else "disabled", required=False
+    )
+    components["ai"] = _component(
+        "ready" if bool(AI_CONFIG.get("api_key")) else "disabled", required=False
+    )
+    components["feishu"] = _component(
+        "ready" if globals().get("FEISHU_BLUEPRINT_ENABLED", False) else "disabled",
+        required=False,
+    )
+    with cache_lock:
+        rss_status = "ready" if cache.get("last_update") else "stale"
+    components["rss"] = _component(rss_status, required=False)
+    ready = all(
+        value["status"] == "ready"
+        for value in components.values()
+        if value["required"]
+    )
+    degraded = [
+        name for name, value in components.items()
+        if value["status"] != "ready"
+    ]
+    return {"ready": ready, "degraded": degraded, "components": components}
+
+
+@app.route("/health/live")
+def health_live():
+    return jsonify({"status": "alive"})
+
+
+@app.route("/health/ready")
+def health_ready():
+    readiness = _readiness_snapshot()
+    payload = {"version": APP_VERSION, "build_id": BUILD_ID, **readiness}
+    return jsonify(payload), (200 if readiness["ready"] else 503)
 
 # ══════════════════════════════════════════════════════════════
 # AI 分析 API
@@ -2230,14 +2676,6 @@ def api_ai_config_set():
         return jsonify({
             "error": "cloud AI credentials must use the device-bound credential API"
         }), 409
-    try:
-        selection = resolve_provider(
-            data.get("provider") or AI_CONFIG.get("provider"),
-            data.get("model") or AI_CONFIG.get("model"),
-        )
-    except UnsupportedAiProvider as exc:
-        return jsonify({"error": str(exc)}), 400
-    previous_config = dict(AI_CONFIG)
     if "api_key" in data:
         api_key = data["api_key"]
         if (
@@ -2246,18 +2684,38 @@ def api_ai_config_set():
             or any(ord(char) < 32 for char in api_key)
         ):
             return jsonify({"error": "invalid API key"}), 400
-        AI_CONFIG["api_key"] = api_key
-    AI_CONFIG.update({
-        "provider": selection.provider,
-        "model": selection.model_id,
-        "base_url": selection.endpoint.rsplit("/chat/completions", 1)[0],
-    })
-    if not _save_ai_config():
-        AI_CONFIG.clear()
-        AI_CONFIG.update(previous_config)
-        return jsonify({
-            "error": "secure AI credential persistence is unavailable"
-        }), 503
+    with _AI_CONFIG_LOCK:
+        try:
+            selection = resolve_provider(
+                data.get("provider") or AI_CONFIG.get("provider"),
+                data.get("model") or AI_CONFIG.get("model"),
+            )
+            previous_selection = resolve_provider(
+                AI_CONFIG.get("provider"), AI_CONFIG.get("model"),
+            )
+        except UnsupportedAiProvider:
+            return _api_error("不支持的 AI 服务或模型", "UNSUPPORTED_AI_PROVIDER", 400)
+        candidate = dict(AI_CONFIG)
+        previous_origin = _url_origin(
+            candidate.get("base_url") or previous_selection.endpoint
+        )
+        if "api_key" in data:
+            candidate["api_key"] = api_key
+        elif (
+            selection.provider != previous_selection.provider
+            or _url_origin(selection.endpoint) != previous_origin
+        ):
+            candidate["api_key"] = ""
+        candidate.update({
+            "provider": selection.provider,
+            "model": selection.model_id,
+            "base_url": selection.endpoint.rsplit("/chat/completions", 1)[0],
+        })
+        if not _save_ai_config(candidate):
+            return jsonify({
+                "error": "secure AI credential persistence is unavailable"
+            }), 503
+        AI_CONFIG.update(candidate)
     return jsonify({
         "ok": True,
         "enabled": _ai_is_enabled(),
@@ -2269,6 +2727,55 @@ def api_ai_config_set():
 def _ai_ssl_verify(base_url: str) -> bool:
     """TLS certificate verification is mandatory for every AI request."""
     return True
+
+
+_AI_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _ai_transport_ssrf_check(url: str):
+    """Build the last-mile SSRF check for one immutable AI request target."""
+    parsed = urlparse(str(url or ""))
+    original_host = (parsed.hostname or "").lower()
+    allow_loopback = RUNTIME_MODE == "desktop" and original_host in _AI_LOOPBACK_HOSTS
+    if not allow_loopback:
+        return _is_ssrf_safe
+
+    def local_model_only(candidate: str) -> tuple[bool, str]:
+        candidate_host = (urlparse(str(candidate or "")).hostname or "").lower()
+        if candidate_host == "localhost":
+            return True, ""
+        try:
+            if ipaddress.ip_address(candidate_host).is_loopback:
+                return True, ""
+        except ValueError:
+            pass
+        return False, "本地 AI 端点只允许回环地址"
+
+    return local_model_only
+
+
+def _url_origin(value: str) -> tuple[str, str, int | None]:
+    parsed = urlparse(str(value or "").strip())
+    return parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port
+
+
+def _assert_current_ai_request(url: str, headers: dict) -> None:
+    """Reject stale base-url/key snapshots before a credential reaches transport."""
+    with _AI_CONFIG_LOCK:
+        current_selection = resolve_provider(
+            AI_CONFIG.get("provider"),
+            AI_CONFIG.get("model"),
+        )
+        current_key = str(AI_CONFIG.get("api_key") or "")
+    if _url_origin(url) != _url_origin(current_selection.endpoint):
+        raise RuntimeError("AI端点已变更，请重新发起请求")
+    supplied = dict(headers or {})
+    bearer = str(supplied.get("Authorization") or "")
+    anthropic_key = str(supplied.get("x-api-key") or "")
+    if not current_key or (
+        bearer != f"Bearer {current_key}" and anthropic_key != current_key
+    ):
+        raise RuntimeError("AI凭据已变更，请重新发起请求")
 
 
 # ── AI 成本闸（进程内、按 UTC 天滚动）：兜底防报告扩写/自主循环失控烧钱。默认宽松，仅超限时拦截。──
@@ -2290,27 +2797,67 @@ def _ai_kill_switch_on() -> bool:
     return os.environ.get("AI_KILL_SWITCH", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _ai_budget_reserve(est_tokens: int = 0) -> None:
-    """发起 AI 调用前预留额度；kill-switch 开启或当日超限则抛 AIBudgetExceeded（在真正请求前拦截）。"""
+def _ai_budget_reserve(est_tokens: int = 0) -> list[str]:
+    """Transactionally reserve the daily call/token budget before an AI call."""
     if _ai_kill_switch_on():
         raise AIBudgetExceeded("AI 调用已被 kill-switch 关闭（取消设置 AI_KILL_SWITCH 可恢复）")
+    today = _ai_today()
+    token_amount = max(0, int(est_tokens or 0))
+    nonce = secrets.token_hex(12)
+    reservations = []
+    try:
+        call_id = f"ai-calls:{today}:{nonce}"
+        user_state.reserve_daily_budget(
+            "ai_calls", today, 1, AI_DAILY_MAX_CALLS, call_id
+        )
+        reservations.append(call_id)
+        if token_amount and AI_DAILY_MAX_TOKENS:
+            token_id = f"ai-tokens:{today}:{nonce}"
+            user_state.reserve_daily_budget(
+                "ai_tokens",
+                today,
+                token_amount,
+                AI_DAILY_MAX_TOKENS,
+                token_id,
+            )
+            reservations.append(token_id)
+    except user_state.StateStoreError as exc:
+        for reservation_id in reservations:
+            try:
+                user_state.release_daily_budget(reservation_id)
+            except Exception:
+                pass
+        if exc.code == "BUDGET_EXCEEDED":
+            raise AIBudgetExceeded("当日 AI 调用或 token 预算已用尽") from None
+        raise
     with _AI_BUDGET_LOCK:
-        today = _ai_today()
-        if _AI_BUDGET["date"] != today:
-            _AI_BUDGET.update(date=today, calls=0, tokens=0)
-        if _AI_BUDGET["calls"] >= AI_DAILY_MAX_CALLS:
-            raise AIBudgetExceeded(f"当日 AI 调用已达上限 {AI_DAILY_MAX_CALLS} 次（AI_DAILY_MAX_CALLS）")
-        if AI_DAILY_MAX_TOKENS and _AI_BUDGET["tokens"] >= AI_DAILY_MAX_TOKENS:
-            raise AIBudgetExceeded(f"当日 AI token 预算已用尽 {AI_DAILY_MAX_TOKENS}（AI_DAILY_MAX_TOKENS）")
-        _AI_BUDGET["calls"] += 1
-        _AI_BUDGET["tokens"] += max(0, int(est_tokens or 0))
+        _AI_BUDGET.update(
+            date=today,
+            calls=_ai_budget_snapshot()["calls"],
+            tokens=_ai_budget_snapshot()["tokens"],
+        )
+    return reservations
+
+
+def _ai_budget_confirm(reservations, actual_tokens=None) -> None:
+    for reservation_id in reservations or []:
+        amount = None
+        if actual_tokens is not None and str(reservation_id).startswith("ai-tokens:"):
+            amount = max(0, int(actual_tokens))
+        user_state.confirm_daily_budget(reservation_id, amount=amount)
+
+
+def _ai_budget_release(reservations) -> None:
+    for reservation_id in reservations or []:
+        user_state.release_daily_budget(reservation_id)
 
 
 def _ai_budget_snapshot() -> dict:
-    with _AI_BUDGET_LOCK:
-        rolled = _AI_BUDGET["date"] != _ai_today()
-        calls = 0 if rolled else _AI_BUDGET["calls"]
-        tokens = 0 if rolled else _AI_BUDGET["tokens"]
+    today = _ai_today()
+    call_ledger = user_state.get_daily_budget("ai_calls", today)
+    token_ledger = user_state.get_daily_budget("ai_tokens", today)
+    calls = int(call_ledger["reserved"]) + int(call_ledger["confirmed"])
+    tokens = int(token_ledger["reserved"]) + int(token_ledger["confirmed"])
     return {
         "date": _ai_today(),
         "calls": calls, "max_calls": AI_DAILY_MAX_CALLS,
@@ -2338,13 +2885,98 @@ def _search_budget_reserve(n: int) -> None:
     if _search_kill_switch_on():
         raise SearchBudgetExceeded("搜索已被 kill-switch 关闭（取消设置 SEARCH_KILL_SWITCH 可恢复）")
     n = max(0, int(n or 0))
+    if not n:
+        return None
+    today = _ai_today()
+    reservation_id = f"search-calls:{today}:{secrets.token_hex(12)}"
+    try:
+        user_state.reserve_daily_budget(
+            "search_calls", today, n, SEARCH_DAILY_MAX_CALLS, reservation_id
+        )
+        # Search adapters call this immediately before issuing provider calls;
+        # once reserved, the external request is considered consumed.
+        user_state.confirm_daily_budget(reservation_id)
+    except user_state.StateStoreError as exc:
+        if exc.code == "BUDGET_EXCEEDED":
+            raise SearchBudgetExceeded(
+                f"当日搜索调用将超上限 {SEARCH_DAILY_MAX_CALLS}（SEARCH_DAILY_MAX_CALLS）"
+            ) from None
+        raise
+    ledger = user_state.get_daily_budget("search_calls", today)
     with _SEARCH_BUDGET_LOCK:
-        today = _ai_today()
-        if _SEARCH_BUDGET["date"] != today:
-            _SEARCH_BUDGET.update(date=today, calls=0)
-        if _SEARCH_BUDGET["calls"] + n > SEARCH_DAILY_MAX_CALLS:
-            raise SearchBudgetExceeded(f"当日搜索调用将超上限 {SEARCH_DAILY_MAX_CALLS}（SEARCH_DAILY_MAX_CALLS）")
-        _SEARCH_BUDGET["calls"] += n
+        _SEARCH_BUDGET.update(
+            date=today,
+            calls=int(ledger["reserved"]) + int(ledger["confirmed"]),
+        )
+    return reservation_id
+
+
+def _estimate_ai_input_tokens(messages) -> int:
+    """Return a conservative byte-level upper estimate for prompt tokens."""
+    try:
+        serialized = json.dumps(messages, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        serialized = str(messages)
+    return len(serialized.encode("utf-8", errors="replace")) + 16
+
+
+def _provider_usage_tokens(response):
+    """Read OpenAI/Anthropic usage without weakening a missing-usage reservation."""
+    try:
+        payload = response.json()
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        if usage.get("total_tokens") is not None:
+            return max(0, int(usage["total_tokens"]))
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if input_tokens is not None or output_tokens is not None:
+            return max(0, int(input_tokens or 0)) + max(0, int(output_tokens or 0))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _post_ai_with_budget(
+    estimated_tokens: int,
+    url: str,
+    *,
+    enforce_local_config: bool = False,
+    **kwargs,
+):
+    reservations = _ai_budget_reserve(estimated_tokens)
+    response = None
+    try:
+        request_headers = dict(kwargs.get("headers") or {})
+        if enforce_local_config:
+            _assert_current_ai_request(url, request_headers)
+        kwargs["headers"] = request_headers
+        # 不接受旧调用方的 verify=False；固定 IP 适配器仍以原域名
+        # 执行 SNI 与证书 hostname 校验。
+        kwargs["verify"] = True
+        response = search_adapters.safe_request(
+            "POST",
+            url,
+            ssrf_check=_ai_transport_ssrf_check(url),
+            **kwargs,
+        )
+        if 300 <= int(getattr(response, "status_code", 0)) < 400:
+            raise requests.TooManyRedirects(
+                "AI端点重定向已阻止",
+                response=response,
+            )
+        response.raise_for_status()
+    except Exception:
+        if response is not None:
+            response.close()
+        _ai_budget_release(reservations)
+        raise
+    actual_tokens = None
+    if not bool(kwargs.get("stream")):
+        actual_tokens = _provider_usage_tokens(response)
+    _ai_budget_confirm(reservations, actual_tokens=actual_tokens)
+    return response
 
 
 def _call_ai(messages, stream=False, temperature=None, max_tokens=None):
@@ -2355,8 +2987,6 @@ def _call_ai(messages, stream=False, temperature=None, max_tokens=None):
         selection = resolve_provider(runtime["provider"], runtime["model_id"])
         if not secrets.compare_digest(runtime["endpoint"], selection.endpoint):
             raise ValueError("AI endpoint does not match the fixed provider registry")
-        _ai_budget_reserve(output_tokens)
-
         # The three MVP providers all use an OpenAI-compatible endpoint.
         headers = {
             "Authorization": f"Bearer {runtime['api_key']}",
@@ -2382,15 +3012,15 @@ def _call_ai(messages, stream=False, temperature=None, max_tokens=None):
         else:
             payload["max_tokens"] = output_tokens
             payload["temperature"] = temp
-        resp = requests.post(
+        resp = _post_ai_with_budget(
+            _estimate_ai_input_tokens(messages) + output_tokens,
             selection.endpoint,
             headers=headers,
             json=payload,
             timeout=180,
             stream=stream,
-            verify=True,
+            enforce_local_config=runtime.get("source") == "local",
         )
-        resp.raise_for_status()
         if stream:
             return resp
         result = resp.json()
@@ -2532,13 +3162,17 @@ def _ai_public_value_error_message(error: ValueError) -> str:
 @require_ai_rate
 def api_ai_analyze():
     """分析单条/多条新闻"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     articles = data.get("articles", [])
     mode = data.get("mode", "analyze")  # analyze / compare / brief / freeqa
     question = data.get("question", "")
 
     if not _ai_is_enabled():
-        return jsonify({"error": "AI API Key 未配置，请先在设置中配置"}), 400
+        return _api_error(
+            "AI API Key 未配置，请先在设置中配置",
+            "AI_NOT_CONFIGURED",
+            400,
+        )
 
     try:
         if mode == "analyze" and articles:
@@ -2581,26 +3215,30 @@ def api_ai_analyze():
                 {"role": "user", "content": f"当前新闻库近期标题：\n{context}\n\n用户提问：{question}"}
             ]
         else:
-            return jsonify({"error": "无效的请求参数"}), 400
+            return _api_error("无效的请求参数", "INVALID_ARGUMENT", 400)
 
         result = _call_ai(messages)
         return jsonify({"result": result, "mode": mode, "model": _ai_model_id()})
 
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI API 请求失败: {e.response.status_code}"}), 502
+        return _upstream_http_error(e, "AI 服务暂时不可用", "AI_UPSTREAM_ERROR")
     except ValueError as e:
         logger.info("AI analyze request rejected error_type=%s", type(e).__name__)
-        return jsonify({"error": _ai_public_value_error_message(e)}), 400
+        return _api_error(
+            _ai_public_value_error_message(e),
+            "AI_REQUEST_INVALID",
+            400,
+        )
     except Exception as e:
         logger.error("AI analyze error_type=%s", type(e).__name__)
-        return jsonify({"error": "分析失败"}), 500
+        return _api_error("分析失败", "AI_ANALYZE_FAILED", 500)
 
 @app.route("/api/ai/stream", methods=["POST"])
 @require_auth
 @require_ai_rate
 def api_ai_stream():
     """流式AI分析（SSE）"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     articles = data.get("articles", [])
     mode = data.get("mode", "analyze")
     question = data.get("question", "")
@@ -2637,7 +3275,7 @@ def api_ai_stream():
         messages = [{"role": "system", "content": SYSTEM_PROMPT_FREEQA},
                     {"role": "user", "content": f"新闻库：\n{context}\n\n提问：{question}"}]
     else:
-        return jsonify({"error": "无效参数"}), 400
+        return _api_error("无效参数", "INVALID_ARGUMENT", 400)
 
     def generate():
         resp = None
@@ -2859,6 +3497,23 @@ BRIEF_STRUCTURED_TEXT_FIELDS = (
     "reporter",
 )
 BRIEF_MARKDOWN_RE = re.compile(r"(?:^|\s)(#{1,6}\s|\*\*|__|```|~~~|^\s*[-*+]\s)", re.MULTILINE)
+BRIEF_RELATIVE_EVENT_WORDS = ("近期", "近日", "日前", "最近", "当前", "本月", "今年")
+BRIEF_EVENT_DATE_RE = re.compile(r"(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日")
+BRIEF_SOURCE_ENTRY_RE = re.compile(
+    r"^(?P<name>.+?)\s*(?P<month>\d{1,2})月(?P<day>\d{1,2})日发文《(?P<title>[^》]+)》$"
+)
+BRIEF_BODY_ATTRIBUTION_RE = re.compile(r"据(?P<label>[^，,。；;]{1,80}?)报道")
+BRIEF_SECONDARY_ATTRIBUTION_RE = re.compile(
+    r"(?P<name>[\u4e00-\u9fffA-Za-z0-9·]{2,30}?(?:通讯社|新闻社|电视台|新闻网|网站|研究所|中心|智库|公众号|杂志|周刊|日报|时报|报|社|网|新闻))"
+    r"(?:称|指出|披露|报道(?:称)?|援引)"
+)
+BRIEF_CONTEXT_ATTRIBUTION_RE = re.compile(
+    r"(?:另据|根据|援引|据)(?P<name>[^，,。；;]{2,40}?)"
+    r"(?:的)?(?:报道|消息|声明|数据|报告)(?:显示|称|指出|披露|证实|，|,|。|；|;|$)"
+)
+BRIEF_RECIPIENT_ATTRIBUTION_RE = re.compile(
+    r"(?:消息人士|官员|知情人士|发言人)向(?P<name>[^，,。；;]{2,40}?)(?:表示|透露|称)"
+)
 
 BRIEF_RELATIVE_EVENT_WORDS = ("近期", "近日", "日前", "最近", "当前", "本月", "今年")
 
@@ -3858,6 +4513,15 @@ def _persist_brief_to_disk(brief_text: str, output_dir: str | None = None,
         logger.warning("[brief auto-save] failed error_type=%s", _brief_error_type(e))
         return ""
 
+
+def _public_saved_artifact(saved_path: str) -> dict:
+    """Expose persistence outcome without leaking the host filesystem layout."""
+    path = str(saved_path or "")
+    return {
+        "saved": bool(path),
+        "filename": os.path.basename(path) if path else "",
+    }
+
 def _build_brief_docx_compiled(parsed_list: list) -> BytesIO:
     """汇编多篇要讯到单一 docx：每篇之间插入分页符；与单篇共享 _render_brief_block 排版"""
     doc = Document()
@@ -3886,6 +4550,7 @@ def _daily_brief_now(now: datetime | None = None) -> datetime:
 def _daily_brief_output_dir(now: datetime | None = None) -> str:
     now = _daily_brief_now(now)
     return os.path.join(_DAILY_BRIEF_OUTPUT_ROOT, now.strftime("%Y%m%d"))
+
 
 def _generate_brief_for_article(article: dict, output_dir: str | None = None,
                                 now: datetime | None = None) -> dict:
@@ -3930,20 +4595,6 @@ def _generate_brief_for_article(article: dict, output_dir: str | None = None,
         "generated_at": run_now.isoformat(),
         "saved_to": saved_path,
     }
-
-def _brief_text_to_parsed_fallback(brief_text: str, source_article: dict | None = None) -> dict:
-    try:
-        return _parse_brief_text(brief_text)
-    except Exception:
-        source_article = source_article or {}
-        return {
-            "event_time": "时间：",
-            "value_point": "价值点：值得关注。",
-            "title": source_article.get("title") or "要讯",
-            "body": brief_text,
-            "source": f"信息来源：{source_article.get('source') or '公开信息源'}",
-            "reporter": "报送人：           电话：",
-        }
 
 def _write_daily_compiled_docx(briefs: list[dict], output_dir: str, now: datetime | None = None) -> str:
     if not DOCX_AVAILABLE or not briefs:
@@ -4546,6 +5197,19 @@ def add_background_jobs(scheduler):
         )
 
 
+def _scheduler_is_running() -> bool:
+    scheduler = getattr(app, "_scheduler", None)
+    if scheduler is None:
+        return False
+    try:
+        running = getattr(scheduler, "running", None)
+        if running is None:
+            return bool(getattr(app, "_scheduler_started", False))
+        return bool(running)
+    except Exception:
+        return False
+
+
 def _start_scheduler_once(force: bool = False):
     """启动后台调度器（默认仅 30min RSS 刷新），进程内只启动一次。
     gunicorn 以 import 方式加载 app:app 不会进入 __main__，故必须在模块级显式启动；
@@ -4555,13 +5219,17 @@ def _start_scheduler_once(force: bool = False):
     多 worker 部署务必配 --workers 1，否则每个 worker 各起一份调度器会重复刷新。"""
     if not force and os.environ.get("RUN_SCHEDULER", "").strip().lower() not in ("1", "true", "yes", "on"):
         return
-    if getattr(app, "_scheduler_started", False):
+    if _scheduler_is_running():
         return
-    app._scheduler_started = True
+    scheduler = None
     try:
         scheduler = BackgroundScheduler(daemon=True)
         add_background_jobs(scheduler)
         scheduler.start()
+        if getattr(scheduler, "running", True) is False:
+            raise RuntimeError("scheduler did not enter running state")
+        app._scheduler = scheduler
+        app._scheduler_started = True
         threading.Thread(target=refresh_news, daemon=True).start()  # 启动即首刷，避免缓存长期为空
         legacy_daily_enabled = _env_bool("ENABLE_LEGACY_AI_DAILY_BRIEF")
         logger.info(
@@ -4569,7 +5237,38 @@ def _start_scheduler_once(force: bool = False):
             " + 旧 AI 22:00 每日要讯" if legacy_daily_enabled else "",
         )
     except Exception as e:
+        app._scheduler = None
+        app._scheduler_started = False
+        if scheduler is not None:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                pass
         logger.error("后台调度器启动失败: %s", e)
+
+
+def _api_error_with_fields(
+    message: str,
+    code: str,
+    status: int,
+    *,
+    retryable: bool = False,
+    details=None,
+    **fields,
+):
+    """Use the common error contract while retaining legacy top-level context."""
+    response, response_status = _api_error(
+        message,
+        code,
+        status,
+        retryable=retryable,
+        details=details,
+    )
+    if fields:
+        payload = response.get_json()
+        payload.update(fields)
+        response.set_data(json.dumps(payload, ensure_ascii=False))
+    return response, response_status
 
 
 @app.route("/api/brief/export_docx", methods=["POST"])
@@ -4641,11 +5340,11 @@ def api_brief_validate():
 def api_brief_export_docx_compiled():
     """将多篇要讯汇编导出为单一docx（每篇分页）"""
     if not DOCX_AVAILABLE:
-        return jsonify({"error": "python-docx 未安装，请 pip install python-docx"}), 500
+        return _api_error("python-docx 未安装，请 pip install python-docx", "DOCX_UNAVAILABLE", 500)
     data = request.get_json() or {}
     briefs = data.get("briefs") or []
     if not briefs:
-        return jsonify({"error": "缺少briefs列表"}), 400
+        return _api_error("缺少briefs列表", "BRIEF_LIST_REQUIRED", 400)
     parsed_list = []
     invalid_items = []
     for index, b in enumerate(briefs, 1):
@@ -4676,7 +5375,7 @@ def api_brief_export_docx_compiled():
             "invalid_items": invalid_items,
         }), 422
     if not parsed_list:
-        return jsonify({"error": "无有效要讯内容"}), 400
+        return _api_error("无有效要讯内容", "NO_VALID_BRIEFS", 400)
     buf = _build_brief_docx_compiled(parsed_list)
     today = datetime.now().strftime("%Y%m%d")
     fname = f"要讯汇编_{today}_共{len(parsed_list)}篇.docx"
@@ -4724,8 +5423,8 @@ def api_quality_feedback():
         except Exception as e:
             logger.warning("质量偏好自动重算失败（反馈已记录）: %s", e)
         return jsonify({"ok": True, **result})
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    except ValueError:
+        return _api_error("反馈参数无效", "INVALID_ARGUMENT", 400)
 
 @app.route("/api/quality/retrain", methods=["POST"])
 @require_auth
@@ -4741,7 +5440,7 @@ def api_brief_check_topic():
     data = request.get_json(force=True, silent=True) or {}
     title = str(data.get("title") or "").strip()
     if not title:
-        return jsonify({"error": "缺少 title"}), 400
+        return _api_error("缺少 title", "TITLE_REQUIRED", 400)
     similar = find_similar_generations(title, days=int(data.get("days") or 7))
     return jsonify({"similar": similar})
 
@@ -4912,10 +5611,10 @@ def api_translate():
         ], temperature=0.2, max_tokens=300)
         translation = (result or "").strip()
         if not translation:
-            return jsonify({"error": "翻译为空", "code": "empty"}), 502
+            return _api_error("翻译为空", "AI_EMPTY_RESPONSE", 502, retryable=True)
         return jsonify({"translation": translation})
-    except AIBudgetExceeded as e:
-        return jsonify({"error": str(e), "code": "budget"}), 429
+    except AIBudgetExceeded:
+        return _api_error("AI 调用额度已用尽或已暂停", "AI_BUDGET_EXCEEDED", 429)
     except Exception as e:
         logger.warning("AI 翻译失败 error_type=%s", type(e).__name__)
         return jsonify({"error": "翻译失败", "code": "ai_error"}), 502
@@ -4961,7 +5660,82 @@ def _consult_public_value_error_message(error: ValueError) -> str:
     return "请求参数无效"
 
 
+def _document_public_error_message(code: str) -> str:
+    """Map parser codes to trusted UI text; never return worker diagnostics."""
+    return {
+        "DOCUMENT_PARSER_ISOLATION_FAILED": "文档隔离解析环境不可用",
+        "DOCUMENT_PARSE_QUEUE_FULL": "文档解析队列已满，请稍后重试",
+        "DOCUMENT_PARSE_TIMEOUT": "文档解析超时，已终止隔离解析进程",
+        "DOCUMENT_PARSE_FAILED": "文档无法安全解析",
+        "UPLOAD_TOO_LARGE": "上传文件超过大小限制",
+        "UPLOAD_PARSE_TIMEOUT": "文档解析超时，已终止隔离解析进程",
+        "UNSUPPORTED_UPLOAD_TYPE": "仅支持 DOCX 和 PDF 文件",
+        "DOCX_MAGIC_MISMATCH": "DOCX 文件头无效",
+        "DOCX_ARCHIVE_INVALID": "DOCX 压缩包无法解析",
+        "DOCX_ENTRY_LIMIT_EXCEEDED": "DOCX 条目数超过限制",
+        "DOCX_UNSAFE_PATH": "DOCX 包含不安全的归档路径",
+        "DOCX_ENCRYPTED": "不支持加密 DOCX",
+        "DOCX_MEMBER_LIMIT_EXCEEDED": "DOCX 单个条目解压后过大",
+        "DOCX_COMPRESSION_RATIO_EXCEEDED": "DOCX 单个条目压缩比超过限制",
+        "DOCX_UNCOMPRESSED_LIMIT_EXCEEDED": "DOCX 解压总量超过限制",
+        "DOCX_TOTAL_COMPRESSION_RATIO_EXCEEDED": "DOCX 总压缩比超过限制",
+        "DOCX_REQUIRED_PART_MISSING": "DOCX 缺少必要的 Word 组件",
+        "PDF_MAGIC_MISMATCH": "PDF 文件头无效",
+        "PDF_ENCRYPTED": "不支持加密 PDF",
+        "PDF_PARSE_ERROR": "PDF 无法安全解析",
+        "PDF_PARSER_UNAVAILABLE": "PDF 安全解析器不可用",
+        "PDF_PAGE_LIMIT_EXCEEDED": "PDF 页数超过限制",
+    }.get(code, "文件未通过安全校验，请检查文件格式和内容")
+
+
 def _consult_error_response(e: Exception):
+    if isinstance(e, search_adapters.RemoteDocumentError) and e.code in {
+        "DOCUMENT_PARSER_ISOLATION_FAILED",
+        "DOCUMENT_PARSE_QUEUE_FULL",
+    }:
+        response, status = _api_error(
+            _document_public_error_message(e.code),
+            e.code,
+            503,
+            retryable=True,
+            details=e.details,
+        )
+        retry_after = int((e.details or {}).get("retry_after") or 0)
+        if retry_after > 0:
+            response.headers["Retry-After"] = str(retry_after)
+        return response, status
+    if isinstance(e, consulting_agent.ActiveTaskExistsError):
+        return _api_error(
+            "已有活跃任务，请等待当前任务完成",
+            e.code,
+            409,
+            details={"existing_job_id": e.existing_job_id},
+        )
+    if isinstance(e, consulting_agent.TaskQueueFullError):
+        response, status = _api_error(
+            "后台任务队列已满，请稍后重试", e.code, 503, retryable=True,
+            details={"retry_after": e.retry_after},
+        )
+        response.headers["Retry-After"] = str(e.retry_after)
+        return response, status
+    if isinstance(e, consulting_agent.TaskNotRetryableError):
+        return _api_error(
+            "任务当前状态不可重试",
+            e.code,
+            409,
+            details={"job_id": e.job_id, "status": e.status},
+        )
+    if isinstance(e, consulting_agent.InvalidTaskTransitionError):
+        return _api_error(
+            "任务状态转换无效",
+            e.code,
+            409,
+            details={
+                "job_id": e.job_id,
+                "current_status": e.current_status,
+                "requested_status": e.requested_status,
+            },
+        )
     if isinstance(e, KeyError):
         return jsonify({"error": "资源不存在"}), 404
     if isinstance(e, ValueError):
@@ -5040,8 +5814,63 @@ def _consult_selected_evidence(session_id: str, data: dict) -> list[dict]:
     return evidence
 
 
+_CONSULT_PRIVATE_PATH_KEYS = {
+    "local_path", "text_path", "metadata_path", "source_archive_path",
+    "asset_local_path", "asset_text_path", "asset_metadata_path",
+}
+_CONSULT_PRIVATE_SECRET_KEYS = {
+    "api_key", "app_secret", "access_token", "refresh_token", "password", "private_key",
+}
+
+
+def _consult_public_value(value, key: str = ""):
+    """Remove filesystem implementation details from browser-facing payloads."""
+    normalized_key = key.lower()
+    if (
+        normalized_key in _CONSULT_PRIVATE_PATH_KEYS
+        or normalized_key.endswith("_path")
+        or normalized_key in _CONSULT_PRIVATE_SECRET_KEYS
+    ):
+        return None
+    if isinstance(value, dict):
+        return {
+            child_key: public_value
+            for child_key, child_value in value.items()
+            if (public_value := _consult_public_value(child_value, child_key)) is not None
+        }
+    if isinstance(value, list):
+        return [
+            public_value
+            for child_value in value
+            if (public_value := _consult_public_value(child_value)) is not None
+        ]
+    if isinstance(value, str):
+        value = re.sub(r"(?i)\b[A-Z]:[\\/][^\r\n\t]*", "[本地路径已隐藏]", value)
+        value = re.sub(
+            r"(?i)(?:^|\s)/(?:Users|home|var|tmp|opt|mnt|Volumes)/[^\r\n\t]*",
+            " [本地路径已隐藏]",
+            value,
+        )
+        value = re.sub(
+            r"(?i)([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key)=)[^&#\s]+",
+            r"\1[REDACTED]",
+            value,
+        )
+    return value
+
+
 def _consult_archive_meta(session_id: str, target: int | None = None) -> dict:
     assets = consulting_agent.list_source_assets(session_id)
+    public_assets = [
+        consulting_agent.source_asset_to_public_dto(
+            asset,
+            download_url=(
+                f"/api/consult/sessions/{session_id}/assets/{asset.get('asset_id')}/file?download=1"
+                if asset.get("asset_id") else ""
+            ),
+        )
+        for asset in assets
+    ]
     archived = [asset for asset in assets if asset.get("status") == "archived"]
     partial = [asset for asset in assets if asset.get("status") == "partial"]
     failures = [asset for asset in assets if asset.get("status") == "failed"]
@@ -5060,13 +5889,13 @@ def _consult_archive_meta(session_id: str, target: int | None = None) -> dict:
                 "asset_id": asset.get("asset_id"),
                 "evidence_id": asset.get("evidence_id"),
                 "title": (asset.get("payload") or {}).get("title") or asset.get("evidence_id"),
-                "url": asset.get("url"),
+                "url": consulting_agent.source_asset_to_public_dto(asset).get("source_url"),
                 "status": asset.get("status"),
                 "reason": asset.get("failure_reason"),
                 "diagnosis": diagnosis,
             })
     return {
-        "assets": assets,
+        "assets": public_assets,
         "archived_count": len(archived),
         "partial_count": len(partial),
         "failed_count": len(failures),
@@ -5077,7 +5906,6 @@ def _consult_archive_meta(session_id: str, target: int | None = None) -> dict:
         "archive_shortfall": max(0, target - len(archived)) if target else 0,
         "failure_breakdown": failure_breakdown,
         "diagnosis_cards": diagnosis_cards,
-        "source_archive_path": consulting_agent.source_archive_root(session_id),
     }
 
 
@@ -5135,21 +5963,68 @@ def _consult_handoff_skip_reason(ev: dict) -> str:
     return ""
 
 
-def _consult_read_asset_text(payload: dict, fallback: str = "") -> str:
-    path = payload.get("asset_text_path") or payload.get("text_path") or ""
-    if path and os.path.exists(path):
+def _consult_read_asset_text(ev: dict, fallback: str = "") -> str:
+    """Read only a server-owned archived asset; imported rows are text-only."""
+    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+    if ev.get("channel") == "imported":
+        return report_agent.sanitize_report_text(
+            payload.get("text") or payload.get("body") or fallback or ""
+        )[:12000]
+
+    asset_id = str(payload.get("asset_id") or "").strip()
+    if asset_id:
         try:
-            return report_agent.sanitize_report_text(open(path, encoding="utf-8", errors="ignore").read()[:12000])
-        except Exception:
-            pass
-    return report_agent.sanitize_report_text(fallback or "")
+            asset = consulting_agent.get_source_asset(asset_id)
+            if (
+                asset.get("session_id") != ev.get("session_id")
+                or asset.get("evidence_id") != ev.get("evidence_id")
+                or asset.get("status") != "archived"
+            ):
+                raise ValueError("资料资产与证据不匹配")
+            path = _consult_safe_asset_path(
+                ev.get("session_id") or "",
+                asset.get("text_path") or "",
+            )
+            with open(path, encoding="utf-8", errors="ignore") as source:
+                return report_agent.sanitize_report_text(source.read(12000))
+        except Exception as exc:
+            logger.warning(
+                "Consulting asset text unavailable for %s: %s",
+                asset_id,
+                exc,
+            )
+    return report_agent.sanitize_report_text(fallback or "")[:12000]
 
 
 def _consult_to_report_candidate(ev: dict) -> dict:
     payload = ev.get("payload") or {}
     score = int(ev.get("score") or 0)
-    asset_text = _consult_read_asset_text(payload, payload.get("text") or ev.get("snippet") or "")
+    asset_text = _consult_read_asset_text(
+        ev,
+        payload.get("text") or ev.get("snippet") or "",
+    )
     summary = asset_text[:1200] or ev.get("snippet") or ""
+    transferable_payload = {
+        key: payload[key]
+        for key in (
+            "asset_id",
+            "asset_status",
+            "asset_checksum",
+            "content_type",
+            "diagnosis",
+            "document_type",
+            "failure_code",
+            "is_fetched_original",
+            "provider",
+            "quality",
+            "quality_penalties",
+            "quality_radar",
+            "query",
+            "relaxed_fallback",
+            "_sources",
+        )
+        if key in payload
+    }
     return {
         "article_id": ev.get("evidence_id"),
         "title": ev.get("title") or "公开来源",
@@ -5167,7 +6042,7 @@ def _consult_to_report_candidate(ev: dict) -> dict:
         "brief_hits": [],
         "source_type": "已抓取公开报告/原文",
         "payload": {
-            **payload,
+            **transferable_payload,
             "consulting_evidence_id": ev.get("evidence_id"),
             "source_type": "已抓取公开报告/原文",
             "text": asset_text,
@@ -5603,8 +6478,9 @@ def api_consult_session_create():
 def api_consult_session_detail(session_id):
     try:
         status = _masked_search_config_status()
+        bundle = _consult_public_value(consulting_agent.get_session_bundle(session_id))
         return jsonify({
-            **consulting_agent.get_session_bundle(session_id),
+            **bundle,
             "capabilities": status,
             "capability_notice": _consult_capability_notice(status),
             "model": _consult_model_info(),
@@ -5801,17 +6677,14 @@ def api_consult_asset_file(session_id, asset_id):
         handle, path = _open_consult_asset(
             session_id, asset.get("local_path") or ""
         )
-        guessed_type = mimetypes.guess_type(path)[0]
-        if (asset.get("document_type") or "").lower() == "pdf":
-            is_real_pdf = handle.read(5) == b"%PDF-"
-            handle.seek(0)
-            if not is_real_pdf:
-                guessed_type = "text/plain; charset=utf-8"
-        mimetype = guessed_type or asset.get("content_type") or "application/octet-stream"
+        is_real_pdf = handle.read(5) == b"%PDF-"
+        handle.seek(0)
+        download_requested = request.args.get("download") == "1"
+        mimetype = "application/pdf" if is_real_pdf else "application/octet-stream"
         response = send_file(
             handle,
             mimetype=mimetype,
-            as_attachment=request.args.get("download") == "1",
+            as_attachment=download_requested or not is_real_pdf,
             download_name=os.path.basename(path),
             max_age=0,
         )
@@ -5892,7 +6765,7 @@ def api_consult_session_search(session_id):
         return jsonify({
             "ok": True,
             "session": consulting_agent.get_session(session_id),
-            "evidence": evidence,
+            "evidence": _consult_public_value(evidence),
             "total": len(evidence),
             "meta": meta,
             "capabilities": status,
@@ -5983,7 +6856,7 @@ def api_consult_session_web_search(session_id):
         return jsonify({
             "ok": True,
             "session": consulting_agent.get_session(session_id),
-            "evidence": evidence,
+            "evidence": _consult_public_value(evidence),
             "total": len(evidence),
             "meta": meta,
             "capabilities": status,
@@ -6196,8 +7069,16 @@ def _consult_archive_one(session_id: str, ev: dict, allow_browser_render: bool =
                 doc = search_adapters.extract_url(url, timeout=10)
                 doc["extraction_method"] = "direct_request"
             except Exception as direct_exc:
+                if (
+                    isinstance(direct_exc, search_adapters.RemoteDocumentError)
+                    and direct_exc.code in {
+                        "DOCUMENT_PARSER_ISOLATION_FAILED",
+                        "DOCUMENT_PARSE_QUEUE_FULL",
+                    }
+                ):
+                    raise
                 rendered_extractor = getattr(search_adapters, "extract_url_rendered", None)
-                if allow_browser_render and callable(rendered_extractor):
+                if allow_browser_render and BROWSER_RENDER_SANDBOXED and callable(rendered_extractor):
                     try:
                         doc = rendered_extractor(url, timeout=8)
                         doc["extraction_method"] = "browser_render"
@@ -6207,6 +7088,14 @@ def _consult_archive_one(session_id: str, ev: dict, allow_browser_render: bool =
                     raise
         doc["url"] = doc.get("url") or url
     except Exception as exc:
+        if (
+            isinstance(exc, search_adapters.RemoteDocumentError)
+            and exc.code in {
+                "DOCUMENT_PARSER_ISOLATION_FAILED",
+                "DOCUMENT_PARSE_QUEUE_FULL",
+            }
+        ):
+            raise
         reason, diagnosis = _consult_safe_exception(exc)
         logger.warning(
             "来源归档失败 (%s, %s)",
@@ -6272,7 +7161,14 @@ def _consult_archive_many(session_id: str, evidence: list[dict], allow_browser_r
     rows = [ev for ev in evidence or [] if ev and ev.get("evidence_id")]
     if not rows:
         return []
-    workers = max(1, min(int(max_workers or 1), len(rows), 5))
+    workers = max(
+        1,
+        min(
+            int(max_workers or 1),
+            len(rows),
+            DOCUMENT_PARSE_MAX_WORKERS,
+        ),
+    )
     if workers <= 1:
         return [_consult_archive_one(session_id, ev, allow_browser_render=allow_browser_render) for ev in rows]
     results: list[tuple[dict | None, dict | None, dict | None]] = []
@@ -6286,6 +7182,14 @@ def _consult_archive_many(session_id: str, evidence: list[dict], allow_browser_r
             try:
                 results.append(future.result())
             except Exception as exc:
+                if (
+                    isinstance(exc, search_adapters.RemoteDocumentError)
+                    and exc.code in {
+                        "DOCUMENT_PARSER_ISOLATION_FAILED",
+                        "DOCUMENT_PARSE_QUEUE_FULL",
+                    }
+                ):
+                    raise
                 reason, diagnosis = _consult_safe_exception(exc)
                 logger.warning(
                     "并发来源归档失败 (%s, %s)",
@@ -6341,6 +7245,14 @@ def _consult_enrich_capture_job(session_id: str, job: dict) -> dict:
     status = job.get("status") or ""
     if status == "running":
         phase = "搜索与归档中"
+    elif status == "cancel_requested":
+        phase = "正在安全取消"
+    elif status == "block_requested":
+        phase = "正在人工阻断"
+    elif status == "cancelled":
+        phase = "任务已取消"
+    elif status == "blocked":
+        phase = "任务已人工阻断"
     elif status == "completed" and shortfall <= 0:
         phase = "目标达成"
     elif status == "completed":
@@ -6383,33 +7295,56 @@ def _run_consult_capture_job(session_id: str, job_id: str):
     allow_browser_render = bool(job.get("allow_browser_render"))
     rejected_total = int(job.get("rejected_low_relevance") or 0)
     try:
+        consulting_agent.claim_capture_job(session_id, job_id)
         session = consulting_agent.get_session(session_id)
         queries = _consult_capture_queries(session, target, max_rounds)
-        consulting_agent.update_capture_job(job_id, status="running", counts=_consult_capture_counts(session_id, target, rejected_total))
+        consulting_agent.update_capture_job(
+            job_id,
+            counts=_consult_capture_counts(session_id, target, rejected_total),
+        )
         stop_reason = "max_rounds_reached"
         for round_no, query in enumerate(queries[:max_rounds], 1):
+            if consulting_agent.checkpoint_capture_job(
+                session_id, job_id
+            )["status"] != "running":
+                return
             counts_before = consulting_agent.capture_asset_counts(session_id, target)
             if counts_before["archived_count"] >= target:
                 stop_reason = "target_reached"
                 break
-            consulting_agent.update_capture_job(job_id, status="running", round_no=round_no, current_query=query)
-            web_results, web_meta = search_adapters.search_web_multi(
-                [query],
-                target_count=max(batch_size, target - counts_before["archived_count"]),
-                config=SEARCH_CONFIG,
-                include_pdf=True,
-                include_news=True,
-                include_doctrine=True,
-                include_raw_content=True,
-                enforce_relevance=True,
-                per_call_limit=batch_size,
-                search_workers=8,
-                timeout=6,
-                on_search_calls=_search_budget_reserve,
+            consulting_agent.update_capture_job(
+                job_id, round_no=round_no, current_query=query
             )
-            rejected_total += int((web_meta or {}).get("rejected_low_relevance") or 0)
-            consulting_agent.record_query(session_id, "capture_web", query, len(web_results), web_meta)
-            evidence = consulting_agent.upsert_evidence(session_id, web_results[:batch_size])
+            with _task_external_step_lock("capture", job_id):
+                if consulting_agent.checkpoint_capture_job(
+                    session_id, job_id
+                )["status"] != "running":
+                    return
+                web_results, web_meta = search_adapters.search_web_multi(
+                    [query],
+                    target_count=max(batch_size, target - counts_before["archived_count"]),
+                    config=SEARCH_CONFIG,
+                    include_pdf=True,
+                    include_news=True,
+                    include_doctrine=True,
+                    include_raw_content=True,
+                    enforce_relevance=True,
+                    per_call_limit=batch_size,
+                    search_workers=8,
+                    timeout=6,
+                    on_search_calls=_search_budget_reserve,
+                )
+                rejected_total += int((web_meta or {}).get("rejected_low_relevance") or 0)
+                consulting_agent.record_query(
+                    session_id, "capture_web", query, len(web_results), web_meta
+                )
+                evidence = consulting_agent.upsert_evidence(
+                    session_id, web_results[:batch_size]
+                )
+            if consulting_agent.checkpoint_capture_job(
+                session_id, job_id
+            )["status"] != "running":
+                return
             archived_delta = partial_delta = failed_delta = needs_delta = 0
             archive_targets = []
             for ev in evidence:
@@ -6419,43 +7354,52 @@ def _run_consult_capture_job(session_id: str, job_id: str):
                 if any(asset.get("status") in {"archived", "needs_user_input"} for asset in existing_assets):
                     continue
                 archive_targets.append(ev)
-            for _updated, asset, _failure in _consult_archive_many(
-                session_id,
-                archive_targets,
-                allow_browser_render=allow_browser_render,
-                max_workers=min(5, batch_size),
-            ):
-                if not asset:
-                    continue
-                if asset["status"] == "archived":
-                    archived_delta += 1
-                elif asset["status"] == "partial":
-                    partial_delta += 1
-                elif asset["status"] == "needs_user_input":
-                    needs_delta += 1
-                elif asset["status"] == "failed":
-                    failed_delta += 1
-            consulting_agent.record_capture_attempt(
-                job_id,
-                session_id,
-                round_no=round_no,
-                query_text=query,
-                result_count=len(web_results),
-                archived_delta=archived_delta,
-                partial_delta=partial_delta,
-                failed_delta=failed_delta,
-                needs_user_input_delta=needs_delta,
-                rejected_low_relevance=int((web_meta or {}).get("rejected_low_relevance") or 0),
-                payload={"web_meta": web_meta},
-            )
-            counts_now = _consult_capture_counts(session_id, target, rejected_total)
-            consulting_agent.update_capture_job(
-                job_id,
-                status="running",
-                round_no=round_no,
-                current_query=query,
-                counts=counts_now,
-            )
+            with _task_external_step_lock("capture", job_id):
+                if consulting_agent.checkpoint_capture_job(
+                    session_id, job_id
+                )["status"] != "running":
+                    return
+                archive_results = _consult_archive_many(
+                    session_id,
+                    archive_targets,
+                    allow_browser_render=allow_browser_render,
+                    max_workers=min(5, batch_size),
+                )
+                for _updated, asset, _failure in archive_results:
+                    if not asset:
+                        continue
+                    if asset["status"] == "archived":
+                        archived_delta += 1
+                    elif asset["status"] == "partial":
+                        partial_delta += 1
+                    elif asset["status"] == "needs_user_input":
+                        needs_delta += 1
+                    elif asset["status"] == "failed":
+                        failed_delta += 1
+                consulting_agent.record_capture_attempt(
+                    job_id,
+                    session_id,
+                    round_no=round_no,
+                    query_text=query,
+                    result_count=len(web_results),
+                    archived_delta=archived_delta,
+                    partial_delta=partial_delta,
+                    failed_delta=failed_delta,
+                    needs_user_input_delta=needs_delta,
+                    rejected_low_relevance=int((web_meta or {}).get("rejected_low_relevance") or 0),
+                    payload={"web_meta": web_meta},
+                )
+                counts_now = _consult_capture_counts(session_id, target, rejected_total)
+                consulting_agent.update_capture_job(
+                    job_id,
+                    round_no=round_no,
+                    current_query=query,
+                    counts=counts_now,
+                )
+            if consulting_agent.checkpoint_capture_job(
+                session_id, job_id
+            )["status"] != "running":
+                return
             if counts_now["archived_count"] >= target:
                 stop_reason = "target_reached"
                 break
@@ -6466,19 +7410,33 @@ def _run_consult_capture_job(session_id: str, job_id: str):
             stop_reason=stop_reason,
             counts=final_counts,
         )
+    except consulting_agent.InvalidTaskTransitionError:
+        return
     except Exception as exc:
-        reason, diagnosis = _consult_safe_exception(exc)
+        error_code = getattr(exc, "code", None) or "CAPTURE_FAILED"
+        error_details = getattr(exc, "details", None)
+        error_payload = dict(job.get("payload") or {})
+        if isinstance(error_details, dict) and error_details:
+            error_payload["error_details"] = error_details
+        reason = consulting_agent.CAPTURE_FAILURE_FALLBACK
+        diagnosis = _consult_failure_diagnosis(reason)
         logger.warning(
             "采集任务失败 (%s, %s)",
             diagnosis["code"],
             type(exc).__name__,
         )
-        consulting_agent.update_capture_job(
-            job_id,
-            status="failed",
-            stop_reason=reason,
-            counts=_consult_capture_counts(session_id, target, rejected_total),
-        )
+        try:
+            consulting_agent.update_capture_job(
+                job_id,
+                status="failed",
+                stop_reason=reason,
+                counts=_consult_capture_counts(session_id, target, rejected_total),
+                payload=error_payload,
+                error_code=error_code,
+                retryable=bool(getattr(exc, "retryable", True)),
+            )
+        except consulting_agent.InvalidTaskTransitionError:
+            pass
 
 
 @app.route("/api/consult/sessions/<session_id>/capture_to_target", methods=["POST"])
@@ -6494,14 +7452,35 @@ def api_consult_capture_to_target(session_id):
             batch_size=max(1, min(int(data.get("batch_size") or 14), 24)),
             max_rounds=max(1, min(int(data.get("max_rounds") or 8), 20)),
             crawl_mode=data.get("crawl_mode") or "steady",
-            allow_browser_render=bool(data.get("allow_browser_render")),
+            allow_browser_render=(
+                bool(data.get("allow_browser_render")) and BROWSER_RENDER_SANDBOXED
+            ),
             payload={"created_from": "capture_to_target"},
+            idempotency_key=request.headers.get("Idempotency-Key"),
         )
-        if app.config.get("TESTING"):
-            _run_consult_capture_job(session_id, job["job_id"])
-        else:
-            CAPTURE_EXECUTOR.submit(_run_consult_capture_job, session_id, job["job_id"])
+        idempotent_replay = bool(job.get("idempotent_replay"))
+        if not idempotent_replay:
+            if app.config.get("TESTING"):
+                _run_consult_capture_job(session_id, job["job_id"])
+            else:
+                try:
+                    CAPTURE_SUBMISSION_GUARD.submit(
+                        CAPTURE_EXECUTOR,
+                        _run_consult_capture_job,
+                        session_id,
+                        job["job_id"],
+                    )
+                except consulting_agent.TaskQueueFullError as exc:
+                    consulting_agent.update_capture_job(
+                        job["job_id"],
+                        status="failed",
+                        stop_reason="后台任务队列已满，请稍后重试",
+                        error_code=exc.code,
+                        retryable=True,
+                    )
+                    raise
         job = consulting_agent.get_capture_job(session_id, job["job_id"])
+        job["idempotent_replay"] = idempotent_replay
         job = _consult_enrich_capture_job(session_id, job)
         return jsonify({"ok": True, **{k: v for k, v in job.items() if k != "attempts"}, "attempts": job["attempts"]})
     except Exception as e:
@@ -6518,6 +7497,76 @@ def api_consult_capture_job(session_id, job_id):
         return _consult_error_response(e)
 
 
+@app.route("/api/consult/sessions/<session_id>/capture_jobs/<job_id>/retry", methods=["POST"])
+@require_auth
+def api_consult_capture_job_retry(session_id, job_id):
+    """显式重试一个失败且标记为可重试的采集任务。"""
+    try:
+        job = consulting_agent.retry_capture_job(session_id, job_id)
+        response_status = 202
+        if app.config.get("TESTING"):
+            _run_consult_capture_job(session_id, job_id)
+            job = consulting_agent.get_capture_job(session_id, job_id)
+            response_status = 200
+        else:
+            try:
+                CAPTURE_SUBMISSION_GUARD.submit(
+                    CAPTURE_EXECUTOR,
+                    _run_consult_capture_job,
+                    session_id,
+                    job_id,
+                )
+            except consulting_agent.TaskQueueFullError as exc:
+                consulting_agent.update_capture_job(
+                    job_id,
+                    status="failed",
+                    stop_reason="后台任务队列已满，请稍后重试",
+                    error_code=exc.code,
+                    retryable=True,
+                )
+                raise
+        return jsonify({"ok": True, "job": _consult_enrich_capture_job(session_id, job)}), response_status
+    except Exception as e:
+        return _consult_error_response(e)
+
+
+def _api_consult_capture_job_control(session_id: str, job_id: str, action: str):
+    data = request.get_json(silent=True) or {}
+    try:
+        if action == "cancel":
+            job = consulting_agent.request_capture_job_cancel(
+                session_id, job_id, data.get("reason") or ""
+            )
+        else:
+            job = consulting_agent.request_capture_job_block(
+                session_id, job_id, data.get("reason") or ""
+            )
+        # Publish the requested state first, then wait for any already-authorized
+        # external phase (and its writes) to finish before returning to the UI.
+        with _task_external_step_lock("capture", job_id):
+            pass
+        status = 202 if job.get("status") in {
+            "cancel_requested", "block_requested"
+        } else 200
+        return jsonify(
+            {"ok": True, "job": _consult_enrich_capture_job(session_id, job)}
+        ), status
+    except Exception as e:
+        return _consult_error_response(e)
+
+
+@app.route("/api/consult/sessions/<session_id>/capture_jobs/<job_id>/cancel", methods=["POST"])
+@require_auth
+def api_consult_capture_job_cancel(session_id, job_id):
+    return _api_consult_capture_job_control(session_id, job_id, "cancel")
+
+
+@app.route("/api/consult/sessions/<session_id>/capture_jobs/<job_id>/block", methods=["POST"])
+@require_auth
+def api_consult_capture_job_block(session_id, job_id):
+    return _api_consult_capture_job_control(session_id, job_id, "block")
+
+
 @app.route("/api/consult/sessions/<session_id>/extract", methods=["POST"])
 @require_auth
 def api_consult_session_extract(session_id):
@@ -6530,7 +7579,9 @@ def api_consult_session_extract(session_id):
         failures = []
         resolved_evidence = []
         resolve_limit = max(1, min(int(data.get("resolve_limit") or 3), 10))
-        allow_browser_render = bool(data.get("allow_browser_render"))
+        allow_browser_render = (
+            bool(data.get("allow_browser_render")) and BROWSER_RENDER_SANDBOXED
+        )
         for ev in selected:
             extraction_targets = [ev]
             if ev.get("channel") == "thinktank_target":
@@ -6557,15 +7608,25 @@ def api_consult_session_extract(session_id):
                 if failure:
                     failures.append(failure)
         archive_meta = _consult_archive_meta(session_id, session.get("target_source_count"))
+        public_assets = [
+            consulting_agent.source_asset_to_public_dto(
+                asset,
+                download_url=(
+                    f"/api/consult/sessions/{session_id}/assets/{asset.get('asset_id')}/file?download=1"
+                    if asset.get("asset_id") else ""
+                ),
+            )
+            for asset in assets
+        ]
         return jsonify({
             "ok": True,
             "extracted_count": len(updated_evidence),
             "archived_count": len([asset for asset in assets if asset.get("status") == "archived"]),
-            "failures": failures,
-            "assets": assets,
+            "failures": _consult_public_value(failures),
+            "assets": public_assets,
             "all_assets": archive_meta["assets"],
-            "resolved_evidence": resolved_evidence,
-            "evidence": updated_evidence,
+            "resolved_evidence": _consult_public_value(resolved_evidence),
+            "evidence": _consult_public_value(updated_evidence),
             "meta": {k: v for k, v in archive_meta.items() if k != "assets"},
         })
     except Exception as e:
@@ -6591,12 +7652,14 @@ def api_consult_handoff_to_report_agent(session_id):
             if not _is_handoff_ready(ev)
         ]
         if not ready:
-            return jsonify({
-                "error": "没有可转入报告Agent的已归档原文；请先执行原文归档",
-                "imported_count": 0,
-                "skipped_count": len(selected),
-                "failures": failures,
-            }), 400
+            return _api_error_with_fields(
+                "没有可转入报告Agent的已归档原文；请先执行原文归档",
+                "NO_ARCHIVED_SOURCE_FOR_HANDOFF",
+                400,
+                imported_count=0,
+                skipped_count=len(selected),
+                failures=failures,
+            )
         title = data.get("title") or f"{session.get('topic') or '防务'}战略分析报告"
         project = report_agent.create_project(
             title=title,
@@ -6647,9 +7710,9 @@ def api_consult_session_synthesize(session_id):
             kind="synthesis",
             payload={"evidence_ids": [e["evidence_id"] for e in evidence]},
         )
-        return jsonify({"ok": True, "answer": answer, "evidence": evidence})
+        return jsonify({"ok": True, "answer": answer, "evidence": _consult_public_value(evidence)})
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI请求失败: {e.response.status_code}"}), 502
+        return _upstream_http_error(e, "AI请求失败", "AI_UPSTREAM_ERROR")
     except Exception as e:
         return _consult_error_response(e)
 
@@ -6669,7 +7732,7 @@ def api_consult_session_source_pack(session_id):
             kind="source_pack",
             payload={"evidence_ids": [e["evidence_id"] for e in evidence]},
         )
-        return jsonify({"ok": True, "answer": answer, "evidence": evidence})
+        return jsonify({"ok": True, "answer": answer, "evidence": _consult_public_value(evidence)})
     except Exception as e:
         return _consult_error_response(e)
 
@@ -6684,7 +7747,7 @@ def api_consult_session_export_source_pack(session_id):
         if answer_id:
             answer = consulting_agent.get_answer(answer_id)
             if answer["session_id"] != session_id:
-                return jsonify({"error": "资料包不属于当前咨询会话"}), 400
+                return _api_error("资料包不属于当前咨询会话", "SOURCE_PACK_SESSION_MISMATCH", 400)
             content = answer["content"]
         else:
             evidence = _consult_selected_evidence(session_id, data)
@@ -6710,14 +7773,14 @@ def api_consult_session_revise(session_id):
     instruction = (data.get("instruction") or "").strip()
     answer_id = (data.get("answer_id") or "").strip()
     if not instruction:
-        return jsonify({"error": "缺少修订要求"}), 400
+        return _api_error("缺少修订要求", "REVISION_INSTRUCTION_REQUIRED", 400)
     if not answer_id:
-        return jsonify({"error": "缺少answer_id"}), 400
+        return _api_error("缺少answer_id", "ANSWER_ID_REQUIRED", 400)
     try:
         session = consulting_agent.get_session(session_id)
         answer = consulting_agent.get_answer(answer_id)
         if answer["session_id"] != session_id:
-            return jsonify({"error": "报告版本不属于当前咨询会话"}), 400
+            return _api_error("报告版本不属于当前咨询会话", "ANSWER_SESSION_MISMATCH", 400)
         if data.get("content"):
             answer = {**answer, "content": data.get("content")}
         messages = consulting_agent.build_revision_messages(session, answer, instruction)
@@ -6731,7 +7794,7 @@ def api_consult_session_revise(session_id):
         )
         return jsonify({"ok": True, "answer": revised})
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI请求失败: {e.response.status_code}"}), 502
+        return _upstream_http_error(e, "AI请求失败", "AI_UPSTREAM_ERROR")
     except Exception as e:
         return _consult_error_response(e)
 
@@ -6799,6 +7862,36 @@ def _agent_public_value_error_message(error: ValueError) -> str:
 
 
 def _agent_error_response(e: Exception):
+    if isinstance(e, report_agent.ActiveTaskExistsError):
+        return _api_error(
+            "已有活跃任务，请等待当前任务完成", e.code, 409,
+            details={"existing_job_id": e.existing_job_id},
+        )
+    if isinstance(e, report_agent.TaskQueueFullError):
+        response, status = _api_error(
+            "后台任务队列已满，请稍后重试", e.code, 503, retryable=True,
+            details={"retry_after": e.retry_after},
+        )
+        response.headers["Retry-After"] = str(e.retry_after)
+        return response, status
+    if isinstance(e, report_agent.TaskNotRetryableError):
+        return _api_error(
+            "任务当前状态不可重试",
+            e.code,
+            409,
+            details={"job_id": e.job_id, "status": e.status},
+        )
+    if isinstance(e, report_agent.InvalidTaskTransitionError):
+        return _api_error(
+            "任务状态转换无效",
+            e.code,
+            409,
+            details={
+                "job_id": e.job_id,
+                "current_status": e.current_status,
+                "requested_status": e.requested_status,
+            },
+        )
     if isinstance(e, KeyError):
         logger.info("Report agent resource not found error_type=%s", type(e).__name__)
         return jsonify({"error": _agent_public_key_error_message(e)}), 404
@@ -7000,7 +8093,7 @@ def api_agent_project_outline(project_id):
         draft = report_agent.save_draft(project_id, "outline", result, model=_ai_model_id())
         return jsonify({"ok": True, "outline": result, "draft": draft})
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI请求失败: {e.response.status_code}"}), 502
+        return _upstream_http_error(e, "AI请求失败", "AI_UPSTREAM_ERROR")
     except Exception as e:
         return _agent_error_response(e)
 
@@ -7010,7 +8103,7 @@ def _run_agent_draft_job(project_id: str, job_id: str):
     try:
         job = report_agent.get_draft_job(project_id, job_id)
         data = job.get("request") or {}
-        report_agent.update_draft_job(job_id, status="running")
+        report_agent.claim_draft_job(project_id, job_id)
         project = report_agent.get_project(project_id)
         evidence = _agent_selected_evidence(project_id, data)
         messages = report_agent.build_draft_messages(
@@ -7022,11 +8115,28 @@ def _run_agent_draft_job(project_id: str, job_id: str):
         )
         target_word_count = _agent_generation_target(project, data)
         max_tokens = _agent_generation_tokens(target_word_count)
-        result = report_agent.sanitize_report_text(_call_ai(messages, temperature=0.4, max_tokens=max_tokens))
-        payload = _agent_draft_payload(result, target_word_count)
-        # 先落盘首稿再扩写：即使扩写超时/worker 被杀，首稿也已持久化，job 状态与草稿都不丢
-        draft = report_agent.save_draft(project_id, "draft", result, model=_ai_model_id(), payload=payload)
-        report_agent.update_draft_job(job_id, draft_id=draft["draft_id"])
+        with _task_external_step_lock("draft", job_id):
+            if report_agent.checkpoint_draft_job(
+                project_id, job_id
+            )["status"] != "running":
+                return
+            result = report_agent.sanitize_report_text(
+                _call_ai(messages, temperature=0.4, max_tokens=max_tokens)
+            )
+            payload = _agent_draft_payload(result, target_word_count)
+            # 外部调用与首稿落盘同处一个受控步骤；取消响应不会先于它完成。
+            draft = report_agent.save_draft(
+                project_id,
+                "draft",
+                result,
+                model=_ai_model_id(),
+                payload=payload,
+            )
+            report_agent.update_draft_job(job_id, draft_id=draft["draft_id"])
+        if report_agent.checkpoint_draft_job(
+            project_id, job_id
+        )["status"] != "running":
+            return
         if target_word_count and not payload["word_count_ok"]:
             expansion_messages = report_agent.build_expansion_messages(
                 project,
@@ -7036,16 +8146,41 @@ def _run_agent_draft_job(project_id: str, job_id: str):
                 outline=data.get("outline", ""),
                 review_notes=data.get("review_notes", ""),
             )
-            expanded = report_agent.sanitize_report_text(_call_ai(expansion_messages, temperature=0.35, max_tokens=max_tokens))
-            expanded_payload = _agent_draft_payload(expanded, target_word_count)
-            if expanded_payload["word_count"] > payload["word_count"]:
-                draft = report_agent.save_draft(project_id, "draft", expanded, model=_ai_model_id(), payload=expanded_payload)
-                report_agent.update_draft_job(job_id, draft_id=draft["draft_id"])
+            with _task_external_step_lock("draft", job_id):
+                if report_agent.checkpoint_draft_job(
+                    project_id, job_id
+                )["status"] != "running":
+                    return
+                expanded = report_agent.sanitize_report_text(
+                    _call_ai(
+                        expansion_messages,
+                        temperature=0.35,
+                        max_tokens=max_tokens,
+                    )
+                )
+                expanded_payload = _agent_draft_payload(expanded, target_word_count)
+                if expanded_payload["word_count"] > payload["word_count"]:
+                    draft = report_agent.save_draft(
+                        project_id,
+                        "draft",
+                        expanded,
+                        model=_ai_model_id(),
+                        payload=expanded_payload,
+                    )
+                    report_agent.update_draft_job(
+                        job_id, draft_id=draft["draft_id"]
+                    )
+            if report_agent.checkpoint_draft_job(
+                project_id, job_id
+            )["status"] != "running":
+                return
         report_agent.update_draft_job(job_id, status="done")
+    except report_agent.InvalidTaskTransitionError:
+        return
     except Exception as exc:
         error_type = type(exc).__name__
         logger.error(
-            "报告草稿任务 %s 失败 error_type=%s", job_id, error_type
+            "报告草稿任务失败 error_type=%s", error_type
         )
         try:
             report_agent.update_draft_job(
@@ -7078,16 +8213,42 @@ def _agent_draft_job_response(project_id: str, job: dict):
 def api_agent_project_draft(project_id):
     """入队报告草稿生成任务；阻塞式 AI 在后台 job 里跑，前端轮询 draft_jobs 取结果。"""
     if not _ai_is_enabled():
-        return jsonify({"error": "AI API Key 未配置，请先在AI标签页配置"}), 400
+        return _api_error(
+            "AI API Key 未配置，请先在AI标签页配置",
+            "AI_UNCONFIGURED",
+            400,
+        )
     data = request.get_json() or {}
     try:
         report_agent.get_project(project_id)   # 校验项目存在
-        job = report_agent.create_draft_job(project_id, request=data)
-        if app.config.get("TESTING"):
-            _run_agent_draft_job(project_id, job["job_id"])   # 测试内同步跑，结果即时可断言
-        else:
-            REPORT_JOB_EXECUTOR.submit(_run_agent_draft_job, project_id, job["job_id"])
+        job = report_agent.create_draft_job(
+            project_id,
+            request=data,
+            idempotency_key=request.headers.get("Idempotency-Key"),
+        )
+        idempotent_replay = bool(job.get("idempotent_replay"))
+        if not idempotent_replay:
+            if app.config.get("TESTING"):
+                _run_agent_draft_job(project_id, job["job_id"])   # 测试内同步跑，结果即时可断言
+            else:
+                try:
+                    REPORT_SUBMISSION_GUARD.submit(
+                        REPORT_JOB_EXECUTOR,
+                        _run_agent_draft_job,
+                        project_id,
+                        job["job_id"],
+                    )
+                except report_agent.TaskQueueFullError as exc:
+                    report_agent.update_draft_job(
+                        job["job_id"],
+                        status="failed",
+                        error="后台任务队列已满，请稍后重试",
+                        error_code=exc.code,
+                        retryable=True,
+                    )
+                    raise
         job = report_agent.get_draft_job(project_id, job["job_id"])
+        job["idempotent_replay"] = idempotent_replay
         return _agent_draft_job_response(project_id, job)
     except Exception as e:
         return _agent_error_response(e)
@@ -7096,12 +8257,85 @@ def api_agent_project_draft(project_id):
 @app.route("/api/agent/projects/<project_id>/draft_jobs/<job_id>", methods=["GET"])
 @require_auth
 def api_agent_draft_job(project_id, job_id):
-    """轮询报告草稿生成任务状态。job.status: queued / running / done / failed。"""
+    """轮询报告草稿任务，包括 queued/running/done/failed/control 终态。"""
     try:
         job = report_agent.get_draft_job(project_id, job_id)
         return _agent_draft_job_response(project_id, job)
     except Exception as e:
         return _agent_error_response(e)
+
+
+@app.route("/api/agent/projects/<project_id>/draft_jobs/<job_id>/retry", methods=["POST"])
+@require_auth
+@require_ai_rate
+def api_agent_draft_job_retry(project_id, job_id):
+    """显式重试一个失败且标记为可重试的草稿任务。"""
+    if not _ai_is_enabled():
+        return _api_error("AI API Key 未配置，请先在AI标签页配置", "AI_UNCONFIGURED", 400)
+    try:
+        job = report_agent.retry_draft_job(project_id, job_id)
+        response_status = 202
+        if app.config.get("TESTING"):
+            _run_agent_draft_job(project_id, job_id)
+            job = report_agent.get_draft_job(project_id, job_id)
+            response_status = 200
+        else:
+            try:
+                REPORT_SUBMISSION_GUARD.submit(
+                    REPORT_JOB_EXECUTOR,
+                    _run_agent_draft_job,
+                    project_id,
+                    job_id,
+                )
+            except report_agent.TaskQueueFullError as exc:
+                report_agent.update_draft_job(
+                    job_id,
+                    status="failed",
+                    error="后台任务队列已满，请稍后重试",
+                    error_code=exc.code,
+                    retryable=True,
+                )
+                raise
+        response = _agent_draft_job_response(project_id, job)
+        return response, response_status
+    except Exception as e:
+        return _agent_error_response(e)
+
+
+def _api_agent_draft_job_control(project_id: str, job_id: str, action: str):
+    data = request.get_json(silent=True) or {}
+    try:
+        if action == "cancel":
+            job = report_agent.request_draft_job_cancel(
+                project_id, job_id, data.get("reason") or ""
+            )
+        else:
+            job = report_agent.request_draft_job_block(
+                project_id, job_id, data.get("reason") or ""
+            )
+        # The response is a barrier: once it is visible, no in-flight AI phase
+        # can still persist a new draft and no later phase can be authorized.
+        with _task_external_step_lock("draft", job_id):
+            pass
+        status = 202 if job.get("status") in {
+            "cancel_requested", "block_requested"
+        } else 200
+        return _agent_draft_job_response(project_id, job), status
+    except Exception as e:
+        return _agent_error_response(e)
+
+
+@app.route("/api/agent/projects/<project_id>/draft_jobs/<job_id>/cancel", methods=["POST"])
+@require_auth
+def api_agent_draft_job_cancel(project_id, job_id):
+    return _api_agent_draft_job_control(project_id, job_id, "cancel")
+
+
+@app.route("/api/agent/projects/<project_id>/draft_jobs/<job_id>/block", methods=["POST"])
+@require_auth
+def api_agent_draft_job_block(project_id, job_id):
+    return _api_agent_draft_job_control(project_id, job_id, "block")
+
 
 @app.route("/api/agent/projects/<project_id>/revise", methods=["POST"])
 @require_auth
@@ -7114,14 +8348,14 @@ def api_agent_project_revise(project_id):
     instruction = (data.get("instruction") or "").strip()
     draft_id = (data.get("draft_id") or "").strip()
     if not instruction:
-        return jsonify({"error": "缺少修订要求"}), 400
+        return _api_error("缺少修订要求", "REVISION_INSTRUCTION_REQUIRED", 400)
     if not draft_id:
-        return jsonify({"error": "缺少draft_id"}), 400
+        return _api_error("缺少draft_id", "DRAFT_ID_REQUIRED", 400)
     try:
         project = report_agent.get_project(project_id)
         draft = report_agent.get_draft(draft_id)
         if draft["project_id"] != project_id:
-            return jsonify({"error": "草稿不属于当前项目"}), 400
+            return _api_error("草稿不属于当前项目", "DRAFT_PROJECT_MISMATCH", 400)
         if data.get("content"):
             draft = {**draft, "content": data.get("content")}
         messages = report_agent.build_revision_messages(project, draft, instruction)
@@ -7139,7 +8373,7 @@ def api_agent_project_revise(project_id):
         )
         return jsonify({"ok": True, "draft": revised})
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI请求失败: {e.response.status_code}"}), 502
+        return _upstream_http_error(e, "AI请求失败", "AI_UPSTREAM_ERROR")
     except Exception as e:
         return _agent_error_response(e)
 
@@ -7151,7 +8385,7 @@ def api_agent_project_preflight(project_id):
     if data is None:
         data = {}
     if not isinstance(data, dict):
-        return jsonify({"error": "请求体必须是JSON对象"}), 400
+        return _api_error("请求体必须是JSON对象", "INVALID_JSON_OBJECT", 400)
 
     try:
         project = report_agent.get_project(project_id)
@@ -7195,12 +8429,12 @@ def api_agent_project_export_docx(project_id):
     data = request.get_json() or {}
     draft_id = (data.get("draft_id") or "").strip()
     if not draft_id:
-        return jsonify({"error": "缺少draft_id"}), 400
+        return _api_error("缺少draft_id", "DRAFT_ID_REQUIRED", 400)
     try:
         project = report_agent.get_project(project_id)
         draft = report_agent.get_draft(draft_id)
         if draft["project_id"] != project_id:
-            return jsonify({"error": "草稿不属于当前项目"}), 400
+            return _api_error("草稿不属于当前项目", "DRAFT_PROJECT_MISMATCH", 400)
         if data.get("content"):
             draft = {**draft, "content": data.get("content")}
         evidence = _agent_selected_evidence(project_id, data, allow_empty=True)
@@ -7276,7 +8510,7 @@ def api_brief_generate():
             "saved_to": _public_brief_saved_name(saved_path),
         })
     except requests.exceptions.HTTPError as e:
-        return jsonify({"error": f"AI请求失败: {e.response.status_code}"}), 502
+        return _upstream_http_error(e, "AI请求失败", "AI_UPSTREAM_ERROR")
     except Exception as e:
         logger.error("Brief generate failed error_type=%s", _brief_error_type(e))
         return jsonify({"error": "生成失败，请稍后重试"}), 500
@@ -7310,7 +8544,7 @@ def api_brief_batch():
         articles = articles[:count]
 
     if not articles:
-        return jsonify({"error": "无可用候选文章"}), 400
+        return _api_error("无可用候选文章", "NO_BRIEF_CANDIDATES", 400)
 
     def generate():
         total = len(articles)
@@ -7429,11 +8663,49 @@ def _extract_url_content(url: str) -> dict:
         source = urlparse(url).netloc.replace("www.", "")
     return {"title": title, "body": body, "pub_date": pub_date, "source": source, "url": url}
 
+def _run_upload_parser(
+    kind, raw, filename, *, timeout=UPLOAD_PARSE_TIMEOUT_SECONDS, max_pages=30
+):
+    try:
+        parsed = parse_document_isolated(
+            kind,
+            raw,
+            filename,
+            timeout=timeout,
+            max_chars=8000,
+            max_pages=max_pages,
+            max_file_size=int(app.config["MAX_CONTENT_LENGTH"]),
+        )
+        return {"title": parsed["title"], "body": parsed["text"]}
+    except IsolatedDocumentParseError as exc:
+        if exc.code in {
+            "DOCUMENT_PARSER_ISOLATION_FAILED",
+            "DOCUMENT_PARSE_QUEUE_FULL",
+        }:
+            raise
+        code = "UPLOAD_PARSE_TIMEOUT" if exc.code == "DOCUMENT_PARSE_TIMEOUT" else exc.code
+        message = (
+            "文件解析超时，请缩小文件后重试"
+            if code == "UPLOAD_PARSE_TIMEOUT"
+            else "文件无法安全解析"
+        )
+        raise UploadValidationError(code, message, details=exc.details) from exc
+
+
 def _extract_file_text(file_storage) -> dict:
-    """从上传文件提取文本（支持 .txt / .docx / .pdf）"""
-    filename = file_storage.filename.lower()
+    """Extract bounded text after extension, magic and archive validation."""
+    original_name = str(file_storage.filename or "")
+    filename = original_name.lower()
+    max_bytes = int(app.config["MAX_CONTENT_LENGTH"])
+    raw = file_storage.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise UploadValidationError(
+            "UPLOAD_TOO_LARGE",
+            "上传文件超过大小限制",
+            details={"max_file_size": max_bytes, "size": len(raw)},
+        )
     if filename.endswith(".txt"):
-        raw = file_storage.read()
+        text = None
         for enc in ("utf-8", "gbk", "gb18030", "utf-16", "latin-1"):
             try:
                 text = raw.decode(enc)
@@ -7441,34 +8713,23 @@ def _extract_file_text(file_storage) -> dict:
             except:
                 text = raw.decode("utf-8", errors="replace")
         return {"title": os.path.splitext(file_storage.filename)[0], "body": text.strip()[:8000]}
-    elif filename.endswith(".docx"):
-        file_storage.seek(0)
-        raw = file_storage.read()
-        try:
-            text = document_safety.extract_docx_text_safe(
-                raw,
-                max_chars=8000,
-                include_tables=True,
-            )
-        except document_safety.DocumentSafetyError as exc:
-            raise ValueError(f"文件未通过安全检查：{exc.code}") from None
-        title = text.split("\n")[0][:100] if text else file_storage.filename
-        return {"title": title, "body": text.strip()[:8000]}
-    elif filename.endswith(".pdf"):
-        file_storage.seek(0)
-        raw = file_storage.read()
-        try:
-            text = document_safety.extract_pdf_text_isolated(
-                raw,
-                max_pages=20,
-                max_chars=8000,
-            )
-        except document_safety.DocumentSafetyError as exc:
-            raise ValueError(f"文件未通过安全检查：{exc.code}") from None
-        title = text.split("\n")[0][:100] if text else file_storage.filename
-        return {"title": title, "body": text.strip()[:8000]}
-    else:
-        raise ValueError(f"不支持的文件格式: {filename}（支持 .txt / .docx / .pdf）")
+    elif filename.endswith((".docx", ".pdf")):
+        envelope = validate_upload_envelope(
+            original_name,
+            raw,
+            max_file_size=max_bytes,
+        )
+        return _run_upload_parser(
+            envelope.kind,
+            raw,
+            original_name,
+            max_pages=20,
+        )
+    raise UploadValidationError(
+        "UNSUPPORTED_UPLOAD_TYPE",
+        "仅支持 TXT、DOCX 和 PDF 文件",
+        details={"extension": os.path.splitext(filename)[1]},
+    )
 
 def _build_brief_user_prompt_imported(title: str, body: str, source: str = "", url: str = "", pub_date: str = "") -> str:
     """为导入内容构造要讯写作prompt"""
@@ -7516,10 +8777,10 @@ def _build_brief_user_prompt_imported(title: str, body: str, source: str = "", u
 @require_ai_rate
 def api_brief_import_url():
     """导入URL生成要讯：抓取网页内容 -> AI生成要讯"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
     if not url:
-        return jsonify({"error": "请输入URL地址"}), 400
+        return _api_error("请输入URL地址", "URL_REQUIRED", 400)
     # SSRF检查
     safe, _reason = _is_ssrf_safe(url)
     if not safe:
@@ -7592,7 +8853,7 @@ def api_brief_import_url():
 def api_brief_import_file():
     """导入文件生成要讯：解析文件内容 -> AI生成要讯"""
     if "file" not in request.files:
-        return jsonify({"error": "未上传文件"}), 400
+        return _api_error("未上传文件", "FILE_REQUIRED", 400)
     file = request.files["file"]
     if not file.filename:
         return jsonify({"error": "文件名为空"}), 400
@@ -7607,7 +8868,7 @@ def api_brief_import_file():
             return jsonify({"error": "请填写可核实的来源发文日期"}), 400
         extracted = _extract_file_text(file)
         if not extracted["body"] or len(extracted["body"]) < 30:
-            return jsonify({"error": "文件内容提取失败或内容过短"}), 400
+            return _api_error("文件内容提取失败或内容过短", "FILE_CONTENT_TOO_SHORT", 400)
         prompt = _build_brief_user_prompt_imported(
             title=extracted["title"], body=extracted["body"],
             source=source, pub_date=pub_date)
@@ -7650,6 +8911,20 @@ def api_brief_import_file():
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "saved_to": _public_brief_saved_name(saved_path),
         })
+    except IsolatedDocumentParseError as e:
+        response, status = _api_error(
+            _document_public_error_message(e.code),
+            e.code,
+            503,
+            retryable=True,
+            details=e.details,
+        )
+        retry_after = int((e.details or {}).get("retry_after") or 0)
+        if retry_after > 0:
+            response.headers["Retry-After"] = str(retry_after)
+        return response, status
+    except UploadValidationError as e:
+        return _api_error(_document_public_error_message(e.code), e.code, 400, details=e.details)
     except ValueError as e:
         logger.warning("Import file rejected error_type=%s", _brief_error_type(e))
         return jsonify({"error": "文件处理失败，请检查文件格式和内容"}), 400
@@ -7663,7 +8938,7 @@ def api_brief_import_file():
 @require_ai_rate
 def api_brief_import_text():
     """导入纯文本生成要讯"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     title = (data.get("title") or "").strip()
     source = (data.get("source") or "").strip()
@@ -7727,7 +9002,7 @@ def api_brief_import_text():
 # 启动
 # ══════════════════════════════════════════════════════════════
 # gunicorn 以 import 方式加载 app:app 时也会执行到这里（不进入下面的 __main__）。
-# 受 RUN_SCHEDULER 控制：生产容器置 1 即在此启动调度器，修复"gunicorn 下定时任务不跑"。
+# 受 RUN_SCHEDULER 控制：生产容器置 1 即在此启动 RSS 调度器；旧 AI 日报另需显式开关。
 _start_scheduler_once()
 
 if __name__ == "__main__":

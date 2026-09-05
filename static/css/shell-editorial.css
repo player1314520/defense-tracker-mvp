@@ -134,7 +134,7 @@ html, body {
 /* 页脚随壳换装 */
 .footer {
   background: var(--bg) !important; border-top: 1px solid var(--line) !important;
-  color: var(--ink4) !important; font-family: var(--mono) !important;
+  color: var(--ink2) !important; font-family: var(--mono) !important;
   font-size: 10px !important; letter-spacing: .5px !important;
 }
 

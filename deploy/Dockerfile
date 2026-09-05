@@ -14,7 +14,7 @@ RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes \
         -r requirements.server.txt
 
 # 复制项目文件（app.py 顶层 import 了下列本地模块，必须一并拷入，否则 gunicorn 加载即 ModuleNotFoundError）
-COPY app.py state.py quality.py tracking.py auth_devices.py user_state.py feishu_bot.py feishu_common.py consulting_agent.py report_agent.py search_adapters.py pinned_http.py protected_secrets.py wechat_runtime.py product_version.py document_safety.py feishu_webhook_security.py version.json ./
+COPY app.py state.py quality.py tracking.py auth_devices.py user_state.py feishu_bot.py feishu_common.py consulting_agent.py report_agent.py search_adapters.py pinned_http.py protected_secrets.py wechat_runtime.py product_version.py document_safety.py isolated_document_parser.py upload_safety.py feishu_webhook_security.py version.json ./
 COPY v9/ v9/
 COPY templates/ templates/
 COPY static/ static/

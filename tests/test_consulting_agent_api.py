@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import sqlite3
 from zipfile import ZipFile
@@ -19,6 +20,13 @@ def _login_cookies(client, csrf="csrf-test-token"):
     client.set_cookie(tracker.AUTH_COOKIE, tracker.ACCESS_TOKEN)
     client.set_cookie(tracker.CSRF_COOKIE, csrf)
     return csrf
+
+
+def _assert_error_contract(data, code, *, retryable=False):
+    assert {"error", "code", "request_id", "retryable"} <= set(data)
+    assert data["code"] == code
+    assert isinstance(data["request_id"], str) and data["request_id"]
+    assert data["retryable"] is retryable
 
 
 def _rss_candidate(idx=1):
@@ -298,6 +306,11 @@ def test_consult_revise_records_revision(monkeypatch, tmp_path):
     )
 
     try:
+        invalid = client.post(
+            f"/api/consult/sessions/{session['session_id']}/revise",
+            json={"answer_id": answer["answer_id"]},
+            headers={tracker.CSRF_HEADER: csrf},
+        )
         resp = client.post(
             f"/api/consult/sessions/{session['session_id']}/revise",
             json={"answer_id": answer["answer_id"], "instruction": "加强影响研判"},
@@ -309,6 +322,9 @@ def test_consult_revise_records_revision(monkeypatch, tmp_path):
 
     data = resp.get_json()
 
+    assert invalid.status_code == 400
+    assert invalid.get_json()["error"] == "缺少修订要求"
+    _assert_error_contract(invalid.get_json(), "REVISION_INSTRUCTION_REQUIRED")
     assert resp.status_code == 200
     assert data["answer"]["kind"] == "revision"
     assert "修订后" in data["answer"]["content"]
@@ -470,6 +486,12 @@ def test_consult_asset_preview_returns_text_and_local_file(monkeypatch, tmp_path
     file_resp = client.get(data["file_url"])
     assert file_resp.status_code == 200
     assert b"European air defense production capacity" in file_resp.data
+    assert file_resp.mimetype == "application/octet-stream"
+    assert file_resp.headers["Content-Disposition"].startswith("attachment;")
+    csp = file_resp.headers["Content-Security-Policy"]
+    assert "script-src 'none'" in csp
+    assert "script-src-attr 'none'" in csp
+    assert "sandbox" in csp
 
 
 def test_consult_asset_preview_does_not_iframe_fake_pdf_placeholder(monkeypatch, tmp_path):
@@ -584,7 +606,9 @@ def test_consult_real_pdf_file_allows_same_origin_reader_iframe(monkeypatch, tmp
     assert data["file_is_real_pdf"] is True
     assert file_resp.status_code == 200
     assert file_resp.headers["Content-Type"].startswith("application/pdf")
-    assert "frame-src 'self' blob:" in csp
+    assert "script-src 'none'" in csp
+    assert "script-src-attr 'none'" in csp
+    assert "sandbox" in csp
     assert "frame-ancestors 'self'" in csp
     assert "frame-ancestors 'none'" not in csp
 
@@ -803,6 +827,7 @@ def test_consult_capture_uses_browser_render_fallback(monkeypatch, tmp_path):
         "raw_bytes": b"<html>rendered</html>",
         "is_fetched_original": True,
     }, raising=False)
+    monkeypatch.setattr(tracker, "BROWSER_RENDER_SANDBOXED", True)
     monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda url: (True, ""))
     tracker.app.config["TESTING"] = True
     client = tracker.app.test_client()
@@ -821,6 +846,87 @@ def test_consult_capture_uses_browser_render_fallback(monkeypatch, tmp_path):
     asset = consulting_agent.list_source_assets(session["session_id"])[0]
     assert asset["status"] == "archived"
     assert asset["payload"]["extraction_method"] == "browser_render"
+
+
+def test_browser_render_request_is_fail_closed_without_server_sandbox(monkeypatch):
+    rendered_called = {"value": False}
+
+    monkeypatch.setattr(tracker, "BROWSER_RENDER_SANDBOXED", False)
+    monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda url: (True, ""))
+    monkeypatch.setattr(
+        tracker.search_adapters,
+        "extract_url",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("empty body")),
+    )
+
+    def fake_rendered(*args, **kwargs):
+        rendered_called["value"] = True
+        return {"text": "must not be reached"}
+
+    monkeypatch.setattr(
+        tracker.search_adapters,
+        "extract_url_rendered",
+        fake_rendered,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        consulting_agent,
+        "record_source_asset_failure",
+        lambda *args, **kwargs: {"status": "failed"},
+    )
+
+    updated, asset, failure = tracker._consult_archive_one(
+        "session-1",
+        {
+            "evidence_id": "ev-1",
+            "title": "Render-only page",
+            "url": "https://example.test/report",
+            "channel": "web",
+        },
+        allow_browser_render=True,
+    )
+
+    assert updated is None
+    assert asset == {"status": "failed"}
+    assert failure["status"] == "failed"
+    assert rendered_called["value"] is False
+
+
+def test_archive_propagates_retryable_parser_service_failure(monkeypatch):
+    monkeypatch.setattr(tracker, "_is_ssrf_safe", lambda _url: (True, ""))
+    error = tracker.search_adapters.RemoteDocumentError(
+        "DOCUMENT_PARSE_QUEUE_FULL",
+        "文档解析队列已满，请稍后重试",
+        retryable=True,
+        details={"retry_after": 5},
+    )
+    monkeypatch.setattr(
+        tracker.search_adapters,
+        "extract_url",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(
+        consulting_agent,
+        "record_source_asset_failure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transient parser service failure must not become an asset failure")
+        ),
+    )
+
+    with pytest.raises(tracker.search_adapters.RemoteDocumentError) as caught:
+        tracker._consult_archive_one(
+            "session-1",
+            {
+                "evidence_id": "ev-1",
+                "title": "Queued PDF",
+                "url": "https://example.test/report.pdf",
+                "channel": "web",
+            },
+        )
+
+    assert caught.value.code == "DOCUMENT_PARSE_QUEUE_FULL"
+    assert caught.value.retryable is True
+    assert caught.value.details == {"retry_after": 5}
 
 
 def test_consult_capture_defaults_to_fast_direct_mode(monkeypatch, tmp_path):
@@ -1196,7 +1302,13 @@ def test_consult_extract_marks_source_as_fetched_original(monkeypatch, tmp_path)
     assert data["extracted_count"] == 1
     assert data["archived_count"] == 1
     assert data["assets"][0]["status"] == "archived"
-    assert Path(data["assets"][0]["text_path"]).exists()
+    assert data["assets"][0]["saved"] is True
+    assert data["assets"][0]["asset_id"]
+    assert data["assets"][0]["download_url"].endswith("?download=1")
+    serialized = json.dumps(data, ensure_ascii=False)
+    assert "local_path" not in serialized
+    assert "text_path" not in serialized
+    assert str(tmp_path) not in serialized
     updated = data["evidence"][0]
     assert updated["payload"]["is_fetched_original"] is True
     assert updated["payload"]["asset_status"] == "archived"
@@ -1365,7 +1477,15 @@ def test_consult_handoff_to_report_agent_filters_unfetched_targets(monkeypatch, 
     asset = consulting_agent.archive_source_asset(session["session_id"], evidence[0], archived_doc)
     evidence = consulting_agent.upsert_evidence(session["session_id"], [{
         **evidence[0],
-        "payload": {"is_fetched_original": True, "document_type": "pdf", "asset_status": "archived", "asset_id": asset["asset_id"]},
+        "payload": {
+            "is_fetched_original": True,
+            "document_type": "pdf",
+            "asset_status": "archived",
+            "asset_id": asset["asset_id"],
+            "asset_local_path": asset["local_path"],
+            "asset_text_path": asset["text_path"],
+            "asset_metadata_path": asset["metadata_path"],
+        },
     }, evidence[1]])
     tracker.app.config["TESTING"] = True
     client = tracker.app.test_client()
@@ -1384,6 +1504,94 @@ def test_consult_handoff_to_report_agent_filters_unfetched_targets(monkeypatch, 
     assert len(bundle["evidence"]) == 1
     assert bundle["evidence"][0]["title"] == "RAND 台海无人系统报告"
     assert "公开报告正文" in bundle["evidence"][0]["summary"]
+    for serialized in (
+        resp.get_data(as_text=True),
+        json.dumps(bundle, ensure_ascii=False),
+    ):
+        assert str(tmp_path) not in serialized
+        assert "asset_local_path" not in serialized
+        assert "asset_text_path" not in serialized
+        assert "asset_metadata_path" not in serialized
+
+
+def test_imported_item_cannot_read_arbitrary_local_file_during_handoff(monkeypatch, tmp_path):
+    monkeypatch.setattr(consulting_agent, "CONSULTING_AGENT_DB_FILE", str(tmp_path / "consult.sqlite3"))
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "report.sqlite3"))
+    monkeypatch.setattr(consulting_agent, "SOURCE_ARCHIVE_DIR", str(tmp_path / "source_archive"), raising=False)
+    monkeypatch.setattr(tracker, "THINK_TANK_DIRECTORY", [])
+    monkeypatch.setattr(tracker, "select_quality_candidates", lambda **_kwargs: ([], {}))
+    private_file = tmp_path / "private-config.txt"
+    private_file.write_text("LOCAL_FILE_READ_MUST_NEVER_APPEAR", encoding="utf-8")
+    session = consulting_agent.create_session(
+        "整理一份用户导入材料",
+        target_source_count=1,
+        search_web=False,
+    )
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+
+    search_response = client.post(
+        f"/api/consult/sessions/{session['session_id']}/search",
+        json={
+            "search_web": False,
+            "imported_items": [{
+                "title": "用户导入材料",
+                "source": "用户导入",
+                "body": "这是明确提交给系统的普通文本材料。",
+                "asset_text_path": str(private_file),
+                "text_path": str(private_file),
+            }],
+        },
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+    assert search_response.status_code == 200
+    evidence = search_response.get_json()["evidence"]
+    assert len(evidence) == 1
+
+    handoff_response = client.post(
+        f"/api/consult/sessions/{session['session_id']}/handoff_to_report_agent",
+        json={"evidence_ids": [evidence[0]["evidence_id"]]},
+        headers={tracker.CSRF_HEADER: csrf},
+    )
+
+    assert handoff_response.status_code == 200
+    serialized = handoff_response.get_data(as_text=True)
+    assert "LOCAL_FILE_READ_MUST_NEVER_APPEAR" not in serialized
+    assert str(private_file) not in serialized
+    assert "这是明确提交给系统的普通文本材料" in (
+        handoff_response.get_json()["imported_evidence"][0]["summary"]
+    )
+
+
+def test_consult_db_migration_redacts_legacy_provider_credentials(monkeypatch, tmp_path):
+    database = tmp_path / "consult.sqlite3"
+    monkeypatch.setattr(consulting_agent, "CONSULTING_AGENT_DB_FILE", str(database))
+    session = consulting_agent.create_session("legacy provider error cleanup")
+    consulting_agent.record_query(session["session_id"], "web", "test", 0, {})
+    secret = "legacy-serpapi-secret-value"
+    legacy = {
+        "provider_errors": {
+            "serpapi": f"401 https://example.test/search?api_key={secret}&q=test",
+        },
+        "api_key": secret,
+    }
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            "UPDATE queries SET payload_json=? WHERE session_id=?",
+            (json.dumps(legacy), session["session_id"]),
+        )
+        conn.commit()
+
+    consulting_agent._INITIALIZED_DB_FILES.discard(os.path.abspath(str(database)))
+    consulting_agent.init_consulting_agent_db()
+    with sqlite3.connect(database) as conn:
+        persisted = conn.execute(
+            "SELECT payload_json FROM queries WHERE session_id=?",
+            (session["session_id"],),
+        ).fetchone()[0]
+    assert secret not in persisted
+    assert "[REDACTED]" in persisted
 
 
 def test_consult_handoff_requires_archived_asset_not_just_payload_flag(monkeypatch, tmp_path):
@@ -1411,5 +1619,6 @@ def test_consult_handoff_requires_archived_asset_not_just_payload_flag(monkeypat
     data = resp.get_json()
 
     assert resp.status_code == 400
+    _assert_error_contract(data, "NO_ARCHIVED_SOURCE_FOR_HANDOFF")
     assert data["skipped_count"] == 1
     assert "未归档" in data["failures"][0]["reason"]

@@ -13,7 +13,12 @@ let clipboardWrites = 0;
 let downloadClicks = 0;
 const context = {
   console,
-  window: {addEventListener() {}, _currentNews: [], showTab() {}},
+  window: {
+    addEventListener() {},
+    _currentNews: [],
+    showTab() {},
+    __USERDATA_REVISION__: 0,
+  },
   document: {
     addEventListener() {},
     getElementById() { return null; },
@@ -29,7 +34,16 @@ const context = {
       async writeText() { clipboardWrites += 1; },
     },
   },
-  udSync(_path, payload) { syncPayload = payload; },
+  fetch: async (_path, options) => {
+    syncPayload = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {revision: 1, brief_results: [syncPayload.item]};
+      },
+    };
+  },
   showToast() {},
   apiFetch: async () => { throw new Error('server source gate blocked'); },
   confirm() { return true; },
@@ -54,18 +68,19 @@ vm.createContext(context);
 vm.runInContext(source, context, {filename: 'brief.js'});
 
 (async () => {
-  vm.runInContext(`
+  await vm.runInContext(`
     briefResults = [{
       id: 'imported',
       brief: 'draft',
       sourceEvidence: {payload: {origin: 'import_text', material_text: 'private source'}},
       article: {region: '导入', summary: 'private source'}
     }];
-    briefSave();
+    briefSave(briefResults[0]);
+    _briefSyncTail;
   `, context);
   assert.ok(syncPayload, 'localStorage quota failure must not block server sync');
-  assert.equal(syncPayload.value[0].sourceEvidence, undefined);
-  assert.equal(syncPayload.value[0].article.summary, '');
+  assert.equal(syncPayload.item.sourceEvidence, undefined);
+  assert.equal(syncPayload.item.article.summary, '');
 
   let importedFeedbackCalls = 0;
   context.apiFetch = async () => { importedFeedbackCalls += 1; return {}; };
@@ -145,12 +160,13 @@ vm.runInContext(source, context, {filename: 'brief.js'});
   assert.equal(downloadClicks, 0, 'TXT export must reject a result-set change during validation');
 
   context.apiFetch = async () => ({});
-  vm.runInContext(`
+  await vm.runInContext(`
     briefResults = [];
     briefAddResult('draft', {
       title: 'unsafe source', source: 'Test', region: 'US',
       link: 'javascript:alert(document.domain)', summary: ''
     }, {payload: {origin: 'rss_cache'}});
+    _briefSyncTail;
   `, context);
   assert.equal(
     vm.runInContext(`briefResults[0].article.link`, context),

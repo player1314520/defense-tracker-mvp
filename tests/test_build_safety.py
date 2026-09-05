@@ -26,6 +26,47 @@ def test_builder_targets_staging_and_never_replaces_release():
     assert 'os.path.join(BASE, "dist")' not in source
 
 
+def test_new_runtime_modules_are_scoped_to_the_builds_that_use_them():
+    builder = (PROJECT_ROOT / "scripts" / "build_app.py").read_text(
+        encoding="utf-8"
+    )
+    server_dockerfile = (PROJECT_ROOT / "deploy" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    server_dockerignore = (
+        PROJECT_ROOT / "deploy" / "Dockerfile.dockerignore"
+    ).read_text(encoding="utf-8")
+    portal_context = (
+        PROJECT_ROOT / "scripts" / "prepare_mvp_portal_context.py"
+    ).read_text(encoding="utf-8")
+
+    for module in (
+        "desktop_single_instance",
+        "isolated_document_parser",
+        "upload_safety",
+        "user_state",
+    ):
+        assert f'"{module}"' in builder
+
+    for module in (
+        "isolated_document_parser.py",
+        "upload_safety.py",
+        "user_state.py",
+    ):
+        assert module in server_dockerfile
+        assert f"!{module}" in server_dockerignore
+
+    assert "desktop_single_instance.py" not in server_dockerfile
+    assert "!desktop_single_instance.py" not in server_dockerignore
+    for module in (
+        "desktop_single_instance.py",
+        "isolated_document_parser.py",
+        "upload_safety.py",
+        "user_state.py",
+    ):
+        assert module not in portal_context
+
+
 def test_build_gate_requires_isolated_python_and_full_release_checks():
     source = (PROJECT_ROOT / "scripts" / "Build-AndShip.ps1").read_text(
         encoding="utf-8-sig"

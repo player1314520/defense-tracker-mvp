@@ -2,7 +2,10 @@
 防务数据追踪系统 V9 — 桌面应用启动器
 使用 PyWebView 创建原生桌面窗口（无浏览器地址栏）
 """
+import atexit
 import hmac
+import html
+import json
 import os
 import re
 import socket
@@ -18,6 +21,11 @@ if len(sys.argv) > 1 and sys.argv[1] == "--defense-tracker-pdf-worker":
 
     raise SystemExit(_pdf_worker_main(["--pdf-worker-output", *sys.argv[2:]]))
 
+if __name__ == "__main__" and len(sys.argv) == 5 and sys.argv[1] == "--document-parser-worker":
+    from isolated_document_parser import worker_file_entry
+
+    raise SystemExit(worker_file_entry(sys.argv[2], sys.argv[3], sys.argv[4]))
+
 # 桌面壳必须在导入 app 前强制启用鉴权。受信 WebView 稍后仅获得
 # 一次性引导能力，由服务端换成 HttpOnly 会话，长期令牌不暴露给 JS。
 os.environ["ACCESS_TOKEN_REQUIRED"] = "1"
@@ -31,8 +39,11 @@ else:
 
 os.chdir(BASE_DIR)
 
-from product_version import PRODUCT_VERSION, current_build_commit
+from product_version import PRODUCT_VERSION, current_build_commit, current_build_id
 from v9.webview2_runtime import detect_webview2_runtime
+
+APP_VERSION = PRODUCT_VERSION.semantic_version
+BUILD_ID = current_build_id()
 
 
 def _require_compatible_webview2_before_startup():
@@ -61,6 +72,41 @@ if __name__ == "__main__":
     # state are initialized. A later renderer assertion independently catches
     # broken registrations and pywebview fallbacks.
     _require_compatible_webview2_before_startup()
+
+from desktop_single_instance import try_acquire_desktop_mutex
+
+_DESKTOP_INSTANCE_MUTEX = None
+
+
+def _show_startup_message(message):
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, message, "DefenseTracker", 0x30)
+            return
+        except (AttributeError, OSError):
+            pass
+    print(message)
+
+
+def _acquire_or_exit_single_instance():
+    global _DESKTOP_INSTANCE_MUTEX
+    try:
+        mutex = try_acquire_desktop_mutex()
+    except OSError as exc:
+        _show_startup_message(f"无法建立桌面单实例保护：{exc}")
+        raise SystemExit(2) from exc
+    if mutex is None:
+        _show_startup_message("DefenseTracker 已在运行。请切换到现有窗口，不要重复启动。")
+        raise SystemExit(3)
+    _DESKTOP_INSTANCE_MUTEX = mutex
+    atexit.register(mutex.close)
+
+
+if __name__ == "__main__":
+    # Acquire before importing app: app import performs restart recovery.
+    _acquire_or_exit_single_instance()
 
 # ── 可写运行目录（程序目录始终只读）──────────────────────────
 from state import RUNTIME_LAYOUT, ensure_runtime_layout, migrate_legacy_runtime
@@ -94,6 +140,7 @@ PORT = find_free_port()
 # ── 导入 Flask 应用（不触发 __main__ 块）────────────────────
 from app import (
     app as flask_app,
+    _start_scheduler_once,
     refresh_news,
     add_background_jobs,
     get_desktop_bootstrap_token,
@@ -181,25 +228,131 @@ def _run_flask():
                   use_reloader=False, threaded=True)
 
 # ── 等待 Flask 就绪 ──────────────────────────────────────────
+def _readiness_payload(response):
+    try:
+        raw = response.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("readiness response is too large")
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        # The response body is untrusted loopback input.  A malformed body or
+        # an unusual file-like reader must never crash the desktop bootstrap.
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        headers = getattr(response, "headers", None)
+        request_id = headers.get("X-Request-ID", "") if headers is not None else ""
+    except Exception:
+        request_id = ""
+    if request_id:
+        payload["request_id"] = request_id
+    return payload
+
+
 def _wait_for_flask(timeout=30):
-    import urllib.request, urllib.error
+    import urllib.error
+    import urllib.request
     deadline = time.time() + timeout
+    last_diagnostic = {
+        "ready": False,
+        "code": "READY_TIMEOUT",
+        "version": APP_VERSION,
+        "build_id": BUILD_ID,
+    }
     while time.time() < deadline:
         try:
-            urllib.request.urlopen(
-                f'http://127.0.0.1:{PORT}/api/status', timeout=1)
-            return True
-        except urllib.error.HTTPError:
-            # 收到 HTTP 响应（如 401 未授权）就证明 Flask 已就绪，require_auth 才能挡
-            return True
-        except Exception:
-            time.sleep(0.4)
-    return False
+            with urllib.request.urlopen(
+                f'http://127.0.0.1:{PORT}/health/ready', timeout=1
+            ) as response:
+                payload = _readiness_payload(response)
+            if payload.get("ready") is True:
+                if (
+                    payload.get("version") == APP_VERSION
+                    and payload.get("build_id") == BUILD_ID
+                ):
+                    return True, payload
+                payload["ready"] = False
+                payload["code"] = "READY_IDENTITY_MISMATCH"
+                payload["expected_version"] = APP_VERSION
+                payload["expected_build_id"] = BUILD_ID
+                return False, payload
+            last_diagnostic = payload or last_diagnostic
+        except urllib.error.HTTPError as exc:
+            payload = _readiness_payload(exc)
+            payload.setdefault("ready", False)
+            payload.setdefault("code", f"READY_HTTP_{exc.code}")
+            last_diagnostic = payload
+        except (OSError, TimeoutError, ValueError):
+            # Startup races, short reads and transient loopback failures are
+            # recoverable until the bounded deadline expires.
+            last_diagnostic = {
+                "ready": False,
+                "code": "READY_RETRYING",
+                "version": APP_VERSION,
+                "build_id": BUILD_ID,
+            }
+        time.sleep(0.4)
+    return False, last_diagnostic
+
+
+def _readiness_recovery_html(diagnostic):
+    diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+    components = diagnostic.get("components")
+    components = components if isinstance(components, dict) else {}
+    blocked = []
+    codes = set()
+    for name, value in components.items():
+        if not isinstance(value, dict) or value.get("status") == "ready":
+            continue
+        code = str(value.get("code") or value.get("status") or "UNAVAILABLE")
+        codes.add(code)
+        detail = str(value.get("detail") or "")
+        blocked.append(f"{name}: {code}" + (f" ({detail})" if detail else ""))
+    if "V9_KEY_LOCKED" in codes:
+        action = (
+            "V9 本地数据密钥不可用，系统已阻止写入。请关闭程序，从可信备份恢复密钥，"
+            "或使用受控恢复入口；不要删除或重建现有数据库。"
+        )
+    else:
+        action = (
+            "请关闭程序后重试。若问题持续，请记录下方诊断码，并查看 "
+            "%LOCALAPPDATA%\\DefenseTracker\\logs。"
+        )
+    diagnostic_lines = blocked or [str(diagnostic.get("code") or "READY_TIMEOUT")]
+    request_id = str(diagnostic.get("request_id") or "未提供")
+    identity = (
+        f"版本 {diagnostic.get('version') or APP_VERSION} · "
+        f"构建 {diagnostic.get('build_id') or BUILD_ID}"
+    )
+    items = "".join(f"<li>{html.escape(line)}</li>" for line in diagnostic_lines)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><style>
+body{{margin:0;background:#060d1a;color:#e5e7eb;font-family:'Microsoft YaHei',sans-serif;
+display:flex;align-items:center;justify-content:center;min-height:100vh}}
+.card{{width:min(720px,calc(100vw - 64px));background:#0f172a;border:1px solid #7f1d1d;
+border-radius:12px;padding:32px;box-sizing:border-box}}
+h1{{color:#fca5a5;font-size:24px;margin:0 0 16px}} p,li{{line-height:1.7}}
+.meta{{font:12px Consolas,monospace;color:#94a3b8}} code{{color:#bfdbfe}}
+</style></head><body><main class="card">
+<h1>服务尚未就绪</h1><p>{html.escape(action)}</p>
+<ul>{items}</ul><p class="meta">{html.escape(identity)}</p>
+<p class="meta">Request ID: <code>{html.escape(request_id)}</code></p>
+</main></body></html>"""
 
 
 def _prepare_desktop_login_url():
-    if not _wait_for_flask():
-        raise RuntimeError("桌面服务启动超时")
+    readiness = _wait_for_flask()
+    if isinstance(readiness, tuple):
+        ready, diagnostic = readiness
+    else:
+        # Keep the helper easy to isolate in unit tests while the production
+        # path always returns the structured pair above.
+        ready, diagnostic = bool(readiness), {}
+    if not ready:
+        error = RuntimeError("桌面服务启动超时")
+        error.diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+        raise error
     bootstrap = get_desktop_bootstrap_token()
     if not bootstrap:
         raise RuntimeError("桌面安全会话初始化失败")
@@ -230,22 +383,14 @@ def _accept_desktop_renderer(renderer):
 # 主程序
 # ════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    # 1. 启动后台新闻抓取：延迟 3 秒，让 UI 先出来再去抢网络/CPU
+    # 1. 启动唯一的后台调度器；其真实 running 状态供 readiness 使用。
     print(f"[启动] 正在初始化情报系统 (端口 {PORT})…")
-    def _delayed_refresh():
-        time.sleep(3)
-        refresh_news()
-    threading.Thread(target=_delayed_refresh, daemon=True).start()
+    _start_scheduler_once(force=True)
 
-    # 2. 启动定时刷新调度器
-    scheduler = BackgroundScheduler(daemon=True)
-    add_background_jobs(scheduler)
-    scheduler.start()
-
-    # 3. 在后台线程启动 Flask
+    # 2. 在后台线程启动 Flask
     threading.Thread(target=_run_flask, daemon=True).start()
 
-    # 4. 导入 pywebview（延迟导入减少启动时间）
+    # 3. 导入 pywebview（延迟导入减少启动时间）
     try:
         import webview
     except ImportError:
@@ -257,6 +402,25 @@ if __name__ == '__main__':
         desktop_login_url = _prepare_desktop_login_url()
     except RuntimeError as exc:
         print(f"[错误] {exc}")
+        diagnostic = getattr(exc, "diagnostic", {})
+        components = diagnostic.get("components", {}) if isinstance(diagnostic, dict) else {}
+        codes = {
+            str(value.get("code") or value.get("status") or "")
+            for value in components.values()
+            if isinstance(value, dict) and value.get("status") != "ready"
+        }
+        if "V9_KEY_LOCKED" in codes:
+            recovery = (
+                "V9 本地数据密钥不可用，写入已被阻止。请从可信备份恢复密钥，"
+                "不要删除或重建现有数据库。"
+            )
+        else:
+            recovery = (
+                "请关闭程序后重试；若问题持续，请保留诊断码并查看 "
+                "%LOCALAPPDATA%\\DefenseTracker\\logs。"
+            )
+        diagnostic_code = str(diagnostic.get("code") or "READY_TIMEOUT")
+        _show_startup_message(f"{exc}\n\n{recovery}\n\n诊断码：{diagnostic_code}")
         raise SystemExit(1)
 
     window = webview.create_window(

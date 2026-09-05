@@ -1,4 +1,9 @@
 from datetime import datetime, timezone
+import json
+import os
+import sqlite3
+
+import pytest
 
 import pytest
 
@@ -20,6 +25,13 @@ def _login_cookies(client, csrf="csrf-test-token"):
     client.set_cookie(tracker.AUTH_COOKIE, tracker.ACCESS_TOKEN)
     client.set_cookie(tracker.CSRF_COOKIE, csrf)
     return csrf
+
+
+def _assert_error_contract(data, code, *, retryable=False):
+    assert {"error", "code", "request_id", "retryable"} <= set(data)
+    assert data["code"] == code
+    assert isinstance(data["request_id"], str) and data["request_id"]
+    assert data["retryable"] is retryable
 
 
 def _candidate():
@@ -397,6 +409,32 @@ def test_agent_draft_requires_ai_config(monkeypatch, tmp_path):
 
     assert resp.status_code == 400
     assert "AI API Key" in resp.get_json()["error"]
+    _assert_error_contract(resp.get_json(), "AI_UNCONFIGURED")
+
+
+def test_agent_revise_missing_instruction_uses_error_contract(monkeypatch, tmp_path):
+    monkeypatch.setattr(report_agent, "REPORT_AGENT_DB_FILE", str(tmp_path / "agent.sqlite3"))
+    old_config = dict(tracker.AI_CONFIG)
+    tracker.AI_CONFIG.update({"api_key": "unit-key", "model": "unit-model"})
+    tracker.app.config["TESTING"] = True
+    client = tracker.app.test_client()
+    csrf = _login_cookies(client)
+    project = report_agent.create_project("台海日报", "daily")
+    draft = report_agent.save_draft(project["project_id"], "draft", "正文", model="unit-model")
+
+    try:
+        resp = client.post(
+            f"/api/agent/projects/{project['project_id']}/revise",
+            json={"draft_id": draft["draft_id"]},
+            headers={tracker.CSRF_HEADER: csrf},
+        )
+    finally:
+        tracker.AI_CONFIG.clear()
+        tracker.AI_CONFIG.update(old_config)
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "缺少修订要求"
+    _assert_error_contract(resp.get_json(), "REVISION_INSTRUCTION_REQUIRED")
 
 
 def test_agent_draft_job_status_endpoint_returns_done_draft(monkeypatch, tmp_path):
@@ -657,6 +695,8 @@ def test_agent_export_docx_requires_draft_and_downloads(monkeypatch, tmp_path):
         headers={tracker.CSRF_HEADER: csrf},
     )
     assert missing.status_code == 400
+    assert missing.get_json()["error"] == "缺少draft_id"
+    _assert_error_contract(missing.get_json(), "DRAFT_ID_REQUIRED")
 
     draft = report_agent.save_draft(project["project_id"], "draft", "台海日报正文", model="unit-model")
     ok = client.post(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -16,8 +17,10 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
-from document_safety import extract_docx_text_safe, extract_pdf_text_isolated
+from requests.adapters import HTTPAdapter
 from pinned_http import pinned_get
+from isolated_document_parser import IsolatedDocumentParseError, parse_document_isolated
+from upload_safety import UploadValidationError, validate_upload_envelope
 
 try:
     import trafilatura
@@ -64,6 +67,24 @@ class ProviderRequestError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+class RemoteDocumentError(RuntimeError):
+    """A diagnosable rejection or failure while parsing a remote document."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        details: dict | None = None,
+    ) -> None:
+        self.code = str(code or "REMOTE_DOCUMENT_ERROR")
+        self.message = str(message or "远程文档处理失败")
+        self.retryable = bool(retryable)
+        self.details = details if isinstance(details, dict) else {}
+        super().__init__(f"[{self.code}] {self.message}")
 
 
 def _provider_error_code(exc: BaseException) -> str:
@@ -669,6 +690,20 @@ def search_web_multi(
     }
 
 
+def _credentialed_provider_request(method: str, url: str, **kwargs):
+    """Send one credential-bearing provider request without following redirects."""
+    check = _resolve_ssrf_check(kwargs.pop("ssrf_check", None))
+    if check is None:
+        raise RuntimeError("SSRF安全校验未初始化")
+    resp = safe_request(method, url, ssrf_check=check, **kwargs)
+    if 300 <= resp.status_code < 400:
+        raise requests.exceptions.TooManyRedirects(
+            "credentialed provider redirect refused",
+            response=resp,
+        )
+    return resp
+
+
 def _search_tavily(query: str, limit: int = 10, **kwargs) -> list[dict]:
     api_key = (kwargs.get("api_key") or os.environ.get("TAVILY_API_KEY") or "").strip()
     if not api_key:
@@ -682,11 +717,13 @@ def _search_tavily(query: str, limit: int = 10, **kwargs) -> list[dict]:
         "include_images": False,
         "topic": kwargs.get("topic") or "general",
     }
-    resp = requests.post(
+    resp = _credentialed_provider_request(
+        "POST",
         TAVILY_ENDPOINT,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json=payload,
         timeout=int(kwargs.get("timeout") or 6),
+        ssrf_check=kwargs.get("ssrf_check"),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -779,7 +816,14 @@ def _search_brave(query: str, limit: int = 10, **kwargs) -> list[dict]:
         "search_lang": "en",
     }
     headers = {"Accept": "application/json", "X-Subscription-Token": api_key}
-    resp = requests.get(BRAVE_WEB_ENDPOINT, params=params, headers=headers, timeout=int(kwargs.get("timeout") or 20))
+    resp = _credentialed_provider_request(
+        "GET",
+        BRAVE_WEB_ENDPOINT,
+        params=params,
+        headers=headers,
+        timeout=int(kwargs.get("timeout") or 20),
+        ssrf_check=kwargs.get("ssrf_check"),
+    )
     resp.raise_for_status()
     data = resp.json()
     rows = []
@@ -793,11 +837,13 @@ def _search_brave(query: str, limit: int = 10, **kwargs) -> list[dict]:
         })
     if kwargs.get("include_news"):
         try:
-            news_resp = requests.get(
+            news_resp = _credentialed_provider_request(
+                "GET",
                 BRAVE_NEWS_ENDPOINT,
                 params={**params, "count": max(1, min(int(limit or 10), 20))},
                 headers=headers,
                 timeout=int(kwargs.get("timeout") or 20),
+                ssrf_check=kwargs.get("ssrf_check"),
             )
             news_resp.raise_for_status()
             for item in (news_resp.json().get("results") or []):
@@ -906,13 +952,75 @@ def extract_html_document(url: str, html: str, max_chars: int = 60000) -> dict:
     }
 
 
-def extract_pdf_document(url: str, content: bytes, max_pages: int = 30, max_chars: int = 60000) -> dict:
-    extracted = extract_pdf_text_isolated(
-        content,
-        max_pages=max(1, int(max_pages or 30)),
-        max_chars=max_chars,
+DEFAULT_REMOTE_DOCUMENT_PARSE_SECONDS = 12.0
+
+
+def _parse_time_limit(value: float | int | None) -> float:
+    seconds = DEFAULT_REMOTE_DOCUMENT_PARSE_SECONDS if value is None else float(value)
+    if seconds <= 0:
+        raise ValueError("max_parse_seconds must be positive")
+    return seconds
+
+
+def _raise_remote_validation_error(label: str, exc: UploadValidationError) -> None:
+    raise RemoteDocumentError(
+        exc.code,
+        f"远程{label}安全校验失败：{exc.message}",
+        details=exc.details,
+    ) from exc
+
+
+def _raise_remote_parse_error(label: str, exc: IsolatedDocumentParseError) -> None:
+    if exc.code in {
+        "DOCUMENT_PARSER_ISOLATION_FAILED",
+        "DOCUMENT_PARSE_QUEUE_FULL",
+    }:
+        raise RemoteDocumentError(
+            exc.code,
+            exc.message,
+            retryable=True,
+            details=exc.details,
+        ) from exc
+    code = (
+        f"REMOTE_{label}_PARSE_TIMEOUT"
+        if exc.code == "DOCUMENT_PARSE_TIMEOUT"
+        else exc.code
+        if exc.code.startswith(f"{label}_")
+        else f"REMOTE_{label}_PARSE_FAILED"
     )
-    text = re.sub(r"\n{3,}", "\n\n", extracted).strip()[:max_chars]
+    raise RemoteDocumentError(code, f"{label} 正文无法安全解析") from exc
+
+
+def extract_pdf_document(
+    url: str,
+    content: bytes,
+    max_pages: int = 30,
+    max_chars: int = 60000,
+    max_parse_seconds: float = DEFAULT_REMOTE_DOCUMENT_PARSE_SECONDS,
+) -> dict:
+    page_limit = max(1, int(max_pages or 30))
+    char_limit = max(1, int(max_chars or 60000))
+    parse_seconds = _parse_time_limit(max_parse_seconds)
+    filename = os.path.basename(urlparse(url).path) or "document.pdf"
+    if not filename.lower().endswith(".pdf"):
+        filename = f"{filename}.pdf"
+    try:
+        validate_upload_envelope(filename, content)
+    except UploadValidationError as exc:
+        _raise_remote_validation_error("PDF", exc)
+    try:
+        parsed = parse_document_isolated(
+            "pdf",
+            content,
+            filename,
+            timeout=parse_seconds,
+            max_chars=char_limit,
+            max_pages=page_limit,
+        )
+    except IsolatedDocumentParseError as exc:
+        _raise_remote_parse_error("PDF", exc)
+
+    text = re.sub(r"\n{3,}", "\n\n", str(parsed.get("text") or "")).strip()[:char_limit]
     title = os.path.basename(urlparse(url).path) or "PDF文档"
     return {
         "title": title,
@@ -926,9 +1034,33 @@ def extract_pdf_document(url: str, content: bytes, max_pages: int = 30, max_char
     }
 
 
-def extract_docx_document(url: str, content: bytes, max_chars: int = 60000) -> dict:
-    extracted = extract_docx_text_safe(content, max_chars=max_chars, include_tables=True)
-    text = re.sub(r"\n{3,}", "\n\n", extracted).strip()[:max_chars]
+def extract_docx_document(
+    url: str,
+    content: bytes,
+    max_chars: int = 60000,
+    max_parse_seconds: float = DEFAULT_REMOTE_DOCUMENT_PARSE_SECONDS,
+) -> dict:
+    char_limit = max(1, int(max_chars or 60000))
+    parse_seconds = _parse_time_limit(max_parse_seconds)
+    filename = os.path.basename(urlparse(url).path) or "document.docx"
+    if not filename.lower().endswith(".docx"):
+        filename = f"{filename}.docx"
+    try:
+        validate_upload_envelope(filename, content)
+    except UploadValidationError as exc:
+        _raise_remote_validation_error("DOCX", exc)
+    try:
+        parsed = parse_document_isolated(
+            "docx",
+            content,
+            filename,
+            timeout=parse_seconds,
+            max_chars=char_limit,
+        )
+    except IsolatedDocumentParseError as exc:
+        _raise_remote_parse_error("DOCX", exc)
+
+    text = re.sub(r"\n{3,}", "\n\n", str(parsed.get("text") or "")).strip()[:char_limit]
     title = os.path.basename(urlparse(url).path) or "DOCX文档"
     return {
         "title": title,
@@ -990,6 +1122,238 @@ _EXTRACT_HEADERS = {
 }
 
 
+class _PinnedIPAdapter(HTTPAdapter):
+    """Connect to one validated IP while retaining the URL host for TLS.
+
+    The adapter is mounted on a one-request Session.  It deliberately bypasses
+    requests' proxy manager and replaces only the pool connection target; the
+    PreparedRequest URL and Host header remain the original origin.
+    """
+
+    def __init__(self, *, original_hostname: str, pinned_ip: str, pinned_port: int):
+        self._original_hostname = original_hostname
+        self._pinned_ip = pinned_ip
+        self._pinned_port = int(pinned_port)
+        super().__init__()
+
+    def _pinned_pool(self, scheme: str, pool_kwargs=None):
+        pool_kwargs = dict(pool_kwargs or {})
+        if scheme == "https":
+            pool_kwargs["assert_hostname"] = self._original_hostname
+            pool_kwargs["server_hostname"] = self._original_hostname
+        return self.poolmanager.connection_from_host(
+            host=self._pinned_ip,
+            port=self._pinned_port,
+            scheme=scheme,
+            pool_kwargs=pool_kwargs,
+        )
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        builder = getattr(self, "build_connection_pool_key_attributes", None)
+        if builder is None:  # requests 2.31 compatibility; its send() uses get_connection().
+            return self.get_connection(request.url, proxies=proxies)
+        try:
+            host_params, pool_kwargs = builder(
+                request,
+                verify,
+                cert,
+            )
+        except ValueError as exc:
+            raise requests.exceptions.InvalidURL(str(exc), request=request) from exc
+
+        # Never hand this request to a proxy manager: the point of the adapter
+        # is that the already-validated address is the actual socket target.
+        return self._pinned_pool(
+            str(host_params.get("scheme") or "http").lower(),
+            pool_kwargs,
+        )
+
+    def get_connection(self, url, proxies=None):  # pragma: no cover - requests 2.31 path
+        """Compatibility path for requests versions before TLS-context pools."""
+        scheme = (urlparse(url).scheme or "http").lower()
+        return self._pinned_pool(scheme)
+
+
+def _idna_hostname(hostname: str) -> str:
+    if ":" in hostname:  # IPv6 literal
+        return hostname
+    try:
+        return hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise RuntimeError("URL主机名无效") from exc
+
+
+def _url_with_ip_host(parsed, ip: str) -> str:
+    host = f"[{ip}]" if ":" in ip else ip
+    try:
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("URL端口无效") from exc
+    if explicit_port is not None:
+        host = f"{host}:{explicit_port}"
+    return urlunparse((
+        parsed.scheme,
+        host,
+        parsed.path or "/",
+        parsed.params,
+        parsed.query,
+        "",
+    ))
+
+
+def _resolve_validated_endpoint(url: str, ssrf_check):
+    ok, reason = ssrf_check(url)
+    if not ok:
+        raise RuntimeError(f"URL不安全: {reason}")
+
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise RuntimeError("URL不安全: 仅允许HTTP/HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("URL不安全: 不允许URL内嵌凭据")
+    hostname = parsed.hostname
+    if not hostname:
+        raise RuntimeError("URL不安全: 缺少主机名")
+    hostname = _idna_hostname(hostname)
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise RuntimeError("URL端口无效") from exc
+
+    try:
+        addr_rows = socket.getaddrinfo(
+            hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise RuntimeError("URL域名解析失败") from exc
+
+    addresses = []
+    for row in addr_rows:
+        sockaddr = row[4]
+        if not sockaddr:
+            continue
+        ip = str(sockaddr[0]).split("%", 1)[0]
+        if ip in addresses:
+            continue
+        # This is the decisive check: it runs on the exact address that the
+        # adapter below will use, closing the validate-then-resolve-again gap.
+        ip_url = _url_with_ip_host(parsed, ip)
+        ip_ok, ip_reason = ssrf_check(ip_url)
+        if not ip_ok:
+            raise RuntimeError(f"URL不安全: {ip_reason}")
+        addresses.append(ip)
+    if not addresses:
+        raise RuntimeError("URL域名未解析到可用地址")
+    return parsed, hostname, port, addresses[0]
+
+
+def _host_header(parsed, hostname: str) -> str:
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    try:
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("URL端口无效") from exc
+    return f"{host}:{explicit_port}" if explicit_port is not None else host
+
+
+def _bind_session_lifetime(response, session):
+    """Make Response.close() release both the response and its private Session."""
+    original_close = response.close
+    closed = False
+
+    def close():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        try:
+            original_close()
+        finally:
+            session.close()
+
+    response.close = close
+    return response
+
+
+def safe_request(
+    method,
+    url,
+    *,
+    headers=None,
+    timeout=None,
+    stream=False,
+    verify=True,
+    ssrf_check,
+    **kwargs,
+):
+    """Send one request to a validated, pinned address without proxy reuse.
+
+    The URL and ``Host`` header retain the configured origin while the socket
+    target is the exact DNS answer that passed ``ssrf_check``.  HTTPS always
+    performs certificate and hostname verification; callers cannot downgrade
+    it with ``verify=False``.  Redirects are deliberately disabled because a
+    credential-bearing request must never be replayed to another origin.
+
+    Streaming callers own the returned response and must close it; closing the
+    response also closes its one-request Session and pinned pool.  For a normal
+    buffered response, requests has already consumed the body, so the private
+    Session is closed before this function returns.
+    """
+    method = str(method or "").strip().upper()
+    if not method or not re.fullmatch(r"[A-Z]+", method):
+        raise RuntimeError("HTTP请求方法无效")
+    parsed, hostname, port, pinned_ip = _resolve_validated_endpoint(url, ssrf_check)
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        adapter = _PinnedIPAdapter(
+            original_hostname=hostname,
+            pinned_ip=pinned_ip,
+            pinned_port=port,
+        )
+        session.mount(f"{parsed.scheme.lower()}://", adapter)
+        request_headers = dict(headers or {})
+        # Force the validated origin even if an upstream caller supplied Host.
+        request_headers["Host"] = _host_header(parsed, hostname)
+        request_kwargs = dict(kwargs)
+        request_kwargs.update({
+            "timeout": timeout,
+            "stream": bool(stream),
+            "allow_redirects": False,
+            "headers": request_headers,
+            # RC 的公网请求不提供 TLS 降级通道。这个值还会传给
+            # _PinnedIPAdapter，以原域名执行 CA + hostname 校验。
+            "verify": True,
+        })
+        request_fn = getattr(session, method.lower(), None)
+        if request_fn is None:  # pragma: no cover - requests Session always has request()
+            response = session.request(method, url, **request_kwargs)
+        else:
+            response = request_fn(url, **request_kwargs)
+    except Exception:
+        session.close()
+        raise
+    if stream:
+        return _bind_session_lifetime(response, session)
+    session.close()
+    return response
+
+
+def safe_stream_get(url, headers, timeout, ssrf_check):
+    """Compatibility wrapper for one pinned, non-redirecting streamed GET."""
+    return safe_request(
+        "GET",
+        url,
+        headers=headers,
+        timeout=timeout,
+        stream=True,
+        ssrf_check=ssrf_check,
+    )
+
+
 def _safe_stream_get(url, headers, timeout, ssrf_check):
     """逐跳策略复检 + DNS 固定的无代理流式 GET。"""
     current = url
@@ -1007,9 +1371,9 @@ def _safe_stream_get(url, headers, timeout, ssrf_check):
         redirect_cookies.update(resp.cookies)
         if 300 <= resp.status_code < 400:
             location = resp.headers.get("Location")
-            resp.close()
             if not location:
                 return resp
+            resp.close()
             if redirect_idx >= MAX_EXTRACT_REDIRECTS:
                 raise RuntimeError(f"重定向超过 {MAX_EXTRACT_REDIRECTS} 次")
             current = urljoin(current, location)

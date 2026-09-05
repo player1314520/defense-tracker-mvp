@@ -20,6 +20,13 @@ CONSULTING_AGENT_DB_FILE = os.path.join(DATA_DIR, "consulting_agent.sqlite3")
 MAX_CONSULTING_INSTRUCTION_CHARS = 4096
 SOURCE_ARCHIVE_DIR = os.path.join(DATA_DIR, "source_archive")
 _DB_LOCK = threading.Lock()
+_INITIALIZED_DB_FILES: set[str] = set()
+
+ActiveTaskExistsError = report_agent.ActiveTaskExistsError
+TaskQueueFullError = report_agent.TaskQueueFullError
+TaskNotRetryableError = report_agent.TaskNotRetryableError
+InvalidTaskTransitionError = report_agent.InvalidTaskTransitionError
+BoundedSubmissionGuard = report_agent.BoundedSubmissionGuard
 
 DEFAULT_TARGET_SOURCE_COUNT = 12
 MIN_SOURCE_TARGET = 1
@@ -72,8 +79,50 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+_SENSITIVE_VALUE_KEYS = {
+    "api_key",
+    "app_secret",
+    "access_token",
+    "refresh_token",
+    "password",
+    "private_key",
+}
+
+
+def _redact_sensitive_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|key)=)[^&#\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r'''(?ix)(["']?(?:api[_-]?key|app[_-]?secret|access[_-]?token|refresh[_-]?token|password|private[_-]?key)["']?\s*[:=]\s*["']?)([^"'\s,}\]&#]+)''',
+        r"\1[REDACTED]",
+        text,
+    )
+    return text
+
+
+def _scrub_sensitive_value(value):
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[REDACTED]"
+                if str(key).lower() in _SENSITIVE_VALUE_KEYS
+                else _scrub_sensitive_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_scrub_sensitive_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_sensitive_text(value)
+    return value
+
+
 def _json_dumps(value) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str)
+    return json.dumps(_scrub_sensitive_value(value), ensure_ascii=False, default=str)
 
 
 def _json_loads(value, default):
@@ -83,6 +132,64 @@ def _json_loads(value, default):
         return json.loads(value)
     except Exception:
         return default
+
+
+def _scrub_legacy_sensitive_values_in_conn(conn) -> int:
+    """Redact provider credentials persisted by older exception handlers."""
+    changed = 0
+    for table, column in (
+        ("queries", "payload_json"),
+        ("evidence", "payload_json"),
+        ("answers", "payload_json"),
+        ("events", "payload_json"),
+        ("source_assets", "payload_json"),
+        ("capture_jobs", "payload_json"),
+        ("capture_attempts", "payload_json"),
+    ):
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            continue
+        for row in conn.execute(f"SELECT rowid, {column} FROM {table}").fetchall():
+            raw = row[column]
+            try:
+                parsed = json.loads(raw or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            sanitized = _json_dumps(parsed)
+            if sanitized == raw:
+                continue
+            conn.execute(
+                f"UPDATE {table} SET {column}=? WHERE rowid=?",
+                (sanitized, row["rowid"]),
+            )
+            changed += 1
+
+    for table, column in (
+        ("source_assets", "failure_reason"),
+        ("capture_jobs", "stop_reason"),
+        ("evidence", "url"),
+        ("source_assets", "url"),
+    ):
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            continue
+        for row in conn.execute(f"SELECT rowid, {column} FROM {table}").fetchall():
+            raw = row[column] or ""
+            sanitized = _redact_sensitive_text(raw)
+            if sanitized == raw:
+                continue
+            conn.execute(
+                f"UPDATE {table} SET {column}=? WHERE rowid=?",
+                (sanitized, row["rowid"]),
+            )
+            changed += 1
+    return changed
 
 
 def normalize_capture_stop_reason(reason: str | None) -> str:
@@ -238,7 +345,62 @@ def _connect():
     return conn
 
 
+def _recover_interrupted_capture_jobs_in_conn(conn, now: str) -> int:
+    rows = conn.execute(
+        "SELECT job_id, session_id, status FROM capture_jobs "
+        "WHERE status IN ('queued', 'running', 'cancel_requested', 'block_requested')"
+    ).fetchall()
+    if not rows:
+        return 0
+    for row in rows:
+        if row["status"] in {"queued", "running"}:
+            terminal_status = "failed"
+            stop_reason = "进程已重启，原任务未完成，可安全重试"
+            error_code = "PROCESS_RESTARTED"
+            retryable = 1
+            event_type = "capture_job_failed"
+        elif row["status"] == "cancel_requested":
+            terminal_status = "cancelled"
+            stop_reason = "用户取消已在进程恢复时确认"
+            error_code = ""
+            retryable = 0
+            event_type = "capture_job_cancelled"
+        else:
+            terminal_status = "blocked"
+            stop_reason = "人工阻断已在进程恢复时确认"
+            error_code = ""
+            retryable = 0
+            event_type = "capture_job_blocked"
+        conn.execute(
+            "UPDATE capture_jobs SET status=?, stop_reason=?, error_code=?, retryable=?, updated_at=? "
+            "WHERE job_id=? AND status=?",
+            (
+                terminal_status,
+                stop_reason,
+                error_code,
+                retryable,
+                now,
+                row["job_id"],
+                row["status"],
+            ),
+        )
+        _log_event(
+            conn,
+            row["session_id"],
+            event_type,
+            {
+                "job_id": row["job_id"],
+                "previous_status": row["status"],
+                "code": error_code,
+                "retryable": bool(retryable),
+            },
+        )
+    return len(rows)
+
+
 def init_consulting_agent_db():
+    db_identity = os.path.abspath(CONSULTING_AGENT_DB_FILE)
+    recovered = 0
     with _DB_LOCK, _connect() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
@@ -341,6 +503,9 @@ def init_consulting_agent_db():
             needs_user_input_count INTEGER NOT NULL DEFAULT 0,
             rejected_low_relevance INTEGER NOT NULL DEFAULT 0,
             stop_reason TEXT NOT NULL DEFAULT '',
+            error_code TEXT NOT NULL DEFAULT '',
+            retryable INTEGER NOT NULL DEFAULT 0,
+            idempotency_key TEXT NOT NULL DEFAULT '',
             payload_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -364,18 +529,82 @@ def init_consulting_agent_db():
             FOREIGN KEY(session_id) REFERENCES sessions(session_id)
         );
         """)
+        job_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(capture_jobs)").fetchall()
+        }
+        if "error_code" not in job_columns:
+            conn.execute(
+                "ALTER TABLE capture_jobs ADD COLUMN error_code TEXT NOT NULL DEFAULT ''"
+            )
+        if "retryable" not in job_columns:
+            conn.execute(
+                "ALTER TABLE capture_jobs ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0"
+            )
+        if "idempotency_key" not in job_columns:
+            conn.execute(
+                "ALTER TABLE capture_jobs ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''"
+            )
+        has_task_identity = {"session_id", "status"} <= job_columns
         allowed_reasons = tuple(CAPTURE_STOP_REASON_LABELS)
         placeholders = ",".join("?" for _ in allowed_reasons)
-        conn.execute(
-            f"""
-            UPDATE capture_jobs
-            SET stop_reason=CASE WHEN stop_reason IS NULL THEN '' ELSE ? END
-            WHERE stop_reason IS NULL OR stop_reason NOT IN ({placeholders})
-            """,
-            (CAPTURE_FAILURE_FALLBACK, *allowed_reasons),
-        )
+        if has_task_identity:
+            conn.execute(
+                f"""
+                UPDATE capture_jobs
+                SET stop_reason=CASE WHEN stop_reason IS NULL THEN '' ELSE ? END
+                WHERE stop_reason IS NULL
+                   OR (
+                       status NOT IN ('cancel_requested', 'block_requested', 'cancelled', 'blocked')
+                       AND stop_reason NOT IN ({placeholders})
+                   )
+                """,
+                (CAPTURE_FAILURE_FALLBACK, *allowed_reasons),
+            )
+        else:
+            conn.execute(
+                f"""
+                UPDATE capture_jobs
+                SET stop_reason=CASE WHEN stop_reason IS NULL THEN '' ELSE ? END
+                WHERE stop_reason IS NULL OR stop_reason NOT IN ({placeholders})
+                """,
+                (CAPTURE_FAILURE_FALLBACK, *allowed_reasons),
+            )
+        if db_identity not in _INITIALIZED_DB_FILES:
+            _scrub_legacy_sensitive_values_in_conn(conn)
+            if has_task_identity:
+                recovered = _recover_interrupted_capture_jobs_in_conn(conn, _now())
         _scrub_legacy_source_failure_details(conn)
+        if has_task_identity:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_capture_jobs_idempotency "
+                "ON capture_jobs(session_id, idempotency_key) WHERE idempotency_key <> ''"
+            )
+            # Partial-index predicates are immutable in SQLite. Rebuild an older
+            # predicate once so requested cancellation/block states remain active.
+            active_index = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='idx_capture_jobs_one_active'"
+            ).fetchone()
+            active_index_sql = (active_index["sql"] or "").lower() if active_index else ""
+            if not all(
+                marker in active_index_sql
+                for marker in ("queued", "running", "cancel_requested", "block_requested")
+            ):
+                conn.execute("DROP INDEX IF EXISTS idx_capture_jobs_one_active")
+                conn.execute(
+                    "CREATE UNIQUE INDEX idx_capture_jobs_one_active "
+                    "ON capture_jobs(session_id) WHERE status IN "
+                    "('queued', 'running', 'cancel_requested', 'block_requested')"
+                )
         conn.commit()
+        _INITIALIZED_DB_FILES.add(db_identity)
+    return recovered
+
+
+def recover_interrupted_capture_jobs() -> int:
+    """Run the process-start recovery once for this database path."""
+    return init_consulting_agent_db()
 
 
 def _clean_text(value: str) -> str:
@@ -882,6 +1111,65 @@ def _asset_from_row(row) -> dict:
     }
 
 
+def _public_asset_text(value: str) -> str:
+    text = report_agent.sanitize_report_text(value or "")
+    text = re.sub(r"(?i)\b[A-Z]:[\\/][^\r\n\t]*", "[本地路径已隐藏]", text)
+    text = re.sub(r"\\\\[^\\/\s]+[\\/][^\r\n\t]*", "[本地路径已隐藏]", text)
+    text = re.sub(
+        r"(?i)(?:^|\s)/(?:Users|home|var|tmp|opt|mnt|Volumes)/[^\r\n\t]*",
+        " [本地路径已隐藏]",
+        text,
+    )
+    return text.strip()
+
+
+def _public_source_url(value: str) -> str:
+    url = str(value or "").strip()
+    if "\\" in url or not re.match(r"(?i)^https?://", url):
+        return ""
+    return url
+
+
+def source_asset_to_public_dto(asset: dict, *, download_url: str = "",
+                               download_token: str = "") -> dict:
+    """Return the browser-safe asset shape; filesystem paths remain internal."""
+    asset = asset or {}
+    payload = asset.get("payload") if isinstance(asset.get("payload"), dict) else {}
+    local_path = str(asset.get("local_path") or "")
+    text_path = str(asset.get("text_path") or "")
+    filename = os.path.basename(local_path) if local_path else ""
+    return {
+        "asset_id": str(asset.get("asset_id") or ""),
+        "evidence_id": str(asset.get("evidence_id") or ""),
+        "status": str(asset.get("status") or ""),
+        "filename": filename,
+        "saved": bool(
+            (local_path and os.path.isfile(local_path))
+            or (text_path and os.path.isfile(text_path))
+        ),
+        "download_url": str(download_url or ""),
+        "download_token": str(download_token or ""),
+        "source_url": _public_source_url(asset.get("url") or ""),
+        "title": _public_asset_text(payload.get("title") or payload.get("source_title") or ""),
+        "source": _public_asset_text(payload.get("source") or payload.get("domain") or ""),
+        "document_type": str(asset.get("document_type") or ""),
+        "content_type": str(asset.get("content_type") or ""),
+        "word_count": int(asset.get("word_count") or 0),
+        "checksum": str(asset.get("checksum") or ""),
+        "failure_reason": _public_asset_text(asset.get("failure_reason") or ""),
+        "failure_code": str(payload.get("failure_code") or ""),
+        "fetched_at": str(asset.get("fetched_at") or ""),
+    }
+
+
+def list_source_asset_public_dtos(session_id: str, evidence_ids: list[str] | None = None,
+                                  status: str | None = None) -> list[dict]:
+    return [
+        source_asset_to_public_dto(asset)
+        for asset in list_source_assets(session_id, evidence_ids=evidence_ids, status=status)
+    ]
+
+
 def _safe_asset_part(value: str, fallback: str = "source") -> str:
     text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (value or "").strip())
     text = re.sub(r"\s+", "_", text).strip("._ ")
@@ -1154,6 +1442,11 @@ def capture_asset_counts(session_id: str, target_count: int | None = None) -> di
 
 
 def _capture_job_from_row(row, attempts: list[dict] | None = None) -> dict:
+    stop_reason = (
+        report_agent.sanitize_public_payload(row["stop_reason"])
+        if row["status"] in {"cancel_requested", "block_requested", "cancelled", "blocked"}
+        else normalize_capture_stop_reason(row["stop_reason"])
+    )
     return {
         "job_id": row["job_id"],
         "session_id": row["session_id"],
@@ -1170,7 +1463,13 @@ def _capture_job_from_row(row, attempts: list[dict] | None = None) -> dict:
         "failed_count": row["failed_count"],
         "needs_user_input_count": row["needs_user_input_count"],
         "rejected_low_relevance": row["rejected_low_relevance"],
-        "stop_reason": normalize_capture_stop_reason(row["stop_reason"]),
+        "stop_reason": stop_reason,
+        "error": stop_reason,
+        "code": row["error_code"] or "",
+        "error_code": row["error_code"] or "",
+        "retryable": bool(row["retryable"]),
+        "idempotency_key": row["idempotency_key"] or "",
+        "idempotent_replay": False,
         "payload": _json_loads(row["payload_json"], {}),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -1198,30 +1497,61 @@ def _capture_attempt_from_row(row) -> dict:
 
 def create_capture_job(session_id: str, target_count: int, batch_size: int = 8,
                        max_rounds: int = 6, crawl_mode: str = "steady",
-                       allow_browser_render: bool = True, payload: dict | None = None) -> dict:
+                       allow_browser_render: bool = True, payload: dict | None = None,
+                       idempotency_key: str | None = None) -> dict:
     get_session(session_id)
     now = _now()
     job_id = _new_id("cj")
     counts = capture_asset_counts(session_id, target_count)
     init_consulting_agent_db()
+    idempotency_key = str(idempotency_key or "").strip()[:255]
+    existing_job_id = ""
     with _DB_LOCK, _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO capture_jobs
-            (job_id, session_id, status, target_count, batch_size, max_rounds, crawl_mode,
-             allow_browser_render, round_no, archived_count, partial_count, failed_count,
-             needs_user_input_count, rejected_low_relevance, payload_json, created_at, updated_at)
-            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?, ?)
-            """,
-            (
-                job_id, session_id, max(1, int(target_count or 1)), max(1, int(batch_size or 8)),
-                max(1, int(max_rounds or 6)), crawl_mode or "steady", 1 if allow_browser_render else 0,
-                counts["archived_count"], counts["partial_count"], counts["failed_count"],
-                counts["needs_user_input_count"], _json_dumps(payload or {}), now, now,
-            ),
-        )
-        _log_event(conn, session_id, "capture_job_created", {"job_id": job_id, "target_count": target_count})
+        conn.execute("BEGIN IMMEDIATE")
+        if idempotency_key:
+            existing = conn.execute(
+                "SELECT job_id FROM capture_jobs WHERE session_id=? AND idempotency_key=?",
+                (session_id, idempotency_key),
+            ).fetchone()
+            if existing:
+                existing_job_id = existing["job_id"]
+        if not existing_job_id:
+            active = conn.execute(
+                "SELECT job_id FROM capture_jobs "
+                "WHERE session_id=? AND status IN "
+                "('queued', 'running', 'cancel_requested', 'block_requested') "
+                "ORDER BY created_at LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if active:
+                raise ActiveTaskExistsError(active["job_id"])
+            conn.execute(
+                """
+                INSERT INTO capture_jobs
+                (job_id, session_id, status, target_count, batch_size, max_rounds, crawl_mode,
+                 allow_browser_render, round_no, archived_count, partial_count, failed_count,
+                 needs_user_input_count, rejected_low_relevance, idempotency_key,
+                 payload_json, created_at, updated_at)
+                VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, session_id, max(1, int(target_count or 1)), max(1, int(batch_size or 8)),
+                    max(1, int(max_rounds or 6)), crawl_mode or "steady", 1 if allow_browser_render else 0,
+                    counts["archived_count"], counts["partial_count"], counts["failed_count"],
+                    counts["needs_user_input_count"], idempotency_key,
+                    _json_dumps(payload or {}), now, now,
+                ),
+            )
+            _log_event(conn, session_id, "capture_job_created", {
+                "job_id": job_id,
+                "target_count": target_count,
+                "idempotency_key": idempotency_key,
+            })
         conn.commit()
+    if existing_job_id:
+        existing_job = get_capture_job(session_id, existing_job_id)
+        existing_job["idempotent_replay"] = True
+        return existing_job
     return get_capture_job(session_id, job_id)
 
 
@@ -1252,9 +1582,43 @@ def record_capture_attempt(job_id: str, session_id: str, round_no: int, query_te
     return attempts[-1]
 
 
+_CAPTURE_JOB_CONTROL_TERMINALS = {
+    "cancel_requested": "cancelled",
+    "block_requested": "blocked",
+}
+_CAPTURE_JOB_ALLOWED_TRANSITIONS = {
+    "queued": {"running", "failed"},
+    "running": {"completed", "failed"},
+    "cancel_requested": {"cancelled"},
+    "block_requested": {"blocked"},
+    "completed": set(),
+    "failed": set(),
+    "cancelled": set(),
+    "blocked": set(),
+}
+
+
+def _capture_job_transition_target(job_id: str, current: str, requested: str) -> tuple[str, bool]:
+    """Return the safe target and whether a worker terminal write was superseded."""
+    if requested == current:
+        return current, False
+    if current in _CAPTURE_JOB_CONTROL_TERMINALS and requested in {"completed", "failed"}:
+        return _CAPTURE_JOB_CONTROL_TERMINALS[current], True
+    if requested in _CAPTURE_JOB_ALLOWED_TRANSITIONS.get(current, set()):
+        return requested, False
+    raise InvalidTaskTransitionError(job_id, current, requested)
+
+
 def update_capture_job(job_id: str, status: str | None = None, round_no: int | None = None,
                        current_query: str | None = None, stop_reason: str | None = None,
-                       counts: dict | None = None, payload: dict | None = None) -> dict:
+                       counts: dict | None = None, payload: dict | None = None,
+                       error_code: str | None = None, retryable: bool | None = None) -> dict:
+    """Update progress fields while enforcing the persisted task state machine.
+
+    Status writes are serialized and compare-and-set against the current row. A
+    late worker completion/failure acknowledges pending control instead of
+    replacing ``cancel_requested``/``block_requested``.
+    """
     init_consulting_agent_db()
     counts = counts or {}
     if stop_reason is not None:
@@ -1280,12 +1644,218 @@ def update_capture_job(job_id: str, status: str | None = None, round_no: int | N
         params.append(_json_dumps(payload))
     params.append(job_id)
     with _DB_LOCK, _connect() as conn:
-        conn.execute(f"UPDATE capture_jobs SET {', '.join(updates)} WHERE job_id=?", params)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT session_id, status FROM capture_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not row:
+            raise KeyError("采集任务不存在")
+        effective_status = row["status"]
+        superseded = False
+        if status is not None:
+            effective_status, superseded = _capture_job_transition_target(
+                job_id, row["status"], status
+            )
+        updates = ["updated_at=?"]
+        params = [_now()]
+        if status is not None:
+            updates.append("status=?")
+            params.append(effective_status)
+        for field, value in (
+            ("round_no", round_no),
+            ("current_query", current_query),
+            ("archived_count", counts.get("archived_count")),
+            ("partial_count", counts.get("partial_count")),
+            ("failed_count", counts.get("failed_count")),
+            ("needs_user_input_count", counts.get("needs_user_input_count")),
+            ("rejected_low_relevance", counts.get("rejected_low_relevance")),
+        ):
+            if value is not None:
+                updates.append(f"{field}=?")
+                params.append(value)
+        # Preserve the user's control reason when a stale worker tries to fail.
+        if stop_reason is not None and not superseded:
+            updates.append("stop_reason=?")
+            params.append(stop_reason)
+        if error_code is not None and not superseded:
+            updates.append("error_code=?")
+            params.append(error_code)
+        if retryable is not None and not superseded:
+            updates.append("retryable=?")
+            params.append(1 if retryable else 0)
+        if superseded:
+            updates.extend(["error_code=''", "retryable=0"])
+        if payload is not None:
+            updates.append("payload_json=?")
+            params.append(_json_dumps(payload))
+        params.extend([job_id, row["status"]])
+        changed = conn.execute(
+            f"UPDATE capture_jobs SET {', '.join(updates)} WHERE job_id=? AND status=?",
+            params,
+        ).rowcount
+        if changed != 1:
+            raise InvalidTaskTransitionError(job_id, row["status"], status or row["status"])
+        if superseded:
+            _log_event(
+                conn,
+                row["session_id"],
+                f"capture_job_{effective_status}",
+                {"job_id": job_id, "superseded_worker_status": status},
+            )
         conn.commit()
-        row = conn.execute("SELECT session_id FROM capture_jobs WHERE job_id=?", (job_id,)).fetchone()
-    if not row:
-        raise KeyError("采集任务不存在")
     return get_capture_job(row["session_id"], job_id)
+
+
+def claim_capture_job(session_id: str, job_id: str) -> dict:
+    """Atomically claim exactly one queued capture job for a worker."""
+    init_consulting_agent_db()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status FROM capture_jobs WHERE session_id=? AND job_id=?",
+            (session_id, job_id),
+        ).fetchone()
+        if not row:
+            raise KeyError("采集任务不存在")
+        if row["status"] != "queued":
+            raise InvalidTaskTransitionError(job_id, row["status"], "running")
+        now = _now()
+        changed = conn.execute(
+            "UPDATE capture_jobs SET status='running', updated_at=? "
+            "WHERE session_id=? AND job_id=? AND status='queued'",
+            (now, session_id, job_id),
+        ).rowcount
+        if changed != 1:
+            raise InvalidTaskTransitionError(job_id, "queued", "running")
+        _log_event(conn, session_id, "capture_job_started", {"job_id": job_id})
+        conn.commit()
+    return get_capture_job(session_id, job_id)
+
+
+def _request_capture_job_control(
+    session_id: str, job_id: str, action: str, reason: str = ""
+) -> dict:
+    if action not in {"cancel", "block"}:
+        raise ValueError("未知任务控制操作")
+    requested = f"{action}_requested"
+    terminal = "cancelled" if action == "cancel" else "blocked"
+    reason = report_agent.sanitize_public_payload(_clean_text(reason or ""))[:500]
+    if not reason:
+        reason = "用户取消任务" if action == "cancel" else "用户人工阻断任务"
+    init_consulting_agent_db()
+    unchanged = False
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status FROM capture_jobs WHERE session_id=? AND job_id=?",
+            (session_id, job_id),
+        ).fetchone()
+        if not row:
+            raise KeyError("采集任务不存在")
+        current = row["status"]
+        if current in {requested, terminal}:
+            unchanged = True
+        elif current == "queued":
+            target = terminal
+        elif current == "running":
+            target = requested
+        else:
+            raise InvalidTaskTransitionError(job_id, current, requested)
+        if not unchanged:
+            now = _now()
+            changed = conn.execute(
+                "UPDATE capture_jobs SET status=?, stop_reason=?, error_code='', retryable=0, updated_at=? "
+                "WHERE session_id=? AND job_id=? AND status=?",
+                (target, reason, now, session_id, job_id, current),
+            ).rowcount
+            if changed != 1:
+                raise InvalidTaskTransitionError(job_id, current, target)
+            _log_event(
+                conn,
+                session_id,
+                f"capture_job_{target}",
+                {"job_id": job_id, "reason": reason},
+            )
+        conn.commit()
+    return get_capture_job(session_id, job_id)
+
+
+def request_capture_job_cancel(session_id: str, job_id: str, reason: str = "") -> dict:
+    return _request_capture_job_control(session_id, job_id, "cancel", reason)
+
+
+def request_capture_job_block(session_id: str, job_id: str, reason: str = "") -> dict:
+    return _request_capture_job_control(session_id, job_id, "block", reason)
+
+
+def checkpoint_capture_job(session_id: str, job_id: str) -> dict:
+    """Read worker state and atomically acknowledge a pending control request."""
+    init_consulting_agent_db()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status FROM capture_jobs WHERE session_id=? AND job_id=?",
+            (session_id, job_id),
+        ).fetchone()
+        if not row:
+            raise KeyError("采集任务不存在")
+        current = row["status"]
+        target = _CAPTURE_JOB_CONTROL_TERMINALS.get(current)
+        if target:
+            now = _now()
+            changed = conn.execute(
+                "UPDATE capture_jobs SET status=?, error_code='', retryable=0, updated_at=? "
+                "WHERE session_id=? AND job_id=? AND status=?",
+                (target, now, session_id, job_id, current),
+            ).rowcount
+            if changed == 1:
+                _log_event(
+                    conn,
+                    session_id,
+                    f"capture_job_{target}",
+                    {"job_id": job_id, "acknowledged_at_checkpoint": True},
+                )
+        conn.commit()
+    return get_capture_job(session_id, job_id)
+
+
+def retry_capture_job(session_id: str, job_id: str) -> dict:
+    """Atomically requeue one retryable failed job without deleting attempts or assets."""
+    init_consulting_agent_db()
+    now = _now()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status, retryable, error_code FROM capture_jobs WHERE session_id=? AND job_id=?",
+            (session_id, job_id),
+        ).fetchone()
+        if not row:
+            raise KeyError("采集任务不存在")
+        if row["status"] != "failed" or not bool(row["retryable"]):
+            raise TaskNotRetryableError(job_id, row["status"])
+        active = conn.execute(
+            "SELECT job_id FROM capture_jobs "
+            "WHERE session_id=? AND job_id<>? AND status IN "
+            "('queued', 'running', 'cancel_requested', 'block_requested') "
+            "ORDER BY created_at LIMIT 1",
+            (session_id, job_id),
+        ).fetchone()
+        if active:
+            raise ActiveTaskExistsError(active["job_id"])
+        conn.execute(
+            "UPDATE capture_jobs "
+            "SET status='queued', round_no=0, current_query='', stop_reason='', "
+            "error_code='', retryable=0, updated_at=? WHERE session_id=? AND job_id=?",
+            (now, session_id, job_id),
+        )
+        _log_event(
+            conn,
+            session_id,
+            "capture_job_retried",
+            {"job_id": job_id, "previous_error_code": row["error_code"] or ""},
+        )
+        conn.commit()
+    return get_capture_job(session_id, job_id)
 
 
 def _get_capture_attempts(job_id: str) -> list[dict]:
@@ -1347,17 +1917,42 @@ def _rss_candidates(rows: list[dict]) -> list[dict]:
 
 
 def _imported_candidates(rows: list[dict]) -> list[dict]:
-    return [{
-        "title": row.get("title") or "用户导入素材",
-        "source": row.get("source") or "用户导入",
-        "published_at": row.get("published_at") or row.get("date") or "",
-        "url": row.get("url") or row.get("link") or "",
-        "channel": "imported",
-        "score": row.get("score") or 78,
-        "reason": "用户导入素材",
-        "snippet": row.get("snippet") or row.get("summary") or row.get("body") or "",
-        "payload": row,
-    } for row in rows or []]
+    candidates = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        title = report_agent.sanitize_report_text(row.get("title") or "用户导入素材")[:300]
+        source = report_agent.sanitize_report_text(row.get("source") or "用户导入")[:200]
+        body = report_agent.sanitize_report_text(
+            row.get("text") or row.get("body") or row.get("snippet") or row.get("summary") or ""
+        )[:12000]
+        published_at = report_agent.sanitize_report_text(
+            row.get("published_at") or row.get("date") or ""
+        )[:80]
+        url = str(row.get("url") or row.get("link") or "").strip()[:2000]
+        payload = {
+            "title": title,
+            "source": source,
+            "published_at": published_at,
+            "url": url,
+            "text": body,
+            "document_type": report_agent.sanitize_report_text(
+                row.get("document_type") or "text"
+            )[:40],
+            "untrusted_source_data": True,
+        }
+        candidates.append({
+            "title": title,
+            "source": source,
+            "published_at": published_at,
+            "url": url,
+            "channel": "imported",
+            "score": row.get("score") or 78,
+            "reason": "用户导入素材",
+            "snippet": body[:1200],
+            "payload": payload,
+        })
+    return candidates
 
 
 def collect_candidates(session: dict, web_results: list[dict], rss_candidates: list[dict],
@@ -1646,12 +2241,29 @@ def record_query(session_id: str, channel: str, query_text: str, result_count: i
 def _evidence_lines(evidence: list[dict]) -> str:
     lines = []
     for idx, ev in enumerate(evidence, 1):
+        payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+        body = next((
+            payload[field][:12000]
+            for field in ("text", "body", "full_text", "content", "extracted_text")
+            if isinstance(payload.get(field), str) and payload[field].strip()
+        ), "")
+        source_data = {
+            "citation": f"[{idx}]",
+            "channel": ev.get("channel") or "source",
+            "source": ev.get("source") or "公开来源",
+            "title": ev.get("title") or "",
+            "published_at": ev.get("published_at") or "未知",
+            "url": ev.get("url") or "无",
+            "score": ev.get("score") or 0,
+            "reason": ev.get("reason") or "公开来源",
+            "summary": ev.get("snippet") or "无摘要",
+            "body": body,
+        }
+        serialized = _json_dumps(source_data).replace("<<<", "＜＜＜").replace(">>>", "＞＞＞")
         lines.append(
-            f"[{idx}] 【{ev.get('channel') or 'source'}｜{ev.get('source') or '公开来源'}】{ev.get('title')}\n"
-            f"    时间：{ev.get('published_at') or '未知'}\n"
-            f"    链接：{ev.get('url') or '无'}\n"
-            f"    可信度：{ev.get('score') or 0}；推荐理由：{ev.get('reason') or '公开来源'}\n"
-            f"    摘要：{ev.get('snippet') or '无摘要'}"
+            f"<<<BEGIN_UNTRUSTED_SOURCE_DATA:{idx}>>>\n"
+            f"{serialized}\n"
+            f"<<<END_UNTRUSTED_SOURCE_DATA:{idx}>>>"
         )
     return "\n".join(lines)
 
@@ -1668,6 +2280,7 @@ def build_synthesis_messages(session: dict, evidence: list[dict], writing_requir
                 "所有事实性判断必须来自证据池，每个关键判断必须绑定来源编号。"
                 "严禁使用“秘密”“机密”“绝密”这三个涉密等级字眼。"
                 "证据不足时必须标注来源不足或待后续检索，不得编造机构、日期、数据、链接和引用。"
+                f"{report_agent.UNTRUSTED_SOURCE_POLICY}"
             ),
         },
         {

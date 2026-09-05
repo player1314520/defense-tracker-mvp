@@ -11,6 +11,44 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_desktop_login_wait_rejects_structured_not_ready_result(tmp_path):
+    env = os.environ.copy()
+    env["DEFENSE_TRACKER_HOME"] = str(tmp_path / "runtime")
+    probe = r"""
+import launcher
+import app
+
+assert launcher._start_scheduler_once is app._start_scheduler_once
+
+launcher._wait_for_flask = lambda: (
+    False,
+    {"ready": False, "code": "READY_TIMEOUT"},
+)
+launcher.get_desktop_bootstrap_token = lambda: (_ for _ in ()).throw(
+    AssertionError("bootstrap token requested before readiness")
+)
+try:
+    launcher._prepare_desktop_login_url()
+except RuntimeError as exc:
+    assert str(exc) == "桌面服务启动超时"
+    assert exc.diagnostic == {"ready": False, "code": "READY_TIMEOUT"}
+else:
+    raise AssertionError("not-ready tuple was treated as truthy")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_desktop_smoke_route_requires_session_origin_csrf_and_edge(tmp_path):
     env = os.environ.copy()
     env.update(
