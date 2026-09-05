@@ -233,21 +233,18 @@ def validate_docx(
     )
 
 
-def _pdf_reader_type():
+def _pdf_parser_types():
     try:
-        from pypdf import PdfReader
+        from pdfminer.pdfdocument import PDFDocument, PDFEncryptionError
+        from pdfminer.pdfpage import PDFPage
+        from pdfminer.pdfparser import PDFParser
 
-        return PdfReader
-    except ImportError:
-        try:
-            from PyPDF2 import PdfReader
-
-            return PdfReader
-        except ImportError as exc:
-            raise UploadValidationError(
-                "PDF_PARSER_UNAVAILABLE",
-                "PDF 安全解析器不可用",
-            ) from exc
+        return PDFParser, PDFDocument, PDFPage, PDFEncryptionError
+    except ImportError as exc:
+        raise UploadValidationError(
+            "PDF_PARSER_UNAVAILABLE",
+            "PDF 安全解析器不可用",
+        ) from exc
 
 
 def validate_pdf(
@@ -264,14 +261,16 @@ def validate_pdf(
     if not payload.startswith(b"%PDF-"):
         raise UploadValidationError("PDF_MAGIC_MISMATCH", "PDF 文件头无效")
 
-    PdfReader = _pdf_reader_type()
+    PDFParser, PDFDocument, PDFPage, PDFEncryptionError = _pdf_parser_types()
     try:
-        reader = PdfReader(BytesIO(payload), strict=True)
-        if getattr(reader, "is_encrypted", False):
+        reader = PDFDocument(PDFParser(BytesIO(payload)), fallback=False)
+        if reader.encryption is not None:
             raise UploadValidationError("PDF_ENCRYPTED", "不支持加密 PDF")
-        page_count = len(reader.pages)
+        page_count = sum(1 for _ in PDFPage.create_pages(reader))
     except UploadValidationError:
         raise
+    except PDFEncryptionError as exc:
+        raise UploadValidationError("PDF_ENCRYPTED", "不支持加密 PDF") from exc
     except Exception as exc:
         raise UploadValidationError("PDF_PARSE_ERROR", "PDF 无法安全解析") from exc
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from io import BytesIO
 import zipfile
 
@@ -25,11 +26,13 @@ def _docx_bytes(*, extra_entries: dict[str, bytes] | None = None) -> bytes:
     return output.getvalue()
 
 
-def _pdf_bytes(page_count: int) -> bytes:
+def _pdf_bytes(page_count: int, *, password: str | None = None) -> bytes:
     from reportlab.pdfgen.canvas import Canvas
+    from reportlab.lib.pdfencrypt import StandardEncryption
 
     output = BytesIO()
-    writer = Canvas(output, pagesize=(72, 72))
+    encryption = None if password is None else StandardEncryption(password, ownerPassword="owner")
+    writer = Canvas(output, pagesize=(72, 72), encrypt=encryption)
     for _ in range(page_count):
         writer.showPage()
     writer.save()
@@ -139,6 +142,35 @@ def test_validate_pdf_accepts_valid_minimal_sample() -> None:
     assert result.archive_entries is None
 
 
+def test_validate_pdf_uses_only_locked_parser_dependencies(monkeypatch) -> None:
+    payload = _pdf_bytes(1)
+    original_import = builtins.__import__
+
+    def locked_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"pypdf", "PyPDF2"}:
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", locked_import)
+
+    assert validate_pdf(payload, max_pages=1).page_count == 1
+
+
+@pytest.mark.parametrize("password", ["", "secret"])
+def test_validate_pdf_rejects_encryption_even_with_empty_password(password) -> None:
+    with pytest.raises(UploadValidationError) as caught:
+        validate_pdf(_pdf_bytes(1, password=password))
+
+    assert caught.value.code == "PDF_ENCRYPTED"
+
+
+def test_validate_pdf_rejects_invalid_structure() -> None:
+    with pytest.raises(UploadValidationError) as caught:
+        validate_pdf(b"%PDF-1.7\nnot a document\n%%EOF")
+
+    assert caught.value.code == "PDF_PARSE_ERROR"
+
+
 def test_validate_pdf_rejects_page_limit() -> None:
     with pytest.raises(UploadValidationError) as caught:
         validate_pdf(_pdf_bytes(3), max_pages=2)
@@ -182,7 +214,7 @@ def test_parent_envelope_pdf_check_does_not_load_pdf_parser(monkeypatch) -> None
 
     monkeypatch.setattr(
         upload_safety,
-        "_pdf_reader_type",
+        "_pdf_parser_types",
         lambda: (_ for _ in ()).throw(
             AssertionError("parent envelope check must not inspect PDF structure")
         ),
