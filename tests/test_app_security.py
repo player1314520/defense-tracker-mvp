@@ -1230,7 +1230,7 @@ def test_ai_config_rejects_unknown_provider_and_model(client):
     )
 
     assert response.status_code == 400
-    assert "provider" in response.get_json()["error"].lower()
+    assert response.get_json()["code"] == "UNSUPPORTED_AI_PROVIDER"
 
 
 def test_ai_settings_ui_exposes_only_the_fixed_mvp_registry():
@@ -1796,6 +1796,92 @@ def test_auth_rate_limit_applies_to_authenticated_endpoint(monkeypatch, client):
     resp = client.get("/api/status")
     assert resp.status_code == 429
     assert "请求过于频繁" in resp.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("route", "function_name", "error", "data", "expected_code"),
+    [
+        ("/api/ai/config", "resolve_provider", tracker.UnsupportedAiProvider,
+         {"provider": "deepseek", "model": "deepseek-v4-flash"}, "UNSUPPORTED_AI_PROVIDER"),
+        ("/api/quality/feedback", "record_quality_feedback", ValueError,
+         {"label": "accepted", "article_id": "test"}, "INVALID_ARGUMENT"),
+        ("/api/translate", "_call_ai", tracker.AIBudgetExceeded,
+         {"text": "test"}, "AI_BUDGET_EXCEEDED"),
+    ],
+)
+def test_api_error_does_not_expose_arbitrary_exception_text(
+    monkeypatch, client, route, function_name, error, data, expected_code
+):
+    secret = "TRACEBACK internal-record-unsafe-token@example.invalid"
+
+    def fail(*args, **kwargs):
+        raise error(secret)
+
+    monkeypatch.setattr(tracker, function_name, fail)
+    monkeypatch.setattr(tracker, "_ai_is_enabled", lambda: True)
+    response = client.post(
+        route, json=data, headers={tracker.CSRF_HEADER: _csrf_cookie(client)},
+    )
+
+    assert response.status_code in (400, 429)
+    assert response.get_json()["code"] == expected_code
+    assert secret not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize("agent", [tracker.consulting_agent, tracker.report_agent])
+@pytest.mark.parametrize(
+    ("error_type", "args", "message"),
+    [
+        ("ActiveTaskExistsError", ("job-1",), "已有活跃任务，请等待当前任务完成"),
+        ("TaskQueueFullError", (5,), "后台任务队列已满，请稍后重试"),
+        ("TaskNotRetryableError", ("job-1", "done"), "任务当前状态不可重试"),
+        ("InvalidTaskTransitionError", ("job-1", "done", "running"), "任务状态转换无效"),
+    ],
+)
+def test_task_api_error_uses_fixed_business_message(agent, error_type, args, message):
+    error = getattr(agent, error_type)(*args)
+    error.args = ("TRACEBACK internal-record-unsafe-token@example.invalid",)
+    handler = (
+        tracker._consult_error_response
+        if agent is tracker.consulting_agent else tracker._agent_error_response
+    )
+    with tracker.app.test_request_context():
+        response, status = handler(error)
+    assert status in (409, 503)
+    assert response.get_json()["error"] == message
+    assert "TRACEBACK" not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("DOCUMENT_PARSER_ISOLATION_FAILED", "文档隔离解析环境不可用"),
+        ("DOCUMENT_PARSE_QUEUE_FULL", "文档解析队列已满，请稍后重试"),
+    ],
+)
+def test_consult_parser_failure_uses_fixed_business_message(code, message):
+    error = tracker.search_adapters.RemoteDocumentError(
+        code, "TRACEBACK internal-record-unsafe-token@example.invalid",
+        details={"retry_after": 5},
+    )
+    with tracker.app.test_request_context():
+        response, status = tracker._consult_error_response(error)
+    assert status == 503
+    assert response.get_json()["error"] == message
+    assert response.headers["Retry-After"] == "5"
+
+
+def test_draft_failure_log_never_interpolates_untrusted_job_id(monkeypatch, caplog):
+    job_id = "job-1\r\nFORGED_LOG_ENTRY"
+    monkeypatch.setattr(
+        tracker.report_agent, "get_draft_job",
+        lambda *args: (_ for _ in ()).throw(ValueError("synthetic error")),
+    )
+    monkeypatch.setattr(tracker.report_agent, "update_draft_job", lambda *args, **kwargs: None)
+    with caplog.at_level("ERROR"):
+        tracker._run_agent_draft_job("project-1", job_id)
+    assert "error_type=ValueError" in caplog.text
+    assert "FORGED_LOG_ENTRY" not in caplog.text
 
 
 def test_ssrf_rejects_private_ip():

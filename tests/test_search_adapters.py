@@ -10,13 +10,13 @@ import search_adapters
 
 
 def _pdf_bytes(page_count: int) -> bytes:
-    from pypdf import PdfWriter
+    from reportlab.pdfgen.canvas import Canvas
 
     output = BytesIO()
-    writer = PdfWriter()
+    writer = Canvas(output, pagesize=(72, 72))
     for _ in range(page_count):
-        writer.add_blank_page(width=72, height=72)
-    writer.write(output)
+        writer.showPage()
+    writer.save()
     return output.getvalue()
 
 

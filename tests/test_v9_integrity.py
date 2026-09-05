@@ -409,7 +409,7 @@ def test_recalled_publication_requires_audit_mode_and_contains_recall_marks(
 def test_recalled_pdf_audit_artifact_is_marked_in_metadata_and_visible_text(
     tmp_path,
 ):
-    from pypdf import PdfReader
+    import pdfplumber
 
     service, context, publication = _ready_publication(tmp_path, recalled=True)
 
@@ -419,10 +419,11 @@ def test_recalled_pdf_audit_artifact_is_marked_in_metadata_and_visible_text(
         "pdf",
         mode="audit",
     )
-    pdf = PdfReader(BytesIO(payload))
-    text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    with pdfplumber.open(BytesIO(payload)) as pdf:
+        title = pdf.metadata.get("Title") or ""
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-    assert "已撤回-审计件" in (pdf.metadata.title or "")
+    assert "已撤回-审计件" in title
     assert "已撤回" in text
     assert "撤回回执" in text
     assert "来源状态需要重新确认" in text

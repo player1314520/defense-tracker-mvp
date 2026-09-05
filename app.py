@@ -2693,8 +2693,8 @@ def api_ai_config_set():
             previous_selection = resolve_provider(
                 AI_CONFIG.get("provider"), AI_CONFIG.get("model"),
             )
-        except UnsupportedAiProvider as exc:
-            return jsonify({"error": str(exc)}), 400
+        except UnsupportedAiProvider:
+            return _api_error("不支持的 AI 服务或模型", "UNSUPPORTED_AI_PROVIDER", 400)
         candidate = dict(AI_CONFIG)
         previous_origin = _url_origin(
             candidate.get("base_url") or previous_selection.endpoint
@@ -5423,8 +5423,8 @@ def api_quality_feedback():
         except Exception as e:
             logger.warning("质量偏好自动重算失败（反馈已记录）: %s", e)
         return jsonify({"ok": True, **result})
-    except ValueError as e:
-        return _api_error(_safe_exception_text(e), "INVALID_ARGUMENT", 400)
+    except ValueError:
+        return _api_error("反馈参数无效", "INVALID_ARGUMENT", 400)
 
 @app.route("/api/quality/retrain", methods=["POST"])
 @require_auth
@@ -5613,8 +5613,8 @@ def api_translate():
         if not translation:
             return _api_error("翻译为空", "AI_EMPTY_RESPONSE", 502, retryable=True)
         return jsonify({"translation": translation})
-    except AIBudgetExceeded as e:
-        return _api_error(_safe_exception_text(e), "AI_BUDGET_EXCEEDED", 429)
+    except AIBudgetExceeded:
+        return _api_error("AI 调用额度已用尽或已暂停", "AI_BUDGET_EXCEEDED", 429)
     except Exception as e:
         logger.warning("AI 翻译失败 error_type=%s", type(e).__name__)
         return jsonify({"error": "翻译失败", "code": "ai_error"}), 502
@@ -5660,13 +5660,41 @@ def _consult_public_value_error_message(error: ValueError) -> str:
     return "请求参数无效"
 
 
+def _document_public_error_message(code: str) -> str:
+    """Map parser codes to trusted UI text; never return worker diagnostics."""
+    return {
+        "DOCUMENT_PARSER_ISOLATION_FAILED": "文档隔离解析环境不可用",
+        "DOCUMENT_PARSE_QUEUE_FULL": "文档解析队列已满，请稍后重试",
+        "DOCUMENT_PARSE_TIMEOUT": "文档解析超时，已终止隔离解析进程",
+        "DOCUMENT_PARSE_FAILED": "文档无法安全解析",
+        "UPLOAD_TOO_LARGE": "上传文件超过大小限制",
+        "UPLOAD_PARSE_TIMEOUT": "文档解析超时，已终止隔离解析进程",
+        "UNSUPPORTED_UPLOAD_TYPE": "仅支持 DOCX 和 PDF 文件",
+        "DOCX_MAGIC_MISMATCH": "DOCX 文件头无效",
+        "DOCX_ARCHIVE_INVALID": "DOCX 压缩包无法解析",
+        "DOCX_ENTRY_LIMIT_EXCEEDED": "DOCX 条目数超过限制",
+        "DOCX_UNSAFE_PATH": "DOCX 包含不安全的归档路径",
+        "DOCX_ENCRYPTED": "不支持加密 DOCX",
+        "DOCX_MEMBER_LIMIT_EXCEEDED": "DOCX 单个条目解压后过大",
+        "DOCX_COMPRESSION_RATIO_EXCEEDED": "DOCX 单个条目压缩比超过限制",
+        "DOCX_UNCOMPRESSED_LIMIT_EXCEEDED": "DOCX 解压总量超过限制",
+        "DOCX_TOTAL_COMPRESSION_RATIO_EXCEEDED": "DOCX 总压缩比超过限制",
+        "DOCX_REQUIRED_PART_MISSING": "DOCX 缺少必要的 Word 组件",
+        "PDF_MAGIC_MISMATCH": "PDF 文件头无效",
+        "PDF_ENCRYPTED": "不支持加密 PDF",
+        "PDF_PARSE_ERROR": "PDF 无法安全解析",
+        "PDF_PARSER_UNAVAILABLE": "PDF 安全解析器不可用",
+        "PDF_PAGE_LIMIT_EXCEEDED": "PDF 页数超过限制",
+    }.get(code, "文件未通过安全校验，请检查文件格式和内容")
+
+
 def _consult_error_response(e: Exception):
     if isinstance(e, search_adapters.RemoteDocumentError) and e.code in {
         "DOCUMENT_PARSER_ISOLATION_FAILED",
         "DOCUMENT_PARSE_QUEUE_FULL",
     }:
         response, status = _api_error(
-            e.message,
+            _document_public_error_message(e.code),
             e.code,
             503,
             retryable=True,
@@ -5678,28 +5706,28 @@ def _consult_error_response(e: Exception):
         return response, status
     if isinstance(e, consulting_agent.ActiveTaskExistsError):
         return _api_error(
-            _safe_exception_text(e),
+            "已有活跃任务，请等待当前任务完成",
             e.code,
             409,
             details={"existing_job_id": e.existing_job_id},
         )
     if isinstance(e, consulting_agent.TaskQueueFullError):
         response, status = _api_error(
-            _safe_exception_text(e), e.code, 503, retryable=True,
+            "后台任务队列已满，请稍后重试", e.code, 503, retryable=True,
             details={"retry_after": e.retry_after},
         )
         response.headers["Retry-After"] = str(e.retry_after)
         return response, status
     if isinstance(e, consulting_agent.TaskNotRetryableError):
         return _api_error(
-            _safe_exception_text(e),
+            "任务当前状态不可重试",
             e.code,
             409,
             details={"job_id": e.job_id, "status": e.status},
         )
     if isinstance(e, consulting_agent.InvalidTaskTransitionError):
         return _api_error(
-            _safe_exception_text(e),
+            "任务状态转换无效",
             e.code,
             409,
             details={
@@ -7446,7 +7474,7 @@ def api_consult_capture_to_target(session_id):
                     consulting_agent.update_capture_job(
                         job["job_id"],
                         status="failed",
-                        stop_reason=_safe_exception_text(exc),
+                        stop_reason="后台任务队列已满，请稍后重试",
                         error_code=exc.code,
                         retryable=True,
                     )
@@ -7492,7 +7520,7 @@ def api_consult_capture_job_retry(session_id, job_id):
                 consulting_agent.update_capture_job(
                     job_id,
                     status="failed",
-                    stop_reason=_safe_exception_text(exc),
+                    stop_reason="后台任务队列已满，请稍后重试",
                     error_code=exc.code,
                     retryable=True,
                 )
@@ -7836,26 +7864,26 @@ def _agent_public_value_error_message(error: ValueError) -> str:
 def _agent_error_response(e: Exception):
     if isinstance(e, report_agent.ActiveTaskExistsError):
         return _api_error(
-            _safe_exception_text(e), e.code, 409,
+            "已有活跃任务，请等待当前任务完成", e.code, 409,
             details={"existing_job_id": e.existing_job_id},
         )
     if isinstance(e, report_agent.TaskQueueFullError):
         response, status = _api_error(
-            _safe_exception_text(e), e.code, 503, retryable=True,
+            "后台任务队列已满，请稍后重试", e.code, 503, retryable=True,
             details={"retry_after": e.retry_after},
         )
         response.headers["Retry-After"] = str(e.retry_after)
         return response, status
     if isinstance(e, report_agent.TaskNotRetryableError):
         return _api_error(
-            _safe_exception_text(e),
+            "任务当前状态不可重试",
             e.code,
             409,
             details={"job_id": e.job_id, "status": e.status},
         )
     if isinstance(e, report_agent.InvalidTaskTransitionError):
         return _api_error(
-            _safe_exception_text(e),
+            "任务状态转换无效",
             e.code,
             409,
             details={
@@ -8152,7 +8180,7 @@ def _run_agent_draft_job(project_id: str, job_id: str):
     except Exception as exc:
         error_type = type(exc).__name__
         logger.error(
-            "报告草稿任务 %s 失败 error_type=%s", job_id, error_type
+            "报告草稿任务失败 error_type=%s", error_type
         )
         try:
             report_agent.update_draft_job(
@@ -8214,7 +8242,7 @@ def api_agent_project_draft(project_id):
                     report_agent.update_draft_job(
                         job["job_id"],
                         status="failed",
-                        error=_safe_exception_text(exc),
+                        error="后台任务队列已满，请稍后重试",
                         error_code=exc.code,
                         retryable=True,
                     )
@@ -8263,7 +8291,7 @@ def api_agent_draft_job_retry(project_id, job_id):
                 report_agent.update_draft_job(
                     job_id,
                     status="failed",
-                    error=_safe_exception_text(exc),
+                    error="后台任务队列已满，请稍后重试",
                     error_code=exc.code,
                     retryable=True,
                 )
@@ -8885,7 +8913,7 @@ def api_brief_import_file():
         })
     except IsolatedDocumentParseError as e:
         response, status = _api_error(
-            e.message,
+            _document_public_error_message(e.code),
             e.code,
             503,
             retryable=True,
@@ -8896,7 +8924,7 @@ def api_brief_import_file():
             response.headers["Retry-After"] = str(retry_after)
         return response, status
     except UploadValidationError as e:
-        return _api_error(e.message, e.code, 400, details=e.details)
+        return _api_error(_document_public_error_message(e.code), e.code, 400, details=e.details)
     except ValueError as e:
         logger.warning("Import file rejected error_type=%s", _brief_error_type(e))
         return jsonify({"error": "文件处理失败，请检查文件格式和内容"}), 400

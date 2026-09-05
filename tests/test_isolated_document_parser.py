@@ -1,6 +1,8 @@
 import subprocess
 import sys
 import json
+import os
+import tempfile
 import threading
 from io import BytesIO
 from pathlib import Path
@@ -246,11 +248,13 @@ def test_worker_job_handle_is_released_after_success(monkeypatch):
 
     job = FakeJob()
 
-    def fake_popen(command, **_kwargs):
-        meta = json.loads(Path(command[-3]).read_text(encoding="utf-8"))
-        observed["gate"] = Path(meta["start_gate"])
+    def fake_popen(command, **kwargs):
+        request_root = Path(kwargs["cwd"])
+        meta = json.loads((request_root / command[-3]).read_text(encoding="utf-8"))
+        assert meta["wait_for_start"] is True
+        observed["gate"] = request_root / "worker.start"
         assert observed["gate"].exists() is False
-        Path(command[-1]).write_text(
+        (request_root / command[-1]).write_text(
             json.dumps(
                 {
                     "status": "ok",
@@ -276,3 +280,74 @@ def test_worker_job_handle_is_released_after_success(monkeypatch):
     assert parsed["text"] == "isolated result"
     assert observed["bound_before_gate"] is True
     assert job.closed is True
+
+
+@pytest.fixture
+def worker_directory(monkeypatch):
+    with tempfile.TemporaryDirectory(prefix="defensetracker-parser-") as directory:
+        with monkeypatch.context() as scoped:
+            scoped.chdir(directory)
+            Path("request.json").write_text(
+                json.dumps({"kind": "docx", "filename": "safe.docx", "limits": {}}),
+                encoding="utf-8",
+            )
+            Path("input.bin").write_bytes(_docx_bytes("controlled input"))
+            yield Path(directory)
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("supplied_path", ["../outside", "nested/file", "C:/outside"])
+def test_worker_rejects_paths_before_any_read_or_write(
+    worker_directory, index, supplied_path, monkeypatch
+):
+    def unexpected_read(*_args):
+        pytest.fail("invalid worker arguments must not open any input")
+
+    monkeypatch.setattr(isolated_document_parser, "_read_worker_file", unexpected_read)
+    arguments = ["request.json", "input.bin", "result.json"]
+    arguments[index] = supplied_path
+    assert isolated_document_parser.worker_file_entry(*arguments) == 64
+    assert not Path("result.json").exists()
+
+
+def test_worker_rejects_uncontrolled_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert isolated_document_parser.worker_file_entry(
+        "request.json", "input.bin", "result.json"
+    ) == 64
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_worker_rejects_existing_result_without_overwriting(worker_directory):
+    Path("result.json").write_bytes(b"preserve existing file")
+    assert isolated_document_parser.worker_file_entry(
+        "request.json", "input.bin", "result.json"
+    ) == 64
+    assert Path("result.json").read_bytes() == b"preserve existing file"
+
+
+def test_worker_rejects_hardlinked_input(worker_directory):
+    os.link("input.bin", "linked-input.bin")
+    assert isolated_document_parser.worker_file_entry(
+        "request.json", "input.bin", "result.json"
+    ) == 3
+    result = json.loads(Path("result.json").read_text(encoding="utf-8"))
+    assert result["code"] == "DOCUMENT_PARSE_FAILED"
+
+
+def test_worker_rejects_symlinked_metadata(worker_directory):
+    Path("request.json").rename("original-request.json")
+    try:
+        Path("request.json").symlink_to("original-request.json")
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc.__class__.__name__}")
+    assert isolated_document_parser.worker_file_entry(
+        "request.json", "input.bin", "result.json"
+    ) == 3
+
+
+def test_upload_filename_cannot_choose_worker_paths():
+    result = parse_document_isolated(
+        "docx", _docx_bytes("in-memory upload"), "../../outside.docx", timeout=10
+    )
+    assert result["text"] == "in-memory upload"

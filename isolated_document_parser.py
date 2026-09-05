@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -243,36 +244,73 @@ def _parse_document(kind: str, content: bytes, filename: str, limits: dict) -> d
     return {"title": _bounded_title(text, filename), "text": text}
 
 
-def _write_result(path: str, payload: dict) -> None:
-    Path(path).write_text(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+def _worker_directory_valid() -> bool:
+    root = Path.cwd()
+    root_stat = root.lstat()
+    if (
+        root.parent != Path(tempfile.gettempdir()).resolve()
+        or not re.fullmatch(r"defensetracker-parser-[A-Za-z0-9_-]+", root.name)
+        or not stat.S_ISDIR(root_stat.st_mode)
+        or getattr(root_stat, "st_file_attributes", 0) & 0x400
+    ):
+        return False
+    if os.name != "nt" and (
+        root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o077
+    ):
+        return False
+    return True
+
+
+def _read_worker_file(name: str, limit: int) -> bytes:
+    before = os.lstat(name)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or getattr(before, "st_file_attributes", 0) & 0x400
+    ):
+        raise ValueError("parser request must be a regular private file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(name, flags), "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("parser request changed while opening")
+        if os.name != "nt" and opened.st_uid != os.getuid():
+            raise ValueError("parser request belongs to another user")
+        return stream.read(limit + 1)
+
+
+def _write_result(payload: dict) -> None:
+    # Exclusive creation also rejects pre-existing files, links and reparse points.
+    with open("result.json", "x", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
 
 
 def worker_file_entry(meta_path: str, input_path: str, output_path: str) -> int:
     """Isolated worker entry used by source Python and the frozen launcher."""
+    # HTTP filenames only occur inside metadata. The worker protocol accepts no
+    # paths: its cwd is the private directory created by the parent process.
+    if (meta_path, input_path, output_path) != (
+        "request.json", "input.bin", "result.json"
+    ) or not _worker_directory_valid() or os.path.lexists("result.json"):
+        return 64
     try:
-        raw_meta = Path(meta_path).read_bytes()
+        raw_meta = _read_worker_file("request.json", 65_536)
         if len(raw_meta) > 65_536:
             raise ValueError("parser metadata too large")
         meta = json.loads(raw_meta.decode("utf-8"))
         limits = meta.get("limits") if isinstance(meta, dict) else None
         if not isinstance(limits, dict):
             raise ValueError("parser metadata invalid")
-        start_gate = str(meta.get("start_gate") or "")
-        if start_gate:
-            request_root = Path(meta_path).resolve().parent
-            gate_path = Path(start_gate).resolve()
-            if gate_path.parent != request_root:
-                raise ValueError("parser start gate outside request directory")
+        if meta.get("wait_for_start") is True:
             gate_deadline = time.monotonic() + 30.0
-            while not gate_path.is_file():
+            while not Path("worker.start").exists():
                 if time.monotonic() >= gate_deadline:
                     raise TimeoutError("parser start gate timed out")
                 time.sleep(0.01)
+            if _read_worker_file("worker.start", 2) != b"go":
+                raise ValueError("parser start gate invalid")
         max_file_size = max(1, int(limits.get("max_file_size") or 25 * 1024 * 1024))
-        content = Path(input_path).read_bytes()
+        content = _read_worker_file("input.bin", max_file_size)
         if len(content) > max_file_size:
             raise UploadValidationError("UPLOAD_TOO_LARGE", "文件超过隔离解析上限")
         result = _parse_document(
@@ -281,11 +319,10 @@ def worker_file_entry(meta_path: str, input_path: str, output_path: str) -> int:
             os.path.basename(str(meta.get("filename") or "document")),
             limits,
         )
-        _write_result(output_path, {"status": "ok", "result": result})
+        _write_result({"status": "ok", "result": result})
         return 0
     except UploadValidationError as exc:
         _write_result(
-            output_path,
             {
                 "status": "validation_error",
                 "code": exc.code,
@@ -296,7 +333,6 @@ def worker_file_entry(meta_path: str, input_path: str, output_path: str) -> int:
         return 2
     except BaseException:
         _write_result(
-            output_path,
             {
                 "status": "error",
                 "code": "DOCUMENT_PARSE_FAILED",
@@ -326,23 +362,22 @@ def _wait_for_worker(process, timeout: float) -> int:
         ) from exc
 
 
-def _worker_command(meta_path: str, input_path: str, output_path: str) -> list[str]:
+def _worker_command() -> list[str]:
     if getattr(sys, "frozen", False):
         return [
             sys.executable,
             "--document-parser-worker",
-            meta_path,
-            input_path,
-            output_path,
+            "request.json",
+            "input.bin",
+            "result.json",
         ]
     return [
         sys.executable,
-        "-m",
-        "isolated_document_parser",
+        str(Path(__file__).resolve()),
         "--worker",
-        meta_path,
-        input_path,
-        output_path,
+        "request.json",
+        "input.bin",
+        "result.json",
     ]
 
 
@@ -367,7 +402,7 @@ def _parse_document_isolated_once(
                 {
                     "kind": str(kind or "").lower(),
                     "filename": os.path.basename(str(filename or "document")),
-                    "start_gate": str(start_gate_path),
+                    "wait_for_start": True,
                     "limits": {
                         "max_chars": int(max_chars),
                         "max_pages": int(max_pages),
@@ -385,7 +420,8 @@ def _parse_document_isolated_once(
         try:
             try:
                 process = subprocess.Popen(
-                    _worker_command(str(meta_path), str(input_path), str(output_path)),
+                    _worker_command(),
+                    cwd=root,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

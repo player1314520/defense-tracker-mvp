@@ -7,12 +7,12 @@ const vm = require('node:vm');
 const root = path.resolve(__dirname, '..', '..');
 const news = fs.readFileSync(path.join(root, 'static', 'js', 'news.js'), 'utf8');
 const brief = fs.readFileSync(path.join(root, 'static', 'js', 'brief.js'), 'utf8');
-const briefSyncSource = brief.slice(0, brief.indexOf('// 加载候选文章'));
 
 function syncContext(fetchImpl, initialStorage = {}) {
   const values = new Map(Object.entries(initialStorage));
   const listeners = new Map();
   const window = {
+    showTab() {},
     __USERDATA_REVISION__: null,
     addEventListener(name, callback) { listeners.set(name, callback); },
   };
@@ -20,13 +20,14 @@ function syncContext(fetchImpl, initialStorage = {}) {
     window,
     fetch: fetchImpl,
     console,
+    document: {addEventListener() {}, getElementById() { return null; }},
     localStorage: {
       getItem(key) { return values.has(key) ? values.get(key) : null; },
       setItem(key, value) { values.set(key, String(value)); },
     },
     encodeURIComponent,
   });
-  vm.runInContext(briefSyncSource, context);
+  vm.runInContext(brief, context, {filename: 'brief.js'});
   return {context, values, listeners, window};
 }
 

@@ -140,6 +140,7 @@ PORT = find_free_port()
 # ── 导入 Flask 应用（不触发 __main__ 块）────────────────────
 from app import (
     app as flask_app,
+    _start_scheduler_once,
     refresh_news,
     add_background_jobs,
     get_desktop_bootstrap_token,

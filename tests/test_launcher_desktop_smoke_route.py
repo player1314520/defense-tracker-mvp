@@ -16,6 +16,9 @@ def test_desktop_login_wait_rejects_structured_not_ready_result(tmp_path):
     env["DEFENSE_TRACKER_HOME"] = str(tmp_path / "runtime")
     probe = r"""
 import launcher
+import app
+
+assert launcher._start_scheduler_once is app._start_scheduler_once
 
 launcher._wait_for_flask = lambda: (
     False,
