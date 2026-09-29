@@ -198,7 +198,7 @@ jobs:
       DIGICERT_KEY_ALIAS: ${{ vars.DEFENSE_TRACKER_DIGICERT_KEY_ALIAS }}
     steps:
       - name: Download exact encrypted installer bundle
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ inputs.installer_envelope_artifact }}
           path: ${{ runner.temp }}\source-envelope
@@ -206,7 +206,7 @@ jobs:
           run-id: ${{ inputs.application_run_id }}
           github-token: ${{ github.token }}
       - name: Download exact public installer request
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ inputs.installer_request_artifact }}
           path: ${{ runner.temp }}\public-request
@@ -390,7 +390,7 @@ jobs:
         run: |
           "OUTPUT_ROOT=${{ runner.temp }}\final-candidate" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
       - name: Download encrypted signed application
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.verify-installer-request.outputs.application_signed_artifact }}
           path: ${{ runner.temp }}\application-envelope
@@ -398,7 +398,7 @@ jobs:
           run-id: ${{ inputs.application_run_id }}
           github-token: ${{ github.token }}
       - name: Download public application receipt
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.verify-installer-request.outputs.application_receipt_artifact }}
           path: ${{ runner.temp }}\application-receipt
@@ -406,7 +406,7 @@ jobs:
           run-id: ${{ inputs.application_run_id }}
           github-token: ${{ github.token }}
       - name: Download encrypted signed installer
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.sign-installer.outputs.signed_installer_name }}
           path: ${{ runner.temp }}\installer-envelope
@@ -414,7 +414,7 @@ jobs:
           run-id: ${{ github.run_id }}
           github-token: ${{ github.token }}
       - name: Download public installer receipt
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.sign-installer.outputs.installer_receipt_name }}
           path: ${{ runner.temp }}\installer-receipt
